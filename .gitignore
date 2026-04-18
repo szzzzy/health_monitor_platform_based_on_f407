@@ -1,0 +1,33 @@
+# Keil/uVision user files
+MDK-ARM/*.uvoptx
+MDK-ARM/*.uvguix.*
+
+# Build output folders
+MDK-ARM/BME/
+MDK-ARM/MAX30102_Simple_Test/
+
+# Debug/session config generated locally
+MDK-ARM/DebugConfig/
+
+# Common embedded build artifacts
+*.o
+*.d
+*.axf
+*.hex
+*.map
+*.htm
+*.lnp
+*.dep
+*.bak
+*.tmp
+
+# CMSIS examples, docs, and test suites not needed for this project
+Drivers/CMSIS/Core/Template/
+Drivers/CMSIS/Core_A/
+Drivers/CMSIS/Device/ST/STM32F4xx/Source/Templates/
+Drivers/CMSIS/DSP/Examples/
+Drivers/CMSIS/DSP/DSP_Lib_TestSuite/
+Drivers/CMSIS/NN/
+Drivers/CMSIS/docs/
+Drivers/CMSIS/RTOS/
+Drivers/CMSIS/RTOS2/
