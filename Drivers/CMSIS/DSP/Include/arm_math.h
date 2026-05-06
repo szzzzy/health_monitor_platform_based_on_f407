@@ -315,6 +315,16 @@
 
 #define __CMSIS_GENERIC         /* disable NVIC and Systick functions */
 
+/*
+ * Standalone CMSIS-DSP source files include arm_math.h directly, without the
+ * STM32 device header that normally defines __FPU_PRESENT. This project targets
+ * STM32F407 (Cortex-M4F), so provide the missing device capability macro only
+ * when the build has not already supplied it.
+ */
+#if defined(ARM_MATH_CM4) && !defined(__FPU_PRESENT)
+  #define __FPU_PRESENT 1U
+#endif
+
 #if defined(ARM_MATH_CM7)
   #include "core_cm7.h"
   #define ARM_MATH_DSP

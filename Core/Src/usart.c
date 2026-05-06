@@ -21,7 +21,26 @@
 #include "usart.h"
 
 /* USER CODE BEGIN 0 */
+#include <string.h>
 
+/* --------------------------------------------------------------------------
+ * USART2 DMA 循环接收缓冲区
+ *
+ * DMA1_Stream5_Channel4 以 CIRCULAR 模式持续接收，IDLE 中断检测帧间隔。
+ * uart_dma_last_pos 记录 DMA 缓冲区中已被协议层消费的位置。
+ * uart_dma_idle_flag 由 ISR 置 1，协议层轮询后清零。
+ * -------------------------------------------------------------------------- */
+static DMA_HandleTypeDef hdma_usart2_rx;
+static uint8_t  uart_dma_rx_buf[UART_DMA_RX_BUF_SIZE];
+static volatile uint16_t uart_dma_last_pos = 0U;
+static volatile uint8_t  uart_dma_idle_flag = 0U;
+
+uint8_t *usart_get_dma_rx_buf(void)       { return uart_dma_rx_buf; }
+uint16_t usart_get_dma_last_pos(void)      { return uart_dma_last_pos; }
+void     usart_set_dma_last_pos(uint16_t p) { uart_dma_last_pos = p; }
+uint8_t  usart_get_dma_idle_flag(void)     { return uart_dma_idle_flag; }
+void     usart_clear_dma_idle_flag(void)   { uart_dma_idle_flag = 0U; }
+void     usart_set_dma_idle_flag(void)     { uart_dma_idle_flag = 1U; }
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart2;
@@ -51,7 +70,13 @@ void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-
+  /* 启动 USART2 IDLE 中断 + DMA 循环接收。
+   * IDLE 中断在总线空闲（≥1 个字符时长无数据）时触发，
+   * 用于检测变长帧结束，免去逐字节轮询。 */
+  __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
+  HAL_NVIC_SetPriority(USART2_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
+  HAL_UART_Receive_DMA(&huart2, uart_dma_rx_buf, UART_DMA_RX_BUF_SIZE);
   /* USER CODE END USART2_Init 2 */
 
 }
@@ -81,7 +106,27 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN USART2_MspInit 1 */
+  /* USART2_RX DMA: DMA1_Stream5, Channel4, 循环模式 */
+  {
+    __HAL_RCC_DMA1_CLK_ENABLE();
 
+    hdma_usart2_rx.Instance = DMA1_Stream5;
+    hdma_usart2_rx.Init.Channel = DMA_CHANNEL_4;
+    hdma_usart2_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_usart2_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_usart2_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_usart2_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart2_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_usart2_rx.Init.Mode = DMA_CIRCULAR;
+    hdma_usart2_rx.Init.Priority = DMA_PRIORITY_LOW;
+    hdma_usart2_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    HAL_DMA_Init(&hdma_usart2_rx);
+
+    __HAL_LINKDMA(uartHandle, hdmarx, hdma_usart2_rx);
+
+    HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 3, 0);
+    HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+  }
   /* USER CODE END USART2_MspInit 1 */
   }
 }

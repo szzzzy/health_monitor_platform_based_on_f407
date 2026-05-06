@@ -23,6 +23,9 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "i2c.h"
+#include "max30102.h"
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -58,7 +61,7 @@
 /* External variables --------------------------------------------------------*/
 
 /* USER CODE BEGIN EV */
-
+extern volatile uint8_t tim6_tick_flag;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -200,6 +203,66 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+/* TIM6 精确 50 Hz 采样节拍 — 优先级 1，每 20 ms 断言一次。 */
+void TIM6_DAC_IRQHandler(void)
+{
+  if (__HAL_TIM_GET_FLAG(&htim6, TIM_FLAG_UPDATE) != RESET)
+  {
+    __HAL_TIM_CLEAR_IT(&htim6, TIM_IT_UPDATE);
+    tim6_tick_flag = 1U;
+  }
+}
 
+void DMA1_Stream5_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(huart2.hdmarx);
+}
+
+void USART2_IRQHandler(void)
+{
+  if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE) != RESET)
+  {
+    __HAL_UART_CLEAR_IDLEFLAG(&huart2);
+    usart_set_dma_idle_flag();
+  }
+  HAL_UART_IRQHandler(&huart2);
+}
+
+void DMA1_Stream0_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(hi2c1.hdmarx);
+}
+
+void DMA1_Stream6_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(hi2c1.hdmatx);
+}
+
+void I2C1_EV_IRQHandler(void)
+{
+  HAL_I2C_EV_IRQHandler(&hi2c1);
+}
+
+void I2C1_ER_IRQHandler(void)
+{
+  HAL_I2C_ER_IRQHandler(&hi2c1);
+}
+
+/* MAX30102 PPG_RDY 中断（PA0 下降沿）。
+ * 若 PA0 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发，
+ * 系统会通过 TIM6 节拍兜底轮询。 */
+void EXTI0_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(MAX30102_INT_Pin);
+}
+
+/* HAL GPIO EXTI 统一回调，按引脚分发。 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == MAX30102_INT_Pin)
+  {
+    max30102_mark_data_ready_from_isr();
+  }
+}
 /* USER CODE END 1 */
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

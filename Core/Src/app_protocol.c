@@ -52,9 +52,11 @@ void app_protocol_update_rtc_snapshot(AppState_t *app)
   app->rtc_time_valid = APP_RTC_IsTimeValid();
 }
 
-/* 轮询 USART2，按“单行命令”协议接收 TIME / SETTIME。 */
+/* 轮询 USART2 DMA 缓冲区，按”单行命令”协议接收 TIME / SETTIME。 */
 void app_protocol_poll_uart_commands(AppState_t *app)
 {
+  uint16_t current_pos;
+  uint16_t buf_size = UART_DMA_RX_BUF_SIZE;
   uint8_t rx_byte;
 
   if (app == NULL)
@@ -62,8 +64,24 @@ void app_protocol_poll_uart_commands(AppState_t *app)
     return;
   }
 
-  while (HAL_UART_Receive(&huart2, &rx_byte, 1U, 0U) == HAL_OK)
+  if (usart_get_dma_idle_flag() == 0U)
   {
+    return;
+  }
+
+  usart_clear_dma_idle_flag();
+
+  /*
+   * DMA_CNDTR 递减计数 → 当前写入位置 = buf_size - CNDTR。
+   * 从 last_pos 读到 current_pos，处理所有已接收字节。
+   */
+  current_pos = (uint16_t)(buf_size - (uint16_t)__HAL_DMA_GET_COUNTER(huart2.hdmarx));
+
+  while (usart_get_dma_last_pos() != current_pos)
+  {
+    rx_byte = usart_get_dma_rx_buf()[usart_get_dma_last_pos()];
+    usart_set_dma_last_pos((uint16_t)((usart_get_dma_last_pos() + 1U) % buf_size));
+
     if (rx_byte == '\r')
     {
       continue;
