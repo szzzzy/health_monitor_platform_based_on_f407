@@ -29,12 +29,12 @@
 #define APP_BPM_CONFIRM_DELTA             8U
 #define APP_BPM_SWITCH_DELTA              14U
 #define APP_BPM_SPIKE_DELTA               24U
-#define APP_BPM_START_CONFIRM_COUNT       3U
-#define APP_BPM_SWITCH_CONFIRM_COUNT      4U
-#define APP_BPM_SPIKE_CONFIRM_COUNT       8U
-#define APP_BPM_INVALID_HOLD_TICKS        60U
-#define APP_BPM_EVALUATE_INTERVAL_SAMPLES 5U
-#define APP_BPM_MAX_STEP_PER_UPDATE       3U
+#define APP_BPM_START_CONFIRM_COUNT       2U
+#define APP_BPM_SWITCH_CONFIRM_COUNT      3U
+#define APP_BPM_SPIKE_CONFIRM_COUNT       5U
+#define APP_BPM_INVALID_HOLD_TICKS        30U
+#define APP_BPM_EVALUATE_INTERVAL_SAMPLES 3U
+#define APP_BPM_MAX_STEP_PER_UPDATE       5U
 #define APP_SIGNAL_QUALITY_MIN_FOR_SPO2   30U
 #define APP_SIGNAL_QUALITY_MIN_FOR_BPM    40U
 
@@ -356,9 +356,9 @@ void app_measurement_process(AppState_t *app)
   }
 
   /*
-   * Waveform and algorithm windows now follow the confirmed finger state:
-   * - no finger: keep the screen quiet instead of drawing ambient noise
-   * - finger confirmed: feed waveform + BPM/SpO2 windows together
+   * 波形和算法窗口仅在确认手指在位时更新：
+   * - 无手指：不绘制环境噪声，保持界面干净
+   * - 确认手指在位：同时推进波形显示和 BPM/SpO2 算法窗口
    */
   if (app->finger_present == 0U)
   {
@@ -412,6 +412,29 @@ void app_measurement_process(AppState_t *app)
 
   bpm_update_decimator = 0U;
   raw_bpm_valid = max30102_calculate_bpm(&spo2_state, &raw_bpm_value);
+
+  /*
+   * 当信号质量足够时，用时域峰值检测 + FFT 自相关两种方法互相验证。
+   * 若两者结果差异 ≤ 8 BPM，采用加权混合：25% 峰值 + 75% 自相关。
+   * 自相关法对弱信号更鲁棒，但对突变心率响应较慢——因此保留峰值检测
+   * 作为 baseline，在差异过大时优先采信峰值检测结果。
+   */
+  if ((raw_bpm_valid != 0U) && (app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM))
+  {
+    uint8_t acorr_bpm;
+
+    if (max30102_autocorr_bpm(&spo2_state, &acorr_bpm) != 0U)
+    {
+      uint8_t diff = (raw_bpm_value > acorr_bpm) ? (raw_bpm_value - acorr_bpm)
+                                                 : (acorr_bpm - raw_bpm_value);
+      if (diff <= 8U)
+      {
+        /* Weighted blend: 25 % peak-detect + 75 % autocorrelation */
+        raw_bpm_value = (uint8_t)(((uint16_t)raw_bpm_value + (uint16_t)acorr_bpm * 3U + 2U) / 4U);
+      }
+    }
+  }
+
   if ((raw_bpm_valid != 0U) && (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM))
   {
     raw_bpm_valid = 0U;

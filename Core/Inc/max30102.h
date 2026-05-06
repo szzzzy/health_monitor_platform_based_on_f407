@@ -59,9 +59,10 @@ extern "C" {
  */
 #define MAX30102_DEFAULT_SPO2_CONFIG            0x23U
 
-/* Slightly raise RED/IR drive current to improve SNR on weak reflective signals. */
-#define MAX30102_DEFAULT_LED1_PA                0x30U
-#define MAX30102_DEFAULT_LED2_PA                0x30U
+/* Boost LED drive current for stronger PPG signal and better SNR on reflective
+   sensing.  Value × 0.2 mA → 0x5F ≈ 19 mA (safe continuous level for MAX30102). */
+#define MAX30102_DEFAULT_LED1_PA                0x5FU
+#define MAX30102_DEFAULT_LED2_PA                0x5FU
 
 /* 用于统计背景 IR 基线 */
 typedef struct
@@ -79,7 +80,7 @@ typedef struct
  * - WINDOW_SIZE 表示最多保留多少个最近样本
  * - MIN_VALID_SAMPLES 表示至少累计多少个样本后才允许开始计算
  */
-#define MAX30102_SPO2_WINDOW_SIZE             200U
+#define MAX30102_SPO2_WINDOW_SIZE             256U
 #define MAX30102_SPO2_MIN_VALID_SAMPLES       30U
 #define MAX30102_BPM_MIN_VALID_SAMPLES        40U
 
@@ -133,6 +134,8 @@ HAL_StatusTypeDef max30102_write_reg(uint8_t reg_addr, uint8_t data);
 HAL_StatusTypeDef max30102_read_reg(uint8_t reg_addr, uint8_t *data);
 HAL_StatusTypeDef max30102_read_fifo(uint8_t *fifo_data, uint16_t data_len);
 const MAX30102_FifoDebug_t *max30102_get_fifo_debug(void);
+void max30102_mark_data_ready_from_isr(void);
+uint8_t max30102_should_service_fifo(void);
 
 /* 把 6 字节 FIFO 数据解析成 RED / IR 原始值 */
 void max30102_parse_spo2_sample(const uint8_t *fifo_data,
@@ -172,10 +175,10 @@ uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_
 uint8_t max30102_calculate_signal_quality(const MAX30102_SpO2_t *spo2_state,
                                           const MAX30102_SignalMetrics_t *metrics,
                                           uint8_t *signal_quality);
+uint8_t max30102_autocorr_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* __MAX30102_H__ */
-

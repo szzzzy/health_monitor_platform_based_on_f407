@@ -34,13 +34,18 @@ extern "C" {
 extern UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN Private defines */
-
+#define UART_DMA_RX_BUF_SIZE  64U
 /* USER CODE END Private defines */
 
 void MX_USART2_UART_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-
+uint8_t *usart_get_dma_rx_buf(void);
+uint16_t usart_get_dma_last_pos(void);
+void     usart_set_dma_last_pos(uint16_t p);
+uint8_t  usart_get_dma_idle_flag(void);
+void     usart_clear_dma_idle_flag(void);
+void     usart_set_dma_idle_flag(void);
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

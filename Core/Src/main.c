@@ -55,7 +55,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+volatile uint8_t tim6_tick_flag = 0;
+TIM_HandleTypeDef htim6;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -133,6 +134,38 @@ static void app_schedule_periodic_refresh(AppState_t *app)
   app->report_due = 1U;
   app->display_refresh_requested = 1U;
 }
+
+/*
+ * TIM6 精确 50 Hz 采样节拍初始化。
+ *
+ * TIM6 挂在 APB1 定时器总线（84 MHz）。
+ * Prescaler = 8399 → 84 MHz / 8400 = 10 kHz 计数时钟
+ * Period    = 199  → 10 kHz / 200 = 50.0 Hz 中断频率（周期 20 ms）
+ *
+ * 优先级设为 1（仅低于不可抢占的 NMI/HardFault），
+ * 保证每 20 ms 准时设置 tim6_tick_flag，不被其他中断长时间延误。
+ */
+static void MX_TIM6_Init(void)
+{
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  __HAL_RCC_TIM6_CLK_ENABLE();
+
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 8399;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 199;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  HAL_TIM_Base_Init(&htim6);
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig);
+
+  HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+  HAL_TIM_Base_Start_IT(&htim6);
+}
 /* USER CODE END 0 */
 
 /**
@@ -160,6 +193,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  MX_TIM6_Init();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -254,36 +288,47 @@ int main(void)
   while (1)
   {
     /*
-     * 主循环保持为“调度器”角色：
-     * - 轮询串口命令
-     * - 处理页面切换
-     * - 在有新样本时推进测量状态机
-     * - 按较低频率统一上报与刷新 OLED
+     * 主循环保持为”调度器”角色：
+     * - 轮询串口命令（DMA+IDLE，非阻塞）
+     * - 处理按键（软件消抖）
+     * - max30102_should_service_fifo() 门控传感器读取：
+     *    若 INT 已触发则立即读，否则等待 INT 或 TIM6 兜底超时
+     * - 推进 BPM/SpO2 算法 + 波形显示
+     * - 200 ms 周期统一上报 + 刷新 OLED
      */
     app_protocol_poll_uart_commands(&app);
     app_display_handle_buttons(&app);
 
-    switch (app_measurement_read_sensor_sample(&app))
+    if (max30102_should_service_fifo() != 0U)
     {
-      case APP_MEASUREMENT_READ_OK:
-        app_measurement_update_adaptive_thresholds(&app);
-        app_measurement_update_finger_state(&app);
-        app_measurement_process(&app);
-        app_measurement_update_periodic_flags(&app);
-        break;
+      switch (app_measurement_read_sensor_sample(&app))
+      {
+        case APP_MEASUREMENT_READ_OK:
+          app_measurement_update_adaptive_thresholds(&app);
+          app_measurement_update_finger_state(&app);
+          app_measurement_process(&app);
+          app_measurement_update_periodic_flags(&app);
+          break;
 
-      case APP_MEASUREMENT_READ_ERROR:
-        app_measurement_recover_sensor(&app);
-        break;
+        case APP_MEASUREMENT_READ_ERROR:
+          app_measurement_recover_sensor(&app);
+          break;
 
-      default:
-        break;
+        default:
+          break;
+      }
     }
 
     app_schedule_periodic_refresh(&app);
     app_send_report_if_due(&app);
     app_refresh_display_if_needed(&app);
-    HAL_Delay(APP_MAIN_LOOP_DELAY_MS);
+
+    /* Wait for next 20ms tick from TIM6 (WFI saves power while idle). */
+    while (tim6_tick_flag == 0U)
+    {
+      __WFI();
+    }
+    tim6_tick_flag = 0U;
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -372,4 +417,3 @@ void assert_failed(uint8_t *file, uint32_t line)
 #endif /* USE_FULL_ASSERT */
 
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
-

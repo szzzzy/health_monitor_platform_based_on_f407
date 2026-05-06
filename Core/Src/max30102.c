@@ -2,10 +2,56 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
+#include "arm_math.h"
 #include "i2c.h"
 
-/* Keep BPM peak spacing, valid interval filtering, and final range checks aligned. */
+/*
+ * arm_bitreversal_32 的纯 C 替代实现。
+ *
+ * CMSIS-DSP 原版使用汇编（GAS 语法），ARMCLANG v6 / armasm 无法汇编。
+ * 本函数提供等效功能：对交错的复数缓冲区进行 in-place 位逆序重排。
+ *
+ * 关键细节：CMSIS-DSP 的位逆序表 pBitRevTable 存储的是"字节偏移"而非
+ * "复数样本索引"。因此需要用 uint8_t* 基址 + 字节偏移来定位待交换的
+ * 复数对（每个复数 = 2 个 float32 = 8 字节）。
+ */
+void arm_bitreversal_32(uint32_t *pSrc, const uint16_t bitRevLength, const uint16_t *pBitRevTable)
+{
+  uint16_t i;
+  uint8_t *base;
+  uint32_t *a;
+  uint32_t *b;
+  uint32_t tmp_re;
+  uint32_t tmp_im;
+
+  if ((pSrc == NULL) || (pBitRevTable == NULL))
+  {
+    return;
+  }
+
+  base = (uint8_t *)pSrc;
+  for (i = 0U; (uint16_t)(i + 1U) < bitRevLength; i = (uint16_t)(i + 2U))
+  {
+    a = (uint32_t *)(base + pBitRevTable[i]);
+    b = (uint32_t *)(base + pBitRevTable[i + 1U]);
+
+    tmp_re = a[0];
+    tmp_im = a[1];
+    a[0] = b[0];
+    a[1] = b[1];
+    b[0] = tmp_re;
+    b[1] = tmp_im;
+  }
+}
+
+/* =========================================================================
+ * BPM / SpO2 算法参数
+ *
+ * 所有参数按 50 Hz 采样率设计。若修改 MAX30102_DEFAULT_SPO2_CONFIG
+ * 中的采样率，以下阈值需要同步缩放。
+ * ========================================================================= */
 #define MAX30102_BPM_MIN_RESULT            35U
 #define MAX30102_BPM_MAX_RESULT            220U
 #define MAX30102_BPM_MIN_AMPLITUDE         24U
@@ -24,7 +70,7 @@
 #define MAX30102_SPO2_MIN_AC_RMS           40U
 #define MAX30102_SPO2_RATIO_SCALE          1000U
 #define MAX30102_FILTER_DC_SHIFT           4U
-#define MAX30102_FILTER_AC_SHIFT           2U
+#define MAX30102_INTR_STATUS_PPG_RDY       0x40U
 #define MAX30102_SIGNAL_QUALITY_IR_PI_GOOD 10U
 #define MAX30102_SIGNAL_QUALITY_RED_PI_GOOD 8U
 #define MAX30102_SIGNAL_QUALITY_IR_RMS_GOOD 96U
@@ -32,8 +78,153 @@
 #define MAX30102_SIGNAL_QUALITY_WINDOW_GOOD 80U
 #define MAX30102_FIFO_DEPTH                32U
 #define MAX30102_FIFO_PTR_MASK             0x1FU
+#define MAX30102_INT_POLL_FALLBACK_TICKS   10U
+
+#ifndef MAX30102_USE_INT_PIN
+#define MAX30102_USE_INT_PIN               0U
+#endif
+
+#if (MAX30102_USE_INT_PIN != 0U)
+#define MAX30102_DEFAULT_INTR_ENABLE_1     MAX30102_INTR_STATUS_PPG_RDY
+#else
+#define MAX30102_DEFAULT_INTR_ENABLE_1     0x00U
+#endif
 
 static MAX30102_FifoDebug_t max30102_fifo_debug;
+
+/* --------------------------------------------------------------------------
+ * I2C DMA 传输状态 — HAL 回调中设置，max30102_read_fifo 中轮询等待。
+ * -------------------------------------------------------------------------- */
+static volatile uint8_t i2c_dma_busy = 0U;
+static volatile HAL_StatusTypeDef i2c_dma_result;
+
+/* --------------------------------------------------------------------------
+ * MAX30102 FIFO 数据就绪检测（INT 驱动 + TIM6 轮询兜底）
+ *
+ * 设计思路：
+ *   max30102_data_ready_flag — 由 EXTI 中断 ISR 置 1，主循环读取后清零。
+ *     上电初始值为 1，确保 TIM6 第一次节拍就会读一次 FIFO。
+ *   max30102_int_seen — 记录是否至少触发过一次 EXTI 中断。
+ *     - 若 INT 引脚已连接，首次 EXTI 后置 1，切换到"INT 驱动模式"。
+ *     - 若 INT 引脚未连接，始终为 0，系统退化到"纯 TIM6 轮询模式"。
+ *
+ *   max30102_should_service_fifo() 决策逻辑：
+ *     1. 若 data_ready_flag == 1 → 立即读（INT 刚触发）
+ *     2. 若 INT 曾被触发过但当前 data_ready_flag == 0：
+ *        - 等待 INT（最多 10 个 TIM6 节拍 = 200 ms）
+ *        - 超时后强制读一次（防止 INT 丢失导致死等）
+ *     3. 若 INT 从未触发 → 每个 TIM6 节拍都读（纯轮询模式）
+ * -------------------------------------------------------------------------- */
+static volatile uint8_t max30102_data_ready_flag = 1U;
+static volatile uint8_t max30102_int_seen = 0U;
+static uint8_t max30102_poll_fallback_ticks = 0U;
+
+static HAL_StatusTypeDef max30102_clear_interrupt_status(void);
+
+/* HAL I2C 接收完成回调 — DMA 传输结束后由 I2C 中断链调用。 */
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1)
+  {
+    i2c_dma_result = HAL_OK;
+    i2c_dma_busy = 0U;
+  }
+}
+
+/* HAL I2C 错误回调 — DMA 或总线错误时由 I2C 中断链调用。 */
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1)
+  {
+    i2c_dma_result = HAL_ERROR;
+    i2c_dma_busy = 0U;
+  }
+}
+
+/* 由 EXTI 中断回调调用，标记 MAX30102 FIFO 有新数据可读。 */
+void max30102_mark_data_ready_from_isr(void)
+{
+  max30102_data_ready_flag = 1U;
+  max30102_int_seen = 1U;
+}
+
+/*
+ * 主循环门控：决定当前节拍是否需要读 FIFO。
+ *
+ *   INT 已触发过（int_seen != 0）：
+ *     - data_ready_flag 已置位 → 立即读，同时清零 flag 和 fallback 计数
+ *     - data_ready_flag 未置位 → 等待 INT（最多 INT_POLL_FALLBACK_TICKS 拍），
+ *       超时后强制读一次，防止 INT 偶然丢失导致系统死等
+ *   INT 从未触发（int_seen == 0）：
+ *     - 每拍都返回 1，纯轮询模式（PA0 未接 MAX30102 INT 时的退化行为）
+ */
+uint8_t max30102_should_service_fifo(void)
+{
+  if (max30102_data_ready_flag != 0U)
+  {
+    max30102_data_ready_flag = 0U;
+    max30102_poll_fallback_ticks = 0U;
+    return 1U;
+  }
+
+#if (MAX30102_USE_INT_PIN != 0U)
+  if (max30102_int_seen != 0U)
+  {
+    if (max30102_poll_fallback_ticks < MAX30102_INT_POLL_FALLBACK_TICKS)
+    {
+      max30102_poll_fallback_ticks++;
+      return 0U;
+    }
+
+    max30102_poll_fallback_ticks = 0U;
+  }
+#endif
+
+  return 1U;
+}
+
+/* --------------------------------------------------------------------------
+ * CMSIS-DSP 4th-order Butterworth bandpass (2 biquad stages)
+ *
+ * Designed for fs = 50 Hz, passband ≈ 0.5–5 Hz (30–300 BPM).
+ * Coefficients are in CMSIS order: {b0, b1, b2, -a1, -a2}.
+ * -------------------------------------------------------------------------- */
+#define BIQUAD_STAGES 2U
+
+static const float32_t biquad_coeffs[5U * BIQUAD_STAGES] = {
+  /* Stage 1 — HPF, fc ≈ 0.5 Hz */
+   0.96953125f, -1.9390625f,  0.96953125f,  1.93859375f, -0.9390625f,
+  /* Stage 2 — LPF, fc ≈ 5 Hz */
+   0.29289322f,  0.58578644f,  0.29289322f,  0.0f,        -0.171572875f
+};
+
+static arm_biquad_casd_df1_inst_f32 biquad_red;
+static arm_biquad_casd_df1_inst_f32 biquad_ir;
+static float32_t biquad_state_red[4U * BIQUAD_STAGES];
+static float32_t biquad_state_ir[4U * BIQUAD_STAGES];
+static uint8_t biquad_initialized = 0U;
+
+static void biquad_ensure_init(void)
+{
+  if (biquad_initialized != 0U)
+  {
+    return;
+  }
+
+  arm_biquad_cascade_df1_init_f32(&biquad_red, BIQUAD_STAGES,
+                                  (float32_t *)biquad_coeffs, biquad_state_red);
+  arm_biquad_cascade_df1_init_f32(&biquad_ir, BIQUAD_STAGES,
+                                  (float32_t *)biquad_coeffs, biquad_state_ir);
+  biquad_initialized = 1U;
+}
+
+static void biquad_reset(void)
+{
+  (void)memset(biquad_state_red, 0, sizeof(biquad_state_red));
+  (void)memset(biquad_state_ir,  0, sizeof(biquad_state_ir));
+  biquad_initialized = 0U;
+  biquad_ensure_init();
+}
 
 /*
  * 用整数形式做一个慢速一阶低通：
@@ -70,38 +261,6 @@ static uint32_t max30102_slow_follow_u32(uint32_t current, uint32_t target, uint
   }
 
   return current - step;
-}
-
-static int32_t max30102_slow_follow_i32(int32_t current, int32_t target, uint8_t shift)
-{
-  uint32_t delta;
-  uint32_t step;
-
-  if (current == target)
-  {
-    return current;
-  }
-
-  if (current < target)
-  {
-    delta = (uint32_t)(target - current);
-    step = delta >> shift;
-    if (step == 0U)
-    {
-      step = 1U;
-    }
-
-    return current + (int32_t)step;
-  }
-
-  delta = (uint32_t)(current - target);
-  step = delta >> shift;
-  if (step == 0U)
-  {
-    step = 1U;
-  }
-
-  return current - (int32_t)step;
 }
 
 static uint32_t max30102_isqrt_u64(uint64_t value)
@@ -247,6 +406,10 @@ static HAL_StatusTypeDef max30102_reset(void)
   }
 
   HAL_Delay(10U);
+  max30102_data_ready_flag = 1U;
+  max30102_int_seen = 0U;
+  max30102_poll_fallback_ticks = 0U;
+
   return HAL_OK;
 }
 
@@ -313,6 +476,25 @@ HAL_StatusTypeDef max30102_read_reg(uint8_t reg_addr, uint8_t *data)
                           data,
                           1U,
                           MAX30102_I2C_TIMEOUT_MS);
+}
+
+/*
+ * 清除 MAX30102 中断状态。
+ * 读取 INTR_STATUS_1 和 INTR_STATUS_2 寄存器即可自动清除中断标志位。
+ * INT 引脚模式的必需要操作——否则 INT 引脚会一直保持低电平，无法产生新中断。
+ */
+static HAL_StatusTypeDef max30102_clear_interrupt_status(void)
+{
+  HAL_StatusTypeDef status;
+  uint8_t status_value;
+
+  status = max30102_read_reg(MAX30102_REG_INTR_STATUS_1, &status_value);
+  if (status != HAL_OK)
+  {
+    return status;
+  }
+
+  return max30102_read_reg(MAX30102_REG_INTR_STATUS_2, &status_value);
 }
 
 static HAL_StatusTypeDef max30102_get_fifo_sample_count(uint8_t *sample_count)
@@ -395,8 +577,8 @@ HAL_StatusTypeDef max30102_init(void)
     return status;
   }
 
-  /* 当前轮询采样，不使用中断，因此先把中断全部关闭。 */
-  status = max30102_write_reg(MAX30102_REG_INTR_ENABLE_1, 0x00U);
+  /* 根据 MAX30102_USE_INT_PIN 配置使能或不使能 PPG 数据就绪中断。 */
+  status = max30102_write_reg(MAX30102_REG_INTR_ENABLE_1, MAX30102_DEFAULT_INTR_ENABLE_1);
   if (status != HAL_OK)
   {
     return status;
@@ -407,6 +589,8 @@ HAL_StatusTypeDef max30102_init(void)
   {
     return status;
   }
+
+  (void)max30102_clear_interrupt_status();
 
   status = max30102_clear_fifo();
   if (status != HAL_OK)
@@ -449,8 +633,11 @@ HAL_StatusTypeDef max30102_init(void)
     return status;
   }
 
+  max30102_data_ready_flag = 1U;
+  max30102_int_seen = 0U;
+  max30102_poll_fallback_ticks = 0U;
+
   /* TODO: 多 LED 模式下继续配置 MULTI_LED_CTRL1 / MULTI_LED_CTRL2。 */
-  /* TODO: 如改用中断采样，可在这里打开相应中断使能位。 */
 
   return HAL_OK;
 }
@@ -470,8 +657,7 @@ HAL_StatusTypeDef max30102_read_fifo(uint8_t *fifo_data, uint16_t data_len)
     return HAL_ERROR;
   }
 
-  /* TODO: 后续可先检查 FIFO 指针，避免读到不完整样本。 */
-  /* Only read when FIFO already holds a whole number of complete samples. */
+  /* 仅当 FIFO 中已有整数个完整样本时才读取。 */
   if ((data_len % MAX30102_FIFO_BYTES_PER_SAMPLE_SPO2) != 0U)
   {
     return HAL_ERROR;
@@ -494,13 +680,42 @@ HAL_StatusTypeDef max30102_read_fifo(uint8_t *fifo_data, uint16_t data_len)
     return HAL_BUSY;
   }
 
-  return HAL_I2C_Mem_Read(&hi2c1,
-                          MAX30102_I2C_ADDR,
-                          MAX30102_REG_FIFO_DATA,
-                          I2C_MEMADD_SIZE_8BIT,
-                          fifo_data,
-                          data_len,
-                          MAX30102_I2C_TIMEOUT_MS);
+  /* 启动 DMA 传输。I2C 传输完成后，HAL 回调会清除 i2c_dma_busy。 */
+  i2c_dma_result = HAL_BUSY;
+  i2c_dma_busy = 1U;
+  status = HAL_I2C_Mem_Read_DMA(&hi2c1,
+                                MAX30102_I2C_ADDR,
+                                MAX30102_REG_FIFO_DATA,
+                                I2C_MEMADD_SIZE_8BIT,
+                                fifo_data,
+                                data_len);
+  if (status != HAL_OK)
+  {
+    i2c_dma_busy = 0U;
+    return status;
+  }
+
+  /* 短轮询等待 DMA 完成：6 字节 @ 400 kHz I2C ≈ 135 µs 传输时间。 */
+  {
+    uint32_t timeout = HAL_GetTick() + 5U;
+
+    while (i2c_dma_busy != 0U)
+    {
+      if (HAL_GetTick() >= timeout)
+      {
+        i2c_dma_busy = 0U;
+        return HAL_TIMEOUT;
+      }
+    }
+  }
+
+  status = i2c_dma_result;
+
+#if (MAX30102_USE_INT_PIN != 0U)
+  (void)max30102_clear_interrupt_status();
+#endif
+
+  return status;
 }
 
 const MAX30102_FifoDebug_t *max30102_get_fifo_debug(void)
@@ -776,13 +991,12 @@ void max30102_spo2_reset(MAX30102_SpO2_t *spo2_state)
   spo2_state->ir_square_sum = 0ULL;
   spo2_state->red_filtered_square_sum = 0ULL;
   spo2_state->ir_filtered_square_sum = 0ULL;
+  biquad_reset();
 }
 
 /* 向测量算法窗口中压入一个新的 RED/IR 样本。 */
 void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, uint32_t ir_value)
 {
-  int32_t red_ac_value;
-  int32_t ir_ac_value;
   int32_t old_red_filtered;
   int32_t old_ir_filtered;
   uint16_t sample_index;
@@ -806,6 +1020,7 @@ void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, u
     spo2_state->ir_filtered_square_sum -= max30102_square_i32(old_ir_filtered);
   }
 
+  /* 维护慢速 DC 估计（用于信号质量 PI 计算和外部诊断）。 */
   if (spo2_state->red_dc_estimate == 0U)
   {
     spo2_state->red_dc_estimate = red_value;
@@ -828,14 +1043,20 @@ void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, u
                                                           MAX30102_FILTER_DC_SHIFT);
   }
 
-  red_ac_value = (int32_t)red_value - (int32_t)spo2_state->red_dc_estimate;
-  ir_ac_value = (int32_t)ir_value - (int32_t)spo2_state->ir_dc_estimate;
-  spo2_state->red_filter_state = max30102_slow_follow_i32(spo2_state->red_filter_state,
-                                                          red_ac_value,
-                                                          MAX30102_FILTER_AC_SHIFT);
-  spo2_state->ir_filter_state = max30102_slow_follow_i32(spo2_state->ir_filter_state,
-                                                         ir_ac_value,
-                                                         MAX30102_FILTER_AC_SHIFT);
+  /* CMSIS-DSP 4th-order Butterworth bandpass isolates the pulse waveform. */
+  {
+    float32_t in, out;
+
+    biquad_ensure_init();
+
+    in = (float32_t)((int32_t)red_value - (int32_t)spo2_state->red_dc_estimate);
+    arm_biquad_cascade_df1_f32(&biquad_red, &in, &out, 1U);
+    spo2_state->red_filter_state = (int32_t)(out + (out >= 0.0f ? 0.5f : -0.5f));
+
+    in = (float32_t)((int32_t)ir_value - (int32_t)spo2_state->ir_dc_estimate);
+    arm_biquad_cascade_df1_f32(&biquad_ir, &in, &out, 1U);
+    spo2_state->ir_filter_state = (int32_t)(out + (out >= 0.0f ? 0.5f : -0.5f));
+  }
 
   spo2_state->red_samples[sample_index] = red_value;
   spo2_state->ir_samples[sample_index] = ir_value;
@@ -1139,7 +1360,7 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
    * 若波形起伏太小，通常说明手指未放稳、压得太轻，
    * 或此时还没有足够明显的脉搏波。
    */
-  /* Allow smaller but still meaningful pulsatile swings to enter BPM detection. */
+  /* 允许较小的脉搏波摆动进入 BPM 检测，避免弱信号被完全过滤。 */
   if (amplitude < MAX30102_BPM_MIN_AMPLITUDE)
   {
     return 0U;
@@ -1161,7 +1382,7 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
     ir_second_max = ir_max;
   }
 
-  /* Ignore one extreme sample on each side and cap the span by RMS. */
+  /* 去掉一个极端值后计算幅度，并用 RMS 做上限约束，减小尖峰干扰。 */
   threshold_amplitude = (uint32_t)((int64_t)ir_second_max - (int64_t)ir_second_min);
   amplitude_cap = ir_ac_rms * MAX30102_BPM_RANGE_CAP_RMS_FACTOR;
   if (threshold_amplitude > amplitude_cap)
@@ -1203,7 +1424,7 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
    * 约束两个峰之间的最小样本间隔，避免一次脉搏中的噪声被重复算成多个峰。
    * 这里按最大心率 220 BPM 反推得到最小峰距。
    */
-  /* Use the same BPM bounds for peak spacing and final validation. */
+  /* 峰距和最终 BPM 验证使用相同的上下限（35~220 BPM）。 */
   min_peak_distance = (uint16_t)((MAX30102_ALGO_SAMPLE_RATE_HZ * 60U) / MAX30102_BPM_MAX_RESULT);
   if (min_peak_distance < 10U)
   {
@@ -1409,3 +1630,148 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
   return 1U;
 }
 
+/* --------------------------------------------------------------------------
+ * 基于 FFT 的自相关心率估算（Wiener–Khinchin 定理）
+ *
+ * 原理：信号的自相关 = 功率谱的逆傅里叶变换
+ *       自相关峰值位置 = 信号的基频周期
+ *
+ * 算法流程：
+ *   1. 从环形缓冲区复制 256 个滤波后的 IR 样本
+ *   2. 减均值 + Hann 窗 → 抑制频谱泄漏
+ *   3. 正变换 RFFT → 功率谱 |X[k]|^2
+ *   4. 逆变换 RFFT → 自相关序列
+ *   5. 在 [LAG_MIN, LAG_MAX] 范围内搜索自相关峰值
+ *   6. BPM = 采样率 × 60 / 滞后值
+ *
+ * 相比时域峰值检测，自相关法对弱灌注 / 噪声信号更鲁棒，
+ * 但对突变心率（如心律不齐）响应较慢（需要 256 点 ≈ 5 秒窗口）。
+ * -------------------------------------------------------------------------- */
+#define FFT_SIZE  256U                    /* 256 点 RFFT，窗口 = 5.12 秒 @ 50 Hz */
+#define LAG_MIN   13U                    /* 50 × 60 / 13 ≈ 230 BPM（最高心率） */
+#define LAG_MAX   85U                    /* 50 × 60 / 85 ≈  35 BPM（最低心率） */
+
+static float32_t fft_in[FFT_SIZE];
+static float32_t fft_out[FFT_SIZE];
+static arm_rfft_fast_instance_f32 rfft_inst;
+static uint8_t rfft_initialized = 0U;
+
+static void autocorr_ensure_init(void)
+{
+  if (rfft_initialized == 0U)
+  {
+    arm_rfft_fast_init_f32(&rfft_inst, FFT_SIZE);
+    rfft_initialized = 1U;
+  }
+}
+
+uint8_t max30102_autocorr_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm)
+{
+  uint16_t i;
+  uint16_t sample_count;
+  uint16_t start_index;
+  uint16_t sample_index;
+  float32_t mean_val;
+  uint32_t lag;
+  float32_t max_val;
+  uint32_t max_lag;
+  uint32_t bpm_estimate;
+
+  if ((spo2_state == NULL) || (bpm == NULL))
+  {
+    return 0U;
+  }
+
+  sample_count = spo2_state->sample_count;
+  if (sample_count < FFT_SIZE)
+  {
+    return 0U;
+  }
+
+  autocorr_ensure_init();
+
+  /* 从环形缓冲区复制滤波后的 IR 样本到 FFT 输入。 */
+  start_index = spo2_state->write_index;
+  sample_index = start_index;
+  for (i = 0U; i < FFT_SIZE; i++)
+  {
+    fft_in[i] = (float32_t)spo2_state->ir_filtered_samples[sample_index];
+    sample_index++;
+    if (sample_index >= MAX30102_SPO2_WINDOW_SIZE)
+    {
+      sample_index = 0U;
+    }
+  }
+
+  /* 减均值 + Hann 窗，抑制 DC 分量和频谱泄漏。 */
+  arm_mean_f32(fft_in, FFT_SIZE, &mean_val);
+  for (i = 0U; i < FFT_SIZE; i++)
+  {
+    fft_in[i] -= mean_val;
+    fft_in[i] *= 0.5f * (1.0f - arm_cos_f32(2.0f * 3.14159265f * (float32_t)i
+                                             / (float32_t)(FFT_SIZE - 1U)));
+  }
+
+  /* 正变换 RFFT：fft_in → fft_out（CMSIS-DSP packed complex 格式）。 */
+  arm_rfft_fast_f32(&rfft_inst, fft_in, fft_out, 0U);
+
+  /* 计算功率谱 |X[k]|^2。
+   * CMSIS-DSP RFFT 输出布局：[Re0, Re(N/2), Re1, Im1, Re2, Im2, ...]
+   * 其中 Re0 = DC 分量，Re(N/2) = Nyquist 分量。 */
+  {
+    float32_t re, im;
+
+    re = fft_out[0];
+    fft_out[0] = re * re;
+    re = fft_out[1];
+    fft_out[1] = re * re;
+
+    for (i = 2U; i < FFT_SIZE; i += 2U)
+    {
+      re = fft_out[i];
+      im = fft_out[i + 1U];
+      fft_out[i]       = re * re + im * im;
+      fft_out[i + 1U]  = 0.0f;
+    }
+  }
+
+  /* 逆变换 RFFT 输出到 fft_in（此版本 CMSIS-DSP 的 RFFT 逆变换不支持真正的
+   * in-place 操作，需要独立的输出缓冲区）。 */
+  arm_rfft_fast_f32(&rfft_inst, fft_out, fft_in, 1U);
+
+  /* 归一化：RFFT 逆变换不含缩放因子，需除以 FFT_SIZE。 */
+  for (i = 0U; i < FFT_SIZE; i++)
+  {
+    fft_in[i] /= (float32_t)FFT_SIZE;
+  }
+
+  /* 在有效滞后范围内搜索自相关峰值。 */
+  max_val = -1e30f;
+  max_lag = LAG_MIN;
+
+  for (lag = LAG_MIN; lag <= LAG_MAX; lag++)
+  {
+    if (fft_in[lag] > max_val)
+    {
+      max_val = fft_in[lag];
+      max_lag = lag;
+    }
+  }
+
+  /* 自相关峰度过弱则拒绝（阈值 = DC 分量峰值的 15%）。 */
+  if (max_val < (fft_in[0] * 0.15f))
+  {
+    return 0U;
+  }
+
+  bpm_estimate = (MAX30102_ALGO_SAMPLE_RATE_HZ * 60U) / max_lag;
+
+  if ((bpm_estimate < MAX30102_BPM_MIN_RESULT) ||
+      (bpm_estimate > MAX30102_BPM_MAX_RESULT))
+  {
+    return 0U;
+  }
+
+  *bpm = (uint8_t)bpm_estimate;
+  return 1U;
+}

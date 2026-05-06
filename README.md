@@ -1,19 +1,27 @@
 # BME
 
 基于 `STM32F407ZGTx` 的 `MAX30102 + SSD1306 + RTC + USART2` 生理信号采集工程。  
-当前版本已经完成心率、血氧、波形显示和串口上报这条主链路，适合作为后续继续扩展 `AD8232`、`DMA/ADC`、`CMSIS-DSP`、`RTOS` 等功能的基础版本。
+当前版本在 50 Hz 精确采样节拍、CMSIS-DSP 带通滤波、自相关 BPM 和 I2C DMA 传输的基础上，完成了心率、血氧、波形显示和串口上报的主链路，适合作为后续继续扩展 `AD8232`、`DMA/ADC`、`RTOS` 等功能的基础版本。
 
 This project is a physiological signal acquisition firmware based on `STM32F407ZGTx`, using `MAX30102 + SSD1306 + RTC + USART2`.  
-The current version already covers the main pipeline of heart-rate estimation, SpO2 estimation, waveform display, and UART reporting, and is suitable as a base for future extensions such as `AD8232`, `DMA/ADC`, `CMSIS-DSP`, and `RTOS`.
+The current version builds on a 50 Hz precise sampling tick, CMSIS-DSP bandpass filtering, autocorrelation BPM, and I2C DMA transfers. It covers the main pipeline of heart-rate estimation, SpO2 estimation, waveform display, and UART reporting, and is suitable as a base for future extensions such as `AD8232`, `DMA/ADC`, and `RTOS`.
 
 ## 当前功能 / Current Features
 
-- `MAX30102` 红光 / 红外采样  
-  `MAX30102` RED / IR sampling
+- `MAX30102` 红光 / 红外采样，LED 驱动电流 19 mA  
+  `MAX30102` RED / IR sampling, LED drive current 19 mA
+- `TIM6` 50 Hz 精确采样节拍 + `WFI` 低功耗等待  
+  `TIM6` 50 Hz precise sampling tick with `WFI` power-saving idle
+- `MAX30102 INT` 引脚中断驱动采样，TIM6 轮询兜底  
+  `MAX30102 INT` pin interrupt-driven sampling, TIM6 polling fallback
+- `I2C DMA` 传输 FIFO 数据，主循环不阻塞  
+  `I2C DMA` FIFO data transfer, non-blocking main loop
+- `CMSIS-DSP` 4 阶 Butterworth 带通滤波 (0.5–5 Hz)  
+  `CMSIS-DSP` 4th-order Butterworth bandpass filter (0.5–5 Hz)
+- 自相关 `BPM` + 时域 `SpO2` 双算法  
+  Autocorrelation `BPM` + time-domain `SpO2` dual algorithm
 - `OLED (SSD1306)` 实时页面显示  
   Real-time page rendering on `OLED (SSD1306)`
-- `BPM / SpO2` 基础计算  
-  Basic `BPM / SpO2` calculation
 - 开机 `5s` 无手指基线采集  
   `5s` no-finger baseline acquisition after boot
 - 自适应手指检测与测量状态切换  
@@ -24,6 +32,30 @@ The current version already covers the main pipeline of heart-rate estimation, S
   `USART2` text protocol reporting for direct host-side parsing
 - 调试页显示 `FIFO`、读数状态、`SQ (signal quality)`、`PI`  
   Debug page showing `FIFO`, read status, `SQ (signal quality)`, and `PI`
+
+## 采样架构 / Sampling Architecture
+
+系统采用 `TIM6` 产生 50 Hz 精确采样节拍（周期 20 ms），主循环在每个节拍内执行以下流程：
+
+The system uses `TIM6` to generate a precise 50 Hz sampling tick (20 ms period). The main loop runs the following flow on each tick:
+
+1. 轮询串口命令（USART2 DMA + IDLE 接收）  
+   Poll UART commands (USART2 DMA + IDLE reception)
+2. 处理按键（软件消抖）  
+   Handle buttons (software debounce)
+3. `max30102_should_service_fifo()` 门控判断是否需要读传感器  
+   `max30102_should_service_fifo()` gate to decide whether to read the sensor
+4. 推进 BPM / SpO2 算法 + 波形显示  
+   Advance BPM / SpO2 algorithms + waveform display
+5. 200 ms 周期上报 + OLED 刷新  
+   200 ms periodic report + OLED refresh
+
+节拍间通过 `__WFI()` 进入低功耗等待，TIM6 中断唤醒。  
+Between ticks the CPU enters low-power wait via `__WFI()`, woken by the TIM6 interrupt.
+
+`MAX30102 INT` 引脚（PA0）配合 EXTI 中断提供硬件数据就绪通知；若硬件未连接 INT 引脚，将 `MAX30102_USE_INT_PIN` 改为 `0U` 即可退化为纯 TIM6 轮询模式。
+
+The `MAX30102 INT` pin (PA0) with EXTI interrupt provides hardware data-ready notification. If the INT pin is not connected on your hardware, set `MAX30102_USE_INT_PIN` to `0U` to fall back to pure TIM6 polling mode.
 
 ## 硬件与引脚 / Hardware and Pinout
 
@@ -38,6 +70,7 @@ The current version already covers the main pipeline of heart-rate estimation, S
 
 - `PB8` -> `SCL`
 - `PB9` -> `SDA`
+- `PA0` -> `MAX30102 INT`（可选，通过 `MAX30102_USE_INT_PIN` 控制 / optional, controlled by `MAX30102_USE_INT_PIN`）
 
 ### `USART2`
 
@@ -137,5 +170,6 @@ T,success,rtc_valid,yyyymmdd,hhmmss,reason
 
 ## 当前状态 / Current Status
 
-这个版本的重点是先把基础采集、显示、RTC、上位机通信，以及一轮信号质量指标稳定下来，适合先存档到 GitHub，再继续往 `AD8232`、更强滤波、异常检测、`DMA/RTOS` 等方向扩展。  
-This version focuses on stabilizing the basic acquisition pipeline, display, RTC, host communication, and one round of signal-quality metrics first. It is a good point to archive on GitHub before moving on to stronger filtering, anomaly detection, `AD8232`, `DMA`, or `RTOS` based extensions.
+这一版已经完成了 TIM6 50 Hz 精确节拍、INT 引脚中断驱动采样、I2C DMA 传输、CMSIS-DSP Butterworth 带通滤波和自相关 BPM 的集成。系统以 20 ms 为周期稳定运行，主循环在 `__WFI()` 低功耗等待中度过大部分时间。适合作为继续往 `AD8232` 心电、更强滤波、异常检测、`RTOS` 等方向扩展的基线。
+
+This version integrates a TIM6 50 Hz precise tick, INT pin interrupt-driven sampling, I2C DMA transfers, CMSIS-DSP Butterworth bandpass filtering, and autocorrelation BPM. The system runs stably on a 20 ms cycle, with the main loop spending most of its time in `__WFI()` low-power wait. It serves as a solid baseline for extensions into `AD8232` ECG, stronger filtering, anomaly detection, or `RTOS`.
