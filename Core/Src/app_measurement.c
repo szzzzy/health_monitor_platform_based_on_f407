@@ -22,7 +22,7 @@
 #define MAX30102_SIGNAL_SPAN_NOISE_GAIN   3UL
 #define MAX30102_REACQUIRE_NOISE_IR       3000UL
 #define MAX30102_FINGER_ON_CONFIRM_COUNT  3U
-#define MAX30102_FINGER_OFF_CONFIRM_COUNT 3U
+#define MAX30102_FINGER_OFF_CONFIRM_COUNT 20U
 #define APP_SENSOR_RECOVERY_ERROR_COUNT   8U
 
 /* BPM 输出平滑参数，用于抑制跳变与尖峰。 */
@@ -719,12 +719,16 @@ static uint8_t app_is_raw_signal_present(const AppState_t *app)
 {
   uint32_t signal_span_threshold;
   uint32_t red_signal_span_threshold;
+  uint32_t finger_delta_threshold;
 
   if (app == NULL)
   {
     return 0U;
   }
 
+  finger_delta_threshold = (app->finger_present != 0U) ?
+                           app->adaptive_finger_off_delta :
+                           app->adaptive_finger_on_delta;
   signal_span_threshold = app_get_signal_span_threshold(app);
   red_signal_span_threshold = (signal_span_threshold * 3U) / 4U;
   if (red_signal_span_threshold == 0U)
@@ -732,7 +736,7 @@ static uint8_t app_is_raw_signal_present(const AppState_t *app)
     red_signal_span_threshold = 1U;
   }
 
-  if (app->ir_signal_delta >= app->adaptive_finger_on_delta)
+  if (app->ir_signal_delta >= finger_delta_threshold)
   {
     return 1U;
   }

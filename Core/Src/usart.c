@@ -24,7 +24,7 @@
 #include <string.h>
 
 /* --------------------------------------------------------------------------
- * USART2 DMA 循环接收缓冲区
+ * USART2 DMA 循环接收缓冲化
  *
  * DMA1_Stream5_Channel4 以 CIRCULAR 模式持续接收，IDLE 中断检测帧间隔。
  * uart_dma_last_pos 记录 DMA 缓冲区中已被协议层消费的位置。
@@ -71,7 +71,7 @@ void MX_USART2_UART_Init(void)
   }
   /* USER CODE BEGIN USART2_Init 2 */
   /* 启动 USART2 IDLE 中断 + DMA 循环接收。
-   * IDLE 中断在总线空闲（≥1 个字符时长无数据）时触发，
+   * IDLE 中断在总线空闲（≥1 个字符时长无数据）时触发）
    * 用于检测变长帧结束，免去逐字节轮询。 */
   __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
   HAL_NVIC_SetPriority(USART2_IRQn, 3, 0);

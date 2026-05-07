@@ -60,17 +60,17 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 /* USER CODE BEGIN Private defines */
 /*
- * MAX30102 中断引脚配置（可开关）
+ * MAX30102 中断引脚配置（可异关）
  *
- * 若你的硬件上 PA0 已连接到 MAX30102 的 INT 引脚，保持 USE_INT_PIN = 1U，
+ * 若你的硬件上 PE5 已连接到 MAX30102 的 INT 引脚，保持 USE_INT_PIN = 1U）
  * 系统会优先使用 EXTI 中断驱动采样（TIM6 节拍兜底）。
  *
- * 若 PA0 未连接，把 USE_INT_PIN 改为 0U 可禁用 EXTI 配置和中断处理，
+ * 若 PE5 未连接，把 USE_INT_PIN 改为 0U 可禁用 EXTI 配置和中断处理，
  * 系统退化为纯 TIM6 轮询模式。
  */
-#define MAX30102_INT_Pin          GPIO_PIN_0
-#define MAX30102_INT_GPIO_Port    GPIOA
-#define MAX30102_INT_EXTI_IRQn    EXTI0_IRQn
+#define MAX30102_INT_Pin          GPIO_PIN_5
+#define MAX30102_INT_GPIO_Port    GPIOE
+#define MAX30102_INT_EXTI_IRQn    EXTI9_5_IRQn
 #define MAX30102_USE_INT_PIN      1U
 
 /* USER CODE END Private defines */

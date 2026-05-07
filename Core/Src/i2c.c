@@ -42,7 +42,7 @@ void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -85,8 +85,8 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     /* I2C1 clock enable */
     __HAL_RCC_I2C1_CLK_ENABLE();
   /* USER CODE BEGIN I2C1_MspInit 1 */
-  /* 配置 I2C1 的 TX/RX DMA 通道及 I2C 事件/错误中断。
-   * HAL_I2C_Mem_Read_DMA 内部先通过 TX DMA 发送设备地址和寄存器地址，
+  /* 配置 I2C1 的 TX/RX DMA 通道取 I2C 事件/错误中断。
+   * HAL_I2C_Mem_Read_DMA 内部先通过 TX DMA 发送设备地址和寄存器地址）
    * 再通过 RX DMA 接收数据。两者缺一不可。 */
   {
     __HAL_RCC_DMA1_CLK_ENABLE();

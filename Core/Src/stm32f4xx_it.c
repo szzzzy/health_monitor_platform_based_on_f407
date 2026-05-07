@@ -26,6 +26,7 @@
 #include "i2c.h"
 #include "max30102.h"
 #include "usart.h"
+#include "app_sd_card.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,7 +60,7 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-
+extern TIM_HandleTypeDef htim6;
 /* USER CODE BEGIN EV */
 extern volatile uint8_t tim6_tick_flag;
 /* USER CODE END EV */
@@ -202,13 +203,39 @@ void SysTick_Handler(void)
 /* please refer to the startup file (startup_stm32f4xx.s).                    */
 /******************************************************************************/
 
-/* USER CODE BEGIN 1 */
-/* TIM6 精确 50 Hz 采样节拍 — 优先级 1，每 20 ms 断言一次。 */
+/**
+  * @brief This function handles EXTI line[9:5] interrupts.
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
+
+  /* USER CODE END EXTI9_5_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_5);
+  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
+
+  /* USER CODE END EXTI9_5_IRQn 1 */
+}
+
+/**
+  * @brief This function handles TIM6 global interrupt, DAC1 and DAC2 underrun error interrupts.
+  */
 void TIM6_DAC_IRQHandler(void)
 {
-  if (__HAL_TIM_GET_FLAG(&htim6, TIM_FLAG_UPDATE) != RESET)
+  /* USER CODE BEGIN TIM6_DAC_IRQn 0 */
+
+  /* USER CODE END TIM6_DAC_IRQn 0 */
+  HAL_TIM_IRQHandler(&htim6);
+  /* USER CODE BEGIN TIM6_DAC_IRQn 1 */
+
+  /* USER CODE END TIM6_DAC_IRQn 1 */
+}
+
+/* USER CODE BEGIN 1 */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if ((htim != NULL) && (htim->Instance == TIM6))
   {
-    __HAL_TIM_CLEAR_IT(&htim6, TIM_IT_UPDATE);
     tim6_tick_flag = 1U;
   }
 }
@@ -248,14 +275,9 @@ void I2C1_ER_IRQHandler(void)
   HAL_I2C_ER_IRQHandler(&hi2c1);
 }
 
-/* MAX30102 PPG_RDY 中断（PA0 下降沿）。
- * 若 PA0 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发，
+/* MAX30102 PPG_RDY 中断（PE5 下降沿）。
+ * 若 PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发）
  * 系统会通过 TIM6 节拍兜底轮询。 */
-void EXTI0_IRQHandler(void)
-{
-  HAL_GPIO_EXTI_IRQHandler(MAX30102_INT_Pin);
-}
-
 /* HAL GPIO EXTI 统一回调，按引脚分发。 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -263,6 +285,11 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   {
     max30102_mark_data_ready_from_isr();
   }
+}
+
+void SDIO_IRQHandler(void)
+{
+  HAL_SD_IRQHandler(APP_SD_Card_GetHandle());
 }
 /* USER CODE END 1 */
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
