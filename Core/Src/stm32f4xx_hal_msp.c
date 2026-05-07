@@ -79,6 +79,48 @@ void HAL_MspInit(void)
 
 /* USER CODE BEGIN 1 */
 
+void HAL_SD_MspInit(SD_HandleTypeDef *hsd)
+{
+  GPIO_InitTypeDef gpio = {0};
+  if (hsd->Instance == SDIO)
+  {
+    __HAL_RCC_SDIO_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+
+    gpio.Mode      = GPIO_MODE_AF_PP;
+    gpio.Pull      = GPIO_PULLUP;
+    gpio.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = GPIO_AF12_SDIO;
+
+    /* DAT0-DAT3: 需上拉 */
+    gpio.Pin = GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11;
+    HAL_GPIO_Init(GPIOC, &gpio);
+
+    /* CLK: 推挽时钟输出，不加上拉 */
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Pin  = GPIO_PIN_12;
+    HAL_GPIO_Init(GPIOC, &gpio);
+
+    gpio.Pin = GPIO_PIN_2;
+    HAL_GPIO_Init(GPIOD, &gpio);
+
+    HAL_NVIC_SetPriority(SDIO_IRQn, 4, 0);
+    HAL_NVIC_EnableIRQ(SDIO_IRQn);
+  }
+}
+
+void HAL_SD_MspDeInit(SD_HandleTypeDef *hsd)
+{
+  if (hsd->Instance == SDIO)
+  {
+    __HAL_RCC_SDIO_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOC, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12);
+    HAL_GPIO_DeInit(GPIOD, GPIO_PIN_2);
+    HAL_NVIC_DisableIRQ(SDIO_IRQn);
+  }
+}
+
 /* USER CODE END 1 */
 
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

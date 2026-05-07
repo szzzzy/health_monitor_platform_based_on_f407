@@ -100,6 +100,11 @@ typedef struct
   PageButton_t brightness_button;
   PageButton_t page_prev_button;
   PageButton_t page_next_button;
+  /* SD 卡数据记录状态 */
+  uint8_t  sd_card_ready;
+  uint8_t  sd_log_active;
+  uint8_t  sd_log_error;
+  uint32_t sd_total_written;
 } AppState_t;
 
 #ifdef __cplusplus

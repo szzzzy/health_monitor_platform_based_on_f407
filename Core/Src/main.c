@@ -1,8 +1,8 @@
-﻿/* USER CODE BEGIN Header */
+/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : 主程序入口与应用层调度
+  * @brief          : 主程序入口与应用层调试
   * @attention
   *
   * <h2><center>&copy; Copyright (c) 2026 STMicroelectronics.
@@ -20,6 +20,7 @@
 #include "main.h"
 #include "i2c.h"
 #include "rtc.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -28,9 +29,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app_data_log.h"
 #include "app_display.h"
 #include "app_measurement.h"
 #include "app_protocol.h"
+#include "app_sd_card.h"
 #include "max30102.h"
 #include "ssd1306.h"
 /* USER CODE END Includes */
@@ -56,7 +59,6 @@
 
 /* USER CODE BEGIN PV */
 volatile uint8_t tim6_tick_flag = 0;
-TIM_HandleTypeDef htim6;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -97,6 +99,9 @@ static void app_send_report_if_due(AppState_t *app)
 
   app_protocol_send_sensor_report(app);
   app->report_due = 0U;
+
+  /* SD 卡日志：每次上报同期落盘 */
+  (void)APP_DataLog_WriteRecord(app);
 }
 
 /* OLED 刷新单独封装，让主循环更像调度器而不是细节堆场。 */
@@ -135,37 +140,6 @@ static void app_schedule_periodic_refresh(AppState_t *app)
   app->display_refresh_requested = 1U;
 }
 
-/*
- * TIM6 精确 50 Hz 采样节拍初始化。
- *
- * TIM6 挂在 APB1 定时器总线（84 MHz）。
- * Prescaler = 8399 → 84 MHz / 8400 = 10 kHz 计数时钟
- * Period    = 199  → 10 kHz / 200 = 50.0 Hz 中断频率（周期 20 ms）
- *
- * 优先级设为 1（仅低于不可抢占的 NMI/HardFault），
- * 保证每 20 ms 准时设置 tim6_tick_flag，不被其他中断长时间延误。
- */
-static void MX_TIM6_Init(void)
-{
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  __HAL_RCC_TIM6_CLK_ENABLE();
-
-  htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 8399;
-  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 199;
-  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  HAL_TIM_Base_Init(&htim6);
-
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig);
-
-  HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
-  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
-  HAL_TIM_Base_Start_IT(&htim6);
-}
 /* USER CODE END 0 */
 
 /**
@@ -193,7 +167,6 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  MX_TIM6_Init();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -201,7 +174,13 @@ int main(void)
   MX_I2C1_Init();
   MX_USART2_UART_Init();
   MX_RTC_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
+  HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+  HAL_TIM_Base_Start_IT(&htim6);
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
   /* 启动显示、读取 RTC，并先给出开机状态页。 */
   ssd1306_Init();
   app_protocol_update_rtc_snapshot(&app);
@@ -223,7 +202,11 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* 上电先采集一段“无手指”背景，建立 IR 基线。 */
+  /* SD 卡日志：提前初始化，不阻塞主路径 */
+  APP_DataLog_Init();
+  (void)APP_DataLog_StartSession();
+
+  /* 上电先采集一段”无手指”背景，建立 IR 基线。 */
   while (app_measurement_baseline_ready() == 0U)
   {
     app_protocol_poll_uart_commands(&app);
