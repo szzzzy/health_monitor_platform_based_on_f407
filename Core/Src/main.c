@@ -47,6 +47,7 @@
 /* USER CODE BEGIN PD */
 #define APP_UI_REFRESH_PERIOD_MS 200U
 #define APP_MAIN_LOOP_DELAY_MS   5U
+#define APP_SENSOR_DRAIN_BUDGET  32U
 
 /* USER CODE END PD */
 
@@ -179,8 +180,6 @@ int main(void)
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
   HAL_TIM_Base_Start_IT(&htim6);
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 2, 0);
-  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
   /* 启动显示、读取 RTC，并先给出开机状态页。 */
   ssd1306_Init();
   app_protocol_update_rtc_snapshot(&app);
@@ -275,7 +274,7 @@ int main(void)
      * - 轮询串口命令（DMA+IDLE，非阻塞）
      * - 处理按键（软件消抖）
      * - max30102_should_service_fifo() 门控传感器读取：
-     *    若 INT 已触发则立即读，否则等待 INT 或 TIM6 兜底超时
+     *    当前禁用 MAX30102 INT，按 TIM6 100 Hz 纯轮询 FIFO
      * - 推进 BPM/SpO2 算法 + 波形显示
      * - 200 ms 周期统一上报 + 刷新 OLED
      */
@@ -284,21 +283,30 @@ int main(void)
 
     if (max30102_should_service_fifo() != 0U)
     {
-      switch (app_measurement_read_sensor_sample(&app))
+      uint8_t drain_budget = APP_SENSOR_DRAIN_BUDGET;
+
+      /* Catch up after OLED/SD blocking so the MAX30102 FIFO keeps moving. */
+      while (drain_budget > 0U)
       {
-        case APP_MEASUREMENT_READ_OK:
+        AppMeasurementReadStatus_t read_status;
+
+        drain_budget--;
+        read_status = app_measurement_read_sensor_sample(&app);
+        if (read_status == APP_MEASUREMENT_READ_OK)
+        {
           app_measurement_update_adaptive_thresholds(&app);
           app_measurement_update_finger_state(&app);
           app_measurement_process(&app);
           app_measurement_update_periodic_flags(&app);
-          break;
+          continue;
+        }
 
-        case APP_MEASUREMENT_READ_ERROR:
+        if (read_status == APP_MEASUREMENT_READ_ERROR)
+        {
           app_measurement_recover_sensor(&app);
-          break;
+        }
 
-        default:
-          break;
+        break;
       }
     }
 
@@ -306,7 +314,7 @@ int main(void)
     app_send_report_if_due(&app);
     app_refresh_display_if_needed(&app);
 
-    /* Wait for next 20ms tick from TIM6 (WFI saves power while idle). */
+    /* Wait for next 10ms tick from TIM6 (WFI saves power while idle). */
     while (tim6_tick_flag == 0U)
     {
       __WFI();

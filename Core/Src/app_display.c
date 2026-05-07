@@ -22,19 +22,25 @@
 #define OLED_WAVEFORM_HEIGHT       (SSD1306_HEIGHT - OLED_WAVEFORM_TOP_Y)
 
 /*
- * 波形显示先做慢速直流跟踪，再做归一化。
- * 这样即使原始值量级很大，也能在 OLED 上看到真正有意义的脉搏起伏。
+ * OLED 只显示已经过 MAX30102 算法带通滤波的 AC 波形。
+ * AGC 使用慢释放、快响应，避免把无意义的小噪声拉成满屏方波。
  */
-#define WAVEFORM_DC_FILTER_SHIFT   5U
-#define WAVEFORM_NORMALIZE_SCALE   4096L
+#define WAVEFORM_SETTLE_SAMPLES      25U
+#define WAVEFORM_AGC_MIN_SCALE       32UL
+#define WAVEFORM_AGC_MAX_SCALE       20000UL
+#define WAVEFORM_AGC_HEADROOM_NUM    2UL
+#define WAVEFORM_AGC_HEADROOM_DEN    1UL
+#define WAVEFORM_AGC_ATTACK_SHIFT    2U
+#define WAVEFORM_AGC_RELEASE_SHIFT   5U
 
-/* OLED 波形缓冲：保存最近一屏样本及当前 DC 估计。 */
+/* OLED 波形缓冲：保存最近一屏带通 AC 样本及显示增益状态。 */
 typedef struct
 {
-  int16_t samples[SSD1306_WIDTH];
+  int32_t samples[SSD1306_WIDTH];
   uint16_t write_index;
   uint16_t sample_count;
-  uint32_t dc_estimate;
+  uint16_t settle_count;
+  uint32_t scale_estimate;
 } WaveformBuffer_t;
 
 static WaveformBuffer_t ir_waveform;
@@ -44,7 +50,8 @@ static const char *const display_brightness_label_table[DISPLAY_BRIGHTNESS_LEVEL
 
 static uint8_t page_button_poll_pressed(PageButton_t *button);
 static void waveform_buffer_reset(WaveformBuffer_t *waveform);
-static void waveform_buffer_add_sample(WaveformBuffer_t *waveform, uint32_t raw_value);
+static uint32_t waveform_abs_i32(int32_t value);
+static void waveform_buffer_add_sample(WaveformBuffer_t *waveform, int32_t filtered_value);
 static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
                                  uint8_t x,
                                  uint8_t y,
@@ -89,15 +96,15 @@ void app_display_reset_waveforms(void)
 }
 
 /* IR 页面使用的波形样本入口。 */
-void app_display_add_ir_sample(uint32_t raw_value)
+void app_display_add_ir_sample(int32_t filtered_value)
 {
-  waveform_buffer_add_sample(&ir_waveform, raw_value);
+  waveform_buffer_add_sample(&ir_waveform, filtered_value);
 }
 
 /* SpO2 页面使用的波形样本入口。 */
-void app_display_add_red_sample(uint32_t raw_value)
+void app_display_add_red_sample(int32_t filtered_value)
 {
-  waveform_buffer_add_sample(&red_waveform, raw_value);
+  waveform_buffer_add_sample(&red_waveform, filtered_value);
 }
 
 /* 处理页面切换按键，让 UI 切换与测量处理保持解耦。 */
@@ -501,62 +508,72 @@ static void waveform_buffer_reset(WaveformBuffer_t *waveform)
 
   waveform->write_index = 0U;
   waveform->sample_count = 0U;
-  waveform->dc_estimate = 0U;
+  waveform->settle_count = 0U;
+  waveform->scale_estimate = WAVEFORM_AGC_MIN_SCALE;
+}
+
+static uint32_t waveform_abs_i32(int32_t value)
+{
+  if (value < 0)
+  {
+    return (uint32_t)(-value);
+  }
+
+  return (uint32_t)value;
 }
 
 /*
- * 压入一个原始样本，并顺手完成去直流与归一化。
- * 这样后续显示逻辑只需要关心“画图”，不必再处理原始值尺度问题。
+ * 压入一个已经带通滤波后的 AC 样本。
+ * 前几个样本只用于等待滤波器阶跃响应消退，不进入显示窗口。
  */
-static void waveform_buffer_add_sample(WaveformBuffer_t *waveform, uint32_t raw_value)
+static void waveform_buffer_add_sample(WaveformBuffer_t *waveform, int32_t filtered_value)
 {
-  int32_t ac_component;
-  int32_t normalized_sample;
-  uint32_t dc_delta;
+  uint32_t abs_value;
+  uint32_t delta;
 
   if (waveform == NULL)
   {
     return;
   }
 
-  if (waveform->dc_estimate == 0U)
+  if (waveform->settle_count < WAVEFORM_SETTLE_SAMPLES)
   {
-    waveform->dc_estimate = raw_value;
-  }
-  else if (waveform->dc_estimate < raw_value)
-  {
-    dc_delta = raw_value - waveform->dc_estimate;
-    waveform->dc_estimate += ((dc_delta >> WAVEFORM_DC_FILTER_SHIFT) != 0U) ?
-                             (dc_delta >> WAVEFORM_DC_FILTER_SHIFT) : 1U;
-  }
-  else if (waveform->dc_estimate > raw_value)
-  {
-    dc_delta = waveform->dc_estimate - raw_value;
-    waveform->dc_estimate -= ((dc_delta >> WAVEFORM_DC_FILTER_SHIFT) != 0U) ?
-                             (dc_delta >> WAVEFORM_DC_FILTER_SHIFT) : 1U;
+    waveform->settle_count++;
+    return;
   }
 
-  ac_component = (int32_t)raw_value - (int32_t)waveform->dc_estimate;
-  if (waveform->dc_estimate == 0U)
+  abs_value = waveform_abs_i32(filtered_value);
+  if (abs_value > WAVEFORM_AGC_MAX_SCALE)
   {
-    normalized_sample = 0;
+    abs_value = WAVEFORM_AGC_MAX_SCALE;
+  }
+
+  if ((waveform->sample_count == 0U) && (abs_value > waveform->scale_estimate))
+  {
+    waveform->scale_estimate = abs_value;
+  }
+  else if (abs_value > waveform->scale_estimate)
+  {
+    delta = abs_value - waveform->scale_estimate;
+    waveform->scale_estimate += ((delta >> WAVEFORM_AGC_ATTACK_SHIFT) != 0U) ?
+                                (delta >> WAVEFORM_AGC_ATTACK_SHIFT) : 1U;
   }
   else
   {
-    normalized_sample = (int32_t)(((int64_t)ac_component * WAVEFORM_NORMALIZE_SCALE) /
-                                  (int64_t)waveform->dc_estimate);
+    delta = waveform->scale_estimate - abs_value;
+    waveform->scale_estimate -= (delta >> WAVEFORM_AGC_RELEASE_SHIFT);
   }
 
-  if (normalized_sample > 32767)
+  if (waveform->scale_estimate < WAVEFORM_AGC_MIN_SCALE)
   {
-    normalized_sample = 32767;
+    waveform->scale_estimate = WAVEFORM_AGC_MIN_SCALE;
   }
-  else if (normalized_sample < -32768)
+  else if (waveform->scale_estimate > WAVEFORM_AGC_MAX_SCALE)
   {
-    normalized_sample = -32768;
+    waveform->scale_estimate = WAVEFORM_AGC_MAX_SCALE;
   }
 
-  waveform->samples[waveform->write_index] = (int16_t)normalized_sample;
+  waveform->samples[waveform->write_index] = filtered_value;
   waveform->write_index++;
   if (waveform->write_index >= SSD1306_WIDTH)
   {
@@ -579,14 +596,15 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
   uint16_t i;
   uint16_t sample_count;
   uint16_t start_index;
-  int16_t sample_min;
-  int16_t sample_max;
-  int16_t sample_value;
   uint8_t prev_y = 0U;
   uint8_t draw_y;
   uint8_t line_y;
   uint16_t sample_index;
-  int32_t range;
+  int32_t center_y;
+  int32_t half_height;
+  int32_t draw_y_i;
+  int32_t sample_value;
+  uint32_t display_scale;
 
   if ((waveform == NULL) || (width == 0U) || (height == 0U))
   {
@@ -618,35 +636,49 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
     start_index = waveform->write_index;
   }
 
-  sample_index = start_index;
-  sample_min = waveform->samples[sample_index];
-  sample_max = waveform->samples[sample_index];
-
-  for (i = 0U; i < sample_count; i++)
+  center_y = (int32_t)y + ((int32_t)height / 2L);
+  half_height = ((int32_t)height / 2L) - 1L;
+  if (half_height < 1L)
   {
-    sample_index = (uint16_t)((start_index + i) % SSD1306_WIDTH);
-    sample_value = waveform->samples[sample_index];
-    if (sample_value < sample_min)
-    {
-      sample_min = sample_value;
-    }
-    if (sample_value > sample_max)
-    {
-      sample_max = sample_value;
-    }
+    half_height = 1L;
   }
 
-  range = (int32_t)sample_max - (int32_t)sample_min;
-  if (range == 0)
+  display_scale = (waveform->scale_estimate * WAVEFORM_AGC_HEADROOM_NUM) /
+                  WAVEFORM_AGC_HEADROOM_DEN;
+  if (display_scale < WAVEFORM_AGC_MIN_SCALE)
   {
-    range = 1;
+    display_scale = WAVEFORM_AGC_MIN_SCALE;
+  }
+  else if (display_scale > WAVEFORM_AGC_MAX_SCALE)
+  {
+    display_scale = WAVEFORM_AGC_MAX_SCALE;
   }
 
   for (i = 0U; i < sample_count; i++)
   {
     sample_index = (uint16_t)((start_index + i) % SSD1306_WIDTH);
     sample_value = waveform->samples[sample_index];
-    draw_y = (uint8_t)(y + ((int32_t)(sample_max - sample_value) * (int32_t)(height - 1U)) / range);
+    if (sample_value > (int32_t)display_scale)
+    {
+      sample_value = (int32_t)display_scale;
+    }
+    else if (sample_value < -((int32_t)display_scale))
+    {
+      sample_value = -((int32_t)display_scale);
+    }
+
+    draw_y_i = center_y - (int32_t)(((int64_t)sample_value * (int64_t)half_height) /
+                                    (int64_t)display_scale);
+    if (draw_y_i < (int32_t)y)
+    {
+      draw_y_i = (int32_t)y;
+    }
+    else if (draw_y_i >= ((int32_t)y + (int32_t)height))
+    {
+      draw_y_i = (int32_t)y + (int32_t)height - 1L;
+    }
+
+    draw_y = (uint8_t)draw_y_i;
     ssd1306_DrawPixel((uint8_t)(x + i), draw_y, SSD1306_COLOR_WHITE);
 
     if (i != 0U)

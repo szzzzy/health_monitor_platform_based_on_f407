@@ -211,7 +211,9 @@ void EXTI9_5_IRQHandler(void)
   /* USER CODE BEGIN EXTI9_5_IRQn 0 */
 
   /* USER CODE END EXTI9_5_IRQn 0 */
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_5);
+#if (MAX30102_USE_INT_PIN != 0U)
+  HAL_GPIO_EXTI_IRQHandler(MAX30102_INT_Pin);
+#endif
   /* USER CODE BEGIN EXTI9_5_IRQn 1 */
 
   /* USER CODE END EXTI9_5_IRQn 1 */
@@ -281,10 +283,14 @@ void I2C1_ER_IRQHandler(void)
 /* HAL GPIO EXTI 统一回调，按引脚分发。 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
+#if (MAX30102_USE_INT_PIN != 0U)
   if (GPIO_Pin == MAX30102_INT_Pin)
   {
     max30102_mark_data_ready_from_isr();
   }
+#else
+  (void)GPIO_Pin;
+#endif
 }
 
 void SDIO_IRQHandler(void)

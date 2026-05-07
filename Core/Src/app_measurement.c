@@ -17,12 +17,9 @@
 #define MAX30102_FINGER_OFF_NOISE_GAIN    2UL
 #define MAX30102_FINGER_ON_DELTA_MAX      18000UL
 #define MAX30102_FINGER_OFF_DELTA_MAX     9000UL
-#define MAX30102_SIGNAL_SPAN_MIN          800UL
-#define MAX30102_SIGNAL_SPAN_MAX          12000UL
-#define MAX30102_SIGNAL_SPAN_NOISE_GAIN   3UL
 #define MAX30102_REACQUIRE_NOISE_IR       3000UL
-#define MAX30102_FINGER_ON_CONFIRM_COUNT  3U
-#define MAX30102_FINGER_OFF_CONFIRM_COUNT 20U
+#define MAX30102_FINGER_ON_CONFIRM_COUNT  8U
+#define MAX30102_FINGER_OFF_CONFIRM_COUNT 75U
 #define APP_SENSOR_RECOVERY_ERROR_COUNT   8U
 
 /* BPM 输出平滑参数，用于抑制跳变与尖峰。 */
@@ -35,8 +32,9 @@
 #define APP_BPM_INVALID_HOLD_TICKS        30U
 #define APP_BPM_EVALUATE_INTERVAL_SAMPLES 3U
 #define APP_BPM_MAX_STEP_PER_UPDATE       5U
+#define APP_BPM_ACORR_BLEND_MAX_DIFF      12U
 #define APP_SIGNAL_QUALITY_MIN_FOR_SPO2   30U
-#define APP_SIGNAL_QUALITY_MIN_FOR_BPM    40U
+#define APP_SIGNAL_QUALITY_MIN_FOR_BPM    25U
 
 static uint8_t fifo_buf[6];
 static MAX30102_Baseline_t baseline_data;
@@ -56,7 +54,6 @@ static struct
   uint32_t red_low;
 } signal_envelope;
 
-static uint32_t app_abs_diff_u32(uint32_t lhs, uint32_t rhs);
 static uint8_t app_abs_diff_u8(uint8_t lhs, uint8_t rhs);
 static uint8_t app_limit_bpm_step(uint8_t current_bpm, uint8_t target_bpm, uint8_t max_step);
 static uint8_t app_median3_u8(uint8_t a, uint8_t b, uint8_t c);
@@ -64,7 +61,6 @@ static uint8_t app_filter_raw_bpm(AppState_t *app, uint8_t raw_bpm_value);
 static uint32_t app_slow_follow_u32(uint32_t current, uint32_t target, uint8_t shift);
 static void app_reset_signal_envelope(void);
 static void app_update_signal_activity(AppState_t *app);
-static uint32_t app_get_signal_span_threshold(const AppState_t *app);
 static uint8_t app_is_raw_signal_present(const AppState_t *app);
 static void app_track_background_ir(AppState_t *app);
 static void app_reset_measurement_outputs(AppState_t *app);
@@ -304,6 +300,9 @@ void app_measurement_update_finger_state(AppState_t *app)
     {
       app->finger_present = 1U;
       app->finger_on_confirm_count = 0U;
+      app_reset_measurement_outputs(app);
+      app_reset_signal_envelope();
+      app->raw_signal_present = 1U;
       app->report_due = 1U;
       app->display_refresh_requested = 1U;
     }
@@ -347,8 +346,12 @@ void app_measurement_process(AppState_t *app)
   MAX30102_SignalMetrics_t signal_metrics;
   uint8_t raw_bpm_valid = 0U;
   uint8_t raw_bpm_value = 0U;
+  uint8_t acorr_bpm_valid = 0U;
+  uint8_t acorr_bpm = 0U;
   uint8_t raw_spo2_valid = 0U;
   uint8_t signal_quality = 0U;
+  int32_t red_waveform_sample = 0;
+  int32_t ir_waveform_sample = 0;
 
   if (app == NULL)
   {
@@ -365,9 +368,14 @@ void app_measurement_process(AppState_t *app)
     return;
   }
 
-  app_display_add_ir_sample(app->ir_value);
-  app_display_add_red_sample(app->red_value);
   max30102_spo2_add_sample(&spo2_state, app->red_value, app->ir_value);
+  if (max30102_spo2_get_latest_filtered(&spo2_state,
+                                         &red_waveform_sample,
+                                         &ir_waveform_sample) != 0U)
+  {
+    app_display_add_ir_sample(ir_waveform_sample);
+    app_display_add_red_sample(red_waveform_sample);
+  }
 
   if (max30102_get_signal_metrics(&spo2_state, &signal_metrics) != 0U)
   {
@@ -415,24 +423,27 @@ void app_measurement_process(AppState_t *app)
 
   /*
    * 当信号质量足够时，用时域峰值检测 + FFT 自相关两种方法互相验证。
-   * 若两者结果差异 ≤ 8 BPM，采用加权混合：25% 峰值 + 75% 自相关。
-   * 自相关法对弱信号更鲁棒，但对突变心率响应较慢——因此保留峰值检测
-   * 作为 baseline，在差异过大时优先采信峰值检测结果。
+   * 自相关法对弱信号和波形极性更鲁棒，因此也作为峰值法失败时的备用路径。
    */
-  if ((raw_bpm_valid != 0U) && (app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM))
+  if (app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM)
   {
-    uint8_t acorr_bpm;
+    acorr_bpm_valid = max30102_autocorr_bpm(&spo2_state, &acorr_bpm);
+  }
 
-    if (max30102_autocorr_bpm(&spo2_state, &acorr_bpm) != 0U)
+  if ((raw_bpm_valid != 0U) && (acorr_bpm_valid != 0U))
+  {
+    uint8_t diff = (raw_bpm_value > acorr_bpm) ? (raw_bpm_value - acorr_bpm)
+                                               : (acorr_bpm - raw_bpm_value);
+    if (diff <= APP_BPM_ACORR_BLEND_MAX_DIFF)
     {
-      uint8_t diff = (raw_bpm_value > acorr_bpm) ? (raw_bpm_value - acorr_bpm)
-                                                 : (acorr_bpm - raw_bpm_value);
-      if (diff <= 8U)
-      {
-        /* Weighted blend: 25 % peak-detect + 75 % autocorrelation */
-        raw_bpm_value = (uint8_t)(((uint16_t)raw_bpm_value + (uint16_t)acorr_bpm * 3U + 2U) / 4U);
-      }
+      /* Weighted blend: 25% peak-detect + 75% autocorrelation. */
+      raw_bpm_value = (uint8_t)(((uint16_t)raw_bpm_value + (uint16_t)acorr_bpm * 3U + 2U) / 4U);
     }
+  }
+  else if (acorr_bpm_valid != 0U)
+  {
+    raw_bpm_valid = 1U;
+    raw_bpm_value = acorr_bpm;
   }
 
   if ((raw_bpm_valid != 0U) && (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM))
@@ -443,7 +454,7 @@ void app_measurement_process(AppState_t *app)
   app_update_bpm_output(app, raw_bpm_valid, raw_bpm_value);
 }
 
-/* 把 50 Hz 采样节拍降频成约 10 Hz 的显示/上报节拍。 */
+/* 把 100 Hz 采样节拍降频成约 5 Hz 的显示/上报节拍。 */
 void app_measurement_update_periodic_flags(AppState_t *app)
 {
   if (app == NULL)
@@ -452,7 +463,7 @@ void app_measurement_update_periodic_flags(AppState_t *app)
   }
 
   app->refresh_div++;
-  if (app->refresh_div < 10U)
+  if (app->refresh_div < 20U)
   {
     return;
   }
@@ -491,17 +502,6 @@ void app_measurement_recover_sensor(AppState_t *app)
   app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
   app->display_refresh_requested = 1U;
   app->report_due = 1U;
-}
-
-/* 计算两个 8 位无符号数的绝对差。 */
-static uint32_t app_abs_diff_u32(uint32_t lhs, uint32_t rhs)
-{
-  if (lhs >= rhs)
-  {
-    return lhs - rhs;
-  }
-
-  return rhs - lhs;
 }
 
 static uint32_t app_slow_follow_u32(uint32_t current, uint32_t target, uint8_t shift)
@@ -680,48 +680,25 @@ static void app_update_signal_activity(AppState_t *app)
     signal_envelope.red_low = app_slow_follow_u32(signal_envelope.red_low, app->red_value, 4U);
   }
 
-  app->ir_signal_delta = app_abs_diff_u32(app->ir_value, app->baseline_ir);
+  app->ir_signal_delta = (app->ir_value > app->baseline_ir) ?
+                         (app->ir_value - app->baseline_ir) : 0U;
   app->ir_signal_span = (signal_envelope.ir_high >= signal_envelope.ir_low) ?
                         (signal_envelope.ir_high - signal_envelope.ir_low) : 0U;
   app->red_signal_span = (signal_envelope.red_high >= signal_envelope.red_low) ?
                          (signal_envelope.red_high - signal_envelope.red_low) : 0U;
 }
 
-static uint32_t app_get_signal_span_threshold(const AppState_t *app)
-{
-  uint32_t threshold = MAX30102_SIGNAL_SPAN_MIN;
-  uint32_t noise_threshold = max30102_baseline_get_noise_ir(&baseline_data) *
-                             MAX30102_SIGNAL_SPAN_NOISE_GAIN;
-
-  if (noise_threshold > threshold)
-  {
-    threshold = noise_threshold;
-  }
-
-  if ((app != NULL) && (app->baseline_range_ir != 0U))
-  {
-    uint32_t startup_range_threshold = app->baseline_range_ir / 4U;
-    if (startup_range_threshold > threshold)
-    {
-      threshold = startup_range_threshold;
-    }
-  }
-
-  if (threshold > MAX30102_SIGNAL_SPAN_MAX)
-  {
-    threshold = MAX30102_SIGNAL_SPAN_MAX;
-  }
-
-  return threshold;
-}
-
 static uint8_t app_is_raw_signal_present(const AppState_t *app)
 {
-  uint32_t signal_span_threshold;
-  uint32_t red_signal_span_threshold;
   uint32_t finger_delta_threshold;
+  uint32_t ir_delta;
 
   if (app == NULL)
+  {
+    return 0U;
+  }
+
+  if (app->ir_value <= app->baseline_ir)
   {
     return 0U;
   }
@@ -729,29 +706,9 @@ static uint8_t app_is_raw_signal_present(const AppState_t *app)
   finger_delta_threshold = (app->finger_present != 0U) ?
                            app->adaptive_finger_off_delta :
                            app->adaptive_finger_on_delta;
-  signal_span_threshold = app_get_signal_span_threshold(app);
-  red_signal_span_threshold = (signal_span_threshold * 3U) / 4U;
-  if (red_signal_span_threshold == 0U)
-  {
-    red_signal_span_threshold = 1U;
-  }
+  ir_delta = app->ir_value - app->baseline_ir;
 
-  if (app->ir_signal_delta >= finger_delta_threshold)
-  {
-    return 1U;
-  }
-
-  if (app->ir_signal_span >= signal_span_threshold)
-  {
-    return 1U;
-  }
-
-  if (app->red_signal_span >= red_signal_span_threshold)
-  {
-    return 1U;
-  }
-
-  return 0U;
+  return (ir_delta >= finger_delta_threshold) ? 1U : 0U;
 }
 
 static void app_track_background_ir(AppState_t *app)

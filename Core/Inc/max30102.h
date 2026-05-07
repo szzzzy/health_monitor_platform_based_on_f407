@@ -50,19 +50,21 @@ extern "C" {
 #define MAX30102_DEFAULT_MODE_CONFIG            MAX30102_MODE_SPO2
 /*
  * SPO2_CONFIG:
- * - ADC range: 4096 nA
- * - Sample rate: 50 sps
+ * - ADC range: 16384 nA
+ * - Sample rate: 100 sps
  * - LED pulse width: 411 us / 18-bit
  *
- * The firmware drains every pending FIFO sample during each 20 ms service pass,
- * so keep the sensor at 50 Hz to match the algorithm's fixed sample-rate math.
+ * The firmware drains every pending FIFO sample during each 10 ms service pass,
+ * so keep the sensor at 100 Hz to match the algorithm's fixed sample-rate math.
+ * Use the largest ADC range so finger contact does not pin RED/IR at 0x03FFFF.
  */
-#define MAX30102_DEFAULT_SPO2_CONFIG            0x23U
+#define MAX30102_DEFAULT_SPO2_CONFIG            0x67U
 
-/* Boost LED drive current for stronger PPG signal and better SNR on reflective
-   sensing.  Value × 0.2 mA → 0x5F ≈ 19 mA (safe continuous level for MAX30102). */
-#define MAX30102_DEFAULT_LED1_PA                0x5FU
-#define MAX30102_DEFAULT_LED2_PA                0x5FU
+/* LED current: value * 0.2 mA. With the ADC range at 16384 nA, 25.6 mA
+   should bring finger-contact DC values back near the useful mid-scale range
+   without pinning RED/IR at 0x03FFFF. */
+#define MAX30102_DEFAULT_LED1_PA                0x80U
+#define MAX30102_DEFAULT_LED2_PA                0x80U
 
 /* 用于统计背景 IR 基线 */
 typedef struct
@@ -85,10 +87,10 @@ typedef struct
 #define MAX30102_BPM_MIN_VALID_SAMPLES        40U
 
 /*
- * 算法默认按 50 Hz 采样设计。
+ * 算法默认按 100 Hz 采样设计。
  * 这个值应与 main.c 中的采样周期保持一致，否则 BPM 结果会按比例偏差。
  */
-#define MAX30102_ALGO_SAMPLE_RATE_HZ          50U
+#define MAX30102_ALGO_SAMPLE_RATE_HZ          100U
 
 /* 用于保存最近一段 RED / IR 样本，给 SpO2 算法计算 AC/DC 比值。 */
 typedef struct
@@ -165,6 +167,9 @@ void max30102_spo2_reset(MAX30102_SpO2_t *spo2_state);
 
 /* 向窗口追加一个新的 RED / IR 样本。 */
 void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, uint32_t ir_value);
+uint8_t max30102_spo2_get_latest_filtered(const MAX30102_SpO2_t *spo2_state,
+                                          int32_t *red_filtered,
+                                          int32_t *ir_filtered);
 
 /* 根据当前窗口内样本估算 SpO2，返回 1 表示结果有效，0 表示暂时无有效结果。 */
 uint8_t max30102_calculate_spo2(const MAX30102_SpO2_t *spo2_state, uint8_t *spo2_value);
