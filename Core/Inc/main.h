@@ -71,7 +71,7 @@ void Error_Handler(void);
 #define MAX30102_INT_Pin          GPIO_PIN_5
 #define MAX30102_INT_GPIO_Port    GPIOE
 #define MAX30102_INT_EXTI_IRQn    EXTI9_5_IRQn
-#define MAX30102_USE_INT_PIN      1U
+#define MAX30102_USE_INT_PIN      0U
 
 /* USER CODE END Private defines */
 

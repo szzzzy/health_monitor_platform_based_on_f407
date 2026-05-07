@@ -10,8 +10,8 @@ extern "C" {
 #include "main.h"
 #include "rtc.h"
 
-/* 应用层固定按 20 ms 节拍运行，对应约 50 Hz 采样/调度频率。 */
-#define APP_SAMPLE_PERIOD_MS 20U
+/* 应用层固定按 10 ms 节拍运行，对应约 100 Hz 采样/调度频率。 */
+#define APP_SAMPLE_PERIOD_MS 10U
 
 /* OLED 当前支持的页面类型，可继续扩展温度页、原始数据页等。 */
 typedef enum
@@ -112,4 +112,3 @@ typedef struct
 #endif
 
 #endif /* __APP_STATE_H__ */
-

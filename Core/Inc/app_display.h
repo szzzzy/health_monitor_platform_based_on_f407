@@ -13,10 +13,10 @@ void app_display_init_state(AppState_t *app);
 void app_display_handle_buttons(AppState_t *app);
 /* 清空波形缓冲区，常用于“无手指”或重新开始测量时。 */
 void app_display_reset_waveforms(void);
-/* 向 IR 波形缓冲区压入一个新样本。 */
-void app_display_add_ir_sample(uint32_t raw_value);
-/* 向 RED 波形缓冲区压入一个新样本。 */
-void app_display_add_red_sample(uint32_t raw_value);
+/* 向 IR 波形缓冲区压入一个带通滤波后的 PPG 样本。 */
+void app_display_add_ir_sample(int32_t filtered_value);
+/* 向 RED 波形缓冲区压入一个带通滤波后的 PPG 样本。 */
+void app_display_add_red_sample(int32_t filtered_value);
 /* 根据当前页面绘制测量结果页。 */
 void app_display_measurement_page(const AppState_t *app);
 /* 绘制状态页，常用于开机、自检和基线采集阶段。 */

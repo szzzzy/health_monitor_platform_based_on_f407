@@ -49,7 +49,7 @@ void arm_bitreversal_32(uint32_t *pSrc, const uint16_t bitRevLength, const uint1
 /* =========================================================================
  * BPM / SpO2 算法参数
  *
- * 所有参数按 50 Hz 采样率设计。若修改 MAX30102_DEFAULT_SPO2_CONFIG
+ * 所有参数按 100 Hz 采样率设计。若修改 MAX30102_DEFAULT_SPO2_CONFIG
  * 中的采样率，以下阈值需要同步缩放。
  * ========================================================================= */
 #define MAX30102_BPM_MIN_RESULT            35U
@@ -99,21 +99,23 @@ static volatile uint8_t i2c_dma_busy = 0U;
 static volatile HAL_StatusTypeDef i2c_dma_result;
 
 /* --------------------------------------------------------------------------
- * MAX30102 FIFO 数据就绪检测（INT 驱动 + TIM6 轮询兜底）
+ * MAX30102 FIFO 数据就绪检测。
+ * 当前项目默认关闭 MAX30102 INT，主循环按 TIM6 100 Hz 纯轮询 FIFO。
  *
  * 设计思路：
- *   max30102_data_ready_flag — 由 EXTI 中断 ISR 置 1，主循环读取后清零。
+ *   max30102_data_ready_flag — 仅在启用 INT 时由 EXTI ISR 置 1，主循环读取后清零。
  *     上电初始值为 1，确保 TIM6 第一次节拍就会读一次 FIFO。
  *   max30102_int_seen — 记录是否至少触发过一次 EXTI 中断。
  *     - 若 INT 引脚已连接，首次 EXTI 后置 1，切换到"INT 驱动模式"。
  *     - 若 INT 引脚未连接，始终为 0，系统退化到"纯 TIM6 轮询模式"。
  *
  *   max30102_should_service_fifo() 决策逻辑：
- *     1. 若 data_ready_flag == 1 → 立即读（INT 刚触发）
- *     2. 若 INT 曾被触发过但当前 data_ready_flag == 0：
- *        - 等待 INT（最多 10 个 TIM6 节拍 = 200 ms）
+ *     1. 默认纯轮询：每个 TIM6 节拍都读 FIFO
+ *     2. 若 data_ready_flag == 1 → 立即读（INT 刚触发）
+ *     3. 若 INT 曾被触发过但当前 data_ready_flag == 0：
+ *        - 等待 INT（最多 10 个 TIM6 节拍 = 100 ms）
  *        - 超时后强制读一次（防止 INT 丢失导致死等）
- *     3. 若 INT 从未触发 → 每个 TIM6 节拍都读（纯轮询模式）
+ *     4. 若 INT 从未触发 → 每个 TIM6 节拍都读（纯轮询模式）
  * -------------------------------------------------------------------------- */
 static volatile uint8_t max30102_data_ready_flag = 1U;
 static volatile uint8_t max30102_int_seen = 0U;
@@ -151,12 +153,13 @@ void max30102_mark_data_ready_from_isr(void)
 /*
  * 主循环门控：决定当前节拍是否需要读 FIFO。
  *
- *   INT 已触发过（int_seen != 0）：
+ *   默认 MAX30102_USE_INT_PIN == 0：每拍返回 1，按 TIM6 纯轮询 FIFO。
+ *   若启用 INT 且 INT 已触发过（int_seen != 0）：
  *     - data_ready_flag 已置位 → 立即读，同时清零 flag 和 fallback 计数
  *     - data_ready_flag 未置位 → 等待 INT（最多 INT_POLL_FALLBACK_TICKS 拍），
  *       超时后强制读一次，防止 INT 偶然丢失导致系统死等
- *   INT 从未触发（int_seen == 0）：
- *     - 每拍都返回 1，纯轮询模式（PA0 未接 MAX30102 INT 时的退化行为）
+ *   若启用 INT 但 INT 从未触发（int_seen == 0）：
+ *     - 每拍都返回 1，纯轮询模式
  */
 uint8_t max30102_should_service_fifo(void)
 {
@@ -186,16 +189,16 @@ uint8_t max30102_should_service_fifo(void)
 /* --------------------------------------------------------------------------
  * CMSIS-DSP 4th-order Butterworth bandpass (2 biquad stages)
  *
- * Designed for fs = 50 Hz, passband ≈ 0.5–5 Hz (30–300 BPM).
+ * Designed for fs = 100 Hz, passband ≈ 0.5–5 Hz (30–300 BPM).
  * Coefficients are in CMSIS order: {b0, b1, b2, -a1, -a2}.
  * -------------------------------------------------------------------------- */
 #define BIQUAD_STAGES 2U
 
 static const float32_t biquad_coeffs[5U * BIQUAD_STAGES] = {
-  /* Stage 1 — HPF, fc ≈ 0.5 Hz */
-   0.96953125f, -1.9390625f,  0.96953125f,  1.93859375f, -0.9390625f,
-  /* Stage 2 — LPF, fc ≈ 5 Hz */
-   0.29289322f,  0.58578644f,  0.29289322f,  0.0f,        -0.171572875f
+  /* Stage 1 – HPF, fc ≈ 0.5 Hz */
+   0.97803048f, -1.95606096f, 0.97803048f,  1.95557824f, -0.95654368f,
+  /* Stage 2 – LPF, fc ≈ 5 Hz */
+   0.02008337f,  0.04016673f, 0.02008337f,  1.56101808f, -0.64135154f
 };
 
 static arm_biquad_casd_df1_inst_f32 biquad_red;
@@ -536,10 +539,20 @@ static HAL_StatusTypeDef max30102_get_fifo_sample_count(uint8_t *sample_count)
 
   if (overflow_count != 0U)
   {
-    (void)max30102_clear_fifo();
+    status = max30102_clear_fifo();
     max30102_fifo_debug.available_samples = 0U;
     *sample_count = 0U;
-    return HAL_ERROR;
+    if (status != HAL_OK)
+    {
+      return status;
+    }
+
+#if (MAX30102_USE_INT_PIN != 0U)
+    (void)max30102_clear_interrupt_status();
+#endif
+    max30102_data_ready_flag = 1U;
+    max30102_poll_fallback_ticks = 0U;
+    return HAL_BUSY;
   }
 
   *sample_count = (uint8_t)((write_ptr - read_ptr) & (MAX30102_FIFO_DEPTH - 1U));
@@ -1081,6 +1094,30 @@ void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, u
   }
 }
 
+uint8_t max30102_spo2_get_latest_filtered(const MAX30102_SpO2_t *spo2_state,
+                                          int32_t *red_filtered,
+                                          int32_t *ir_filtered)
+{
+  uint16_t sample_index;
+
+  if ((spo2_state == NULL) || (red_filtered == NULL) || (ir_filtered == NULL))
+  {
+    return 0U;
+  }
+
+  if (spo2_state->sample_count == 0U)
+  {
+    return 0U;
+  }
+
+  sample_index = (spo2_state->write_index == 0U) ?
+                 (uint16_t)(MAX30102_SPO2_WINDOW_SIZE - 1U) :
+                 (uint16_t)(spo2_state->write_index - 1U);
+  *red_filtered = spo2_state->red_filtered_samples[sample_index];
+  *ir_filtered = spo2_state->ir_filtered_samples[sample_index];
+  return 1U;
+}
+
 uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_SignalMetrics_t *metrics)
 {
   uint16_t sample_count;
@@ -1545,9 +1582,7 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
 
     /*
      * 仅保留落在合理心率区间内的峰距，避免偶发异常峰把平均值拉偏。
-     * 50 Hz 下：
-     * - 12 点约等于 250 BPM
-     * - 60 点约等于 50 BPM
+     * 100 Hz 下，峰距范围由 MAX30102_ALGO_SAMPLE_RATE_HZ 动态换算。
      */
     if ((interval_samples >= min_peak_distance) && (interval_samples <= max_interval_samples))
     {
@@ -1645,11 +1680,12 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
  *   6. BPM = 采样率 × 60 / 滞后值
  *
  * 相比时域峰值检测，自相关法对弱灌注 / 噪声信号更鲁棒，
- * 但对突变心率（如心律不齐）响应较慢（需要 256 点 ≈ 5 秒窗口）。
+ * 但对突变心率（如心律不齐）响应较慢（需要 256 点 ≈ 2.56 秒窗口）。
  * -------------------------------------------------------------------------- */
-#define FFT_SIZE  256U                    /* 256 点 RFFT，窗口 = 5.12 秒 @ 50 Hz */
-#define LAG_MIN   13U                    /* 50 × 60 / 13 ≈ 230 BPM（最高心率） */
-#define LAG_MAX   85U                    /* 50 × 60 / 85 ≈  35 BPM（最低心率） */
+#define FFT_SIZE  256U                    /* 256 点 RFFT，窗口 = 2.56 秒 @ 100 Hz */
+#define LAG_MIN   27U                    /* 100 * 60 / 27 ~= 222 BPM */
+#define LAG_MAX   171U                   /* 100 * 60 / 171 ~= 35 BPM */
+#define AUTOCORR_MIN_PEAK_RATIO 0.08f
 
 static float32_t fft_in[FFT_SIZE];
 static float32_t fft_out[FFT_SIZE];
@@ -1758,8 +1794,8 @@ uint8_t max30102_autocorr_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm)
     }
   }
 
-  /* 自相关峰度过弱则拒绝（阈值 = DC 分量峰值的 15%）。 */
-  if (max_val < (fft_in[0] * 0.15f))
+  /* 自相关峰度过弱则拒绝；真实 PPG 波形较弱时不要过早卡死 BPM。 */
+  if (max_val < (fft_in[0] * AUTOCORR_MIN_PEAK_RATIO))
   {
     return 0U;
   }
