@@ -42,14 +42,23 @@ static void fmt_ts(const APP_RTC_DateTime_t *dt, char *out, size_t sz)
     }
 }
 
-/* 构建一行 CSV 文本并写入 SD 缓冲区 */
-static void emit(const char *ts, uint32_t sid, const char *status,
-                 const char *type, const char *val, const char *unit)
+/*
+ * 构建一行 CSV 文本并写入 SD 缓冲区。
+ *
+ * 返回值改为 AppSdFileStatus_t：
+ *   原来忽略 APP_SdFile_Write 的返回值（(void)），如果 SD 卡写入失败
+ *   （例如卡已满、中途拔出），后续的 emit 调用会带着失效的 session
+ *   继续格式化字符串并尝试写入，白白浪费 CPU 时间。
+ *   现在将返回值向上传播，调用方可以在第一次失败时就中止整条记录，
+ *   避免 8 次无效的格式化 + 写入操作。
+ */
+static AppSdFileStatus_t emit(const char *ts, uint32_t sid, const char *status,
+                              const char *type, const char *val, const char *unit)
 {
     char line[APP_DATA_LOG_LINE_MAX];
     (void)snprintf(line, sizeof(line), "%s,%lu,%s,%s,%s,%s\n",
                    ts, (unsigned long)sid, type, val, unit, status);
-    (void)APP_SdFile_Write(line);
+    return APP_SdFile_Write(line);
 }
 
 /* ---- 公共 API ---- */
@@ -68,16 +77,30 @@ AppDataLogStatus_t APP_DataLog_StartSession(void)
 
     if (!csv_header_written)
     {
-        (void)APP_SdFile_Write(CSV_HEADER);
+        ret = APP_SdFile_Write(CSV_HEADER);
+        if (ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)ret;
         csv_header_written = 1;
     }
     return APP_DATA_LOG_OK;
 }
 
+/*
+ * 写一条完整的 8 字段 CSV 记录。
+ *
+ * 每条记录包含：时间戳、采样号、手指标志、HR、SpO2、信号质量、PI 等。
+ * 共调用 emit 8 次（每次写一行）。
+ *
+ * 写入失败时的提前返回：
+ *   任何一次 emit 返回非 OK 状态，立即终止后续字段的写入并向上传播错误。
+ *   这避免了在 SD 卡已失效的情况下继续执行剩余 7 次格式化+写入操作。
+ *   caller（main.c 的 app_send_report_if_due）会通过 app_update_sd_log_status
+ *   将错误状态同步到 AppState，OLED 显示侧据此展示 SD 卡异常。
+ */
 AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app)
 {
     char ts[24], st[8], vb[24];
     uint32_t sid;
+    AppSdFileStatus_t write_ret;
 
     if (app == NULL) return APP_DATA_LOG_CLOSED;
 
@@ -91,28 +114,36 @@ AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app)
     sid = sample_id++;
 
     (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->red_value);
-    emit(ts, sid, st, "RED", vb, "count");
+    write_ret = emit(ts, sid, st, "RED", vb, "count");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->ir_value);
-    emit(ts, sid, st, "IR", vb, "count");
+    write_ret = emit(ts, sid, st, "IR", vb, "count");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->baseline_ir);
-    emit(ts, sid, st, "Baseline_IR", vb, "count");
+    write_ret = emit(ts, sid, st, "Baseline_IR", vb, "count");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->finger_present);
-    emit(ts, sid, st, "Finger", vb, "bool");
+    write_ret = emit(ts, sid, st, "Finger", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->bpm_value);
-    emit(ts, sid, st, "HR", vb, "bpm");
+    write_ret = emit(ts, sid, st, "HR", vb, "bpm");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->spo2_value);
-    emit(ts, sid, st, "SpO2", vb, "%");
+    write_ret = emit(ts, sid, st, "SpO2", vb, "%");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->signal_quality);
-    emit(ts, sid, st, "SignalQuality", vb, "0-100");
+    write_ret = emit(ts, sid, st, "SignalQuality", vb, "0-100");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->signal_ir_pi_x1000);
-    emit(ts, sid, st, "PI_IR", vb, "x1000");
+    write_ret = emit(ts, sid, st, "PI_IR", vb, "x1000");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     return APP_DATA_LOG_OK;
 }
@@ -126,4 +157,27 @@ AppDataLogStatus_t APP_DataLog_Flush(void)
 uint32_t APP_DataLog_GetSampleId(void)
 {
     return sample_id;
+}
+
+/*
+ * 查询当前 SD 日志会话是否可用，供 AppState 同步状态到显示层。
+ *
+ * 在 sd_card_ready 和 sd_log_active 标志中反映卡和文件系统的实时状态，
+ * OLED 侧据此显示 "SD OK" / "SD ERR" 等状态提示。
+ */
+bool APP_DataLog_IsReady(void)
+{
+    return APP_SdFile_IsReady();
+}
+
+/* 返回自本次上电以来的累计落盘次数（每次 flush 计一次） */
+uint32_t APP_DataLog_GetTotalWritten(void)
+{
+    return APP_SdFile_GetTotalWritten();
+}
+
+/* 返回自本次上电以来的累计写错误次数（写失败 + f_sync 失败 + lseek 失败） */
+uint32_t APP_DataLog_GetErrorCount(void)
+{
+    return APP_SdFile_GetErrorCount();
 }

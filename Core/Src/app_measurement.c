@@ -89,21 +89,60 @@ void app_measurement_reset_runtime(void)
   app_display_reset_waveforms();
 }
 
-/* 基线采集阶段：读样本并累积背景 IR。 */
+/*
+ * 基线采集阶段：读 MAX30102 FIFO 并累积背景 IR。
+ *
+ * 错误分类处理：
+ *   - HAL_BUSY：I2C 总线忙于上一次传输（DMA 未完成或有残留事务），
+ *     不计入连续错误计数，不清空错误连续（error_streak），
+ *     因为这不是传感器或总线硬件故障，而是正常的并发争用。
+ *   - HAL_ERROR / HAL_TIMEOUT：真正的硬件故障，记录 I2C 错误码、
+ *     递增连续错误计数，达到阈值后触发传感器恢复流程。
+ *
+ * 读成功时：清零连续错误计数，记录最后成功采样的时间戳，
+ * 用于判定传感器是否已失效很久（sensor_last_sample_tick）。
+ */
 uint8_t app_measurement_collect_baseline_sample(AppState_t *app)
 {
+  HAL_StatusTypeDef read_status;
+
   if (app == NULL)
   {
     return 0U;
   }
 
-  if (max30102_read_fifo(fifo_buf, 6U) != HAL_OK)
+  read_status = max30102_read_fifo(fifo_buf, 6U);
+  if (read_status != HAL_OK)
   {
+    /* I2C 总线忙：无数据可读但不是错误，不清零错误计数 */
+    if (read_status == HAL_BUSY)
+    {
+      app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
+      app->sensor_read_busy_count++;
+      app->sensor_error_streak = 0U;
+      return 0U;
+    }
+
+    /* I2C 硬件错误：记录错误码和连续计数，尝试恢复 */
+    app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
+    app->sensor_read_error_count++;
+    app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+    if (app->sensor_error_streak < 0xFFU)
+    {
+      app->sensor_error_streak++;
+    }
+    app_measurement_recover_sensor(app);
     return 0U;
   }
 
   max30102_parse_spo2_sample(fifo_buf, &app->red_value, &app->ir_value);
   max30102_baseline_add_ir(&baseline_data, app->ir_value);
+  /* 读成功：清零所有错误状态 */
+  app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_OK;
+  app->sensor_read_ok_count++;
+  app->sensor_error_streak = 0U;
+  app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
+  app->sensor_last_sample_tick = HAL_GetTick();
   return 1U;
 }
 
@@ -473,6 +512,25 @@ void app_measurement_update_periodic_flags(AppState_t *app)
   app->display_refresh_requested = 1U;
 }
 
+/*
+ * 传感器恢复流程 —— 连续 I2C 错误达到阈值时触发。
+ *
+ * 恢复步骤：
+ *   1. 先尝试 I2C 总线恢复（GPIO 位打钟清除 + 重新 Init）
+ *      - 这是新增的保护措施：如果 MAX30102 从机在传输中途意外掉电/复位，
+ *        它可能将 SDA 拉死。单纯的 max30102_init 重新配置寄存器没用，
+ *        因为 I2C 外设检测到总线忙，连 START 条件都发不出。
+ *      - MX_I2C1_RecoverBus 用 GPIO 手动打出 STOP 条件和时钟脉冲，
+ *        强制释放 SDA，然后重新初始化 I2C 外设。
+ *   2. 总线恢复成功后，重新初始化 MAX30102 传感器
+ *   3. 重建算法状态：复位信号包络，重新播种基线跟踪，
+ *      清空测量输出，避免恢复后的残留数据混入新的测量窗口
+ *
+ * 恢复失败保护：
+ *   如果总线恢复或传感器重新初始化失败，将 error_streak 保持为阈值，
+ *   这样下一次错误不会立即再次尝试恢复（避免频繁重试），
+ *   只有在新一轮错误再次累计到阈值后才会重试。
+ */
 void app_measurement_recover_sensor(AppState_t *app)
 {
   if (app == NULL)
@@ -485,9 +543,18 @@ void app_measurement_recover_sensor(AppState_t *app)
     return;
   }
 
+  /* 先恢复 I2C 总线，再重新初始化传感器 */
+  if (MX_I2C1_RecoverBus() != HAL_OK)
+  {
+    app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
+    app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+    return;
+  }
+
   if (max30102_init() != HAL_OK)
   {
     app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
+    app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
     return;
   }
 
