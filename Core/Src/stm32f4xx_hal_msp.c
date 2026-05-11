@@ -93,15 +93,16 @@ void HAL_SD_MspInit(SD_HandleTypeDef *hsd)
     gpio.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
     gpio.Alternate = GPIO_AF12_SDIO;
 
-    /* DAT0-DAT3: 需上拉 */
+    /* DAT0-DAT3: �?上拉 */
     gpio.Pin = GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10 | GPIO_PIN_11;
     HAL_GPIO_Init(GPIOC, &gpio);
 
-    /* CLK: 推挽时钟输出，不加上拉 */
+    /* CLK: 推挽时钟输出，不加上�? */
     gpio.Pull = GPIO_NOPULL;
     gpio.Pin  = GPIO_PIN_12;
     HAL_GPIO_Init(GPIOC, &gpio);
 
+    gpio.Pull = GPIO_PULLUP;
     gpio.Pin = GPIO_PIN_2;
     HAL_GPIO_Init(GPIOD, &gpio);
 

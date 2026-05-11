@@ -35,6 +35,37 @@ static uint32_t last_retry_tick = 0U;
 
 /* ---- 辅助 ---- */
 
+/*
+ * 写入/同步失败后的级联清理：关闭文件 → 卸载卷 → 反初始化卡。
+ *
+ * 为什么不能只关文件：
+ *   1. 写入失败意味着底层 SD 卡可能已经拔出或进入错误状态，
+ *      只关文件会让下一次 f_write 带着坏 FATFS 结构继续操作，
+ *      可能导致文件系统元数据损坏（目录表乱写、FAT 链表断裂）。
+ *   2. 必须整栈重建：APP_SD_Card_Deinit 重置 SDIO 和卡状态，
+ *      f_mount(NULL) 释放胖文件系统的内部缓存，
+ *      确保下一次 Session 从零开始，状态一致。
+ *   3. 记录重试时间戳，防止每次 APP_SdFile_Write 都立即尝试
+ *      重新 Init 卡（60 秒间隔避免了 SD 上电延迟导致的快速重试风暴）。 */
+static void close_session_after_error(void)
+{
+    if (session_active)
+    {
+        (void)f_close(&log_file);
+        session_active = false;
+    }
+
+    if (volume_mounted)
+    {
+        (void)f_mount(NULL, "", 1);
+        volume_mounted = false;
+    }
+
+    APP_SD_Card_Deinit();
+    wr_buf_pos = 0U;
+    last_retry_tick = HAL_GetTick();
+}
+
 static bool rtc_is_valid(const APP_RTC_DateTime_t *dt)
 {
     return (dt->year >= 2000U) && (dt->month >= 1U) && (dt->month <= 12U)
@@ -76,7 +107,7 @@ static uint8_t find_next_sequence(const char *date_prefix)
     (void)snprintf(pattern, sizeof(pattern), "%s_*.CSV", date_prefix);
     if (f_findfirst(&dir, &fno, "", pattern) != FR_OK) return 0U;
 
-    do
+    while (fno.fname[0] != '\0')
     {
         const char *u = strchr(fno.fname, '_');
         const char *d = strchr(fno.fname, '.');
@@ -88,7 +119,11 @@ static uint8_t find_next_sequence(const char *date_prefix)
                 if ((uint8_t)(seq + 1U) > next_seq) next_seq = (uint8_t)(seq + 1U);
             }
         }
-    } while (f_findnext(&dir, &fno) == FR_OK);
+        if (f_findnext(&dir, &fno) != FR_OK)
+        {
+            break;
+        }
+    }
 
     f_closedir(&dir);
     return next_seq;
@@ -104,16 +139,16 @@ static AppSdFileStatus_t flush_internal(void)
     fr = f_write(&log_file, wr_buf, wr_buf_pos, &bw);
     if ((fr != FR_OK) || (bw != wr_buf_pos))
     {
-        session_active = false;
         total_errors++;
+        close_session_after_error();
         return APP_SD_FILE_WRITE_ERROR;
     }
 
     fr = f_sync(&log_file);
     if (fr != FR_OK)
     {
-        session_active = false;
         total_errors++;
+        close_session_after_error();
         return APP_SD_FILE_WRITE_ERROR;
     }
 
@@ -181,10 +216,25 @@ AppSdFileStatus_t APP_SdFile_StartSession(void)
     {
         (void)f_mount(NULL, "", 1);
         volume_mounted = false;
+        APP_SD_Card_Deinit();
+        last_retry_tick = HAL_GetTick();
         return APP_SD_FILE_NO_CARD;
     }
 
-    (void)f_lseek(&log_file, f_size(&log_file));
+    /* f_lseek 失败通常意味着底层存储介质在打开后变为不可读
+     *（例如卡在文件长度查询期间被拔出），此时立即级联清理，
+     * 避免后续 f_write 写到无效的文件句柄上。*/
+    fr = f_lseek(&log_file, f_size(&log_file));
+    if (fr != FR_OK)
+    {
+        (void)f_close(&log_file);
+        (void)f_mount(NULL, "", 1);
+        volume_mounted = false;
+        APP_SD_Card_Deinit();
+        total_errors++;
+        last_retry_tick = HAL_GetTick();
+        return APP_SD_FILE_WRITE_ERROR;
+    }
 
     session_active  = true;
     wr_buf_pos      = 0U;
@@ -192,19 +242,30 @@ AppSdFileStatus_t APP_SdFile_StartSession(void)
     return APP_SD_FILE_OK;
 }
 
+/*
+ * 停止文件会话：先刷缓冲、再关文件、卸载卷、反初始化卡。
+ *
+ * 注意：flush_internal() 在遇到写入错误时会调用 close_session_after_error()
+ * 自行做完整级联清理，并将 session_active 设为 false。
+ * 因此后续的 f_close / f_mount / APP_SD_Card_Deinit 都需要检查
+ * session_active / volume_mounted 标志，防止重复关闭/卸载。 */
 void APP_SdFile_StopSession(void)
 {
     if (session_active)
     {
         (void)flush_internal();
-        (void)f_close(&log_file);
-        session_active = false;
+        if (session_active)
+        {
+            (void)f_close(&log_file);
+            session_active = false;
+        }
     }
     if (volume_mounted)
     {
         (void)f_mount(NULL, "", 1);
         volume_mounted = false;
     }
+    APP_SD_Card_Deinit();
     wr_buf_pos = 0U;
 }
 

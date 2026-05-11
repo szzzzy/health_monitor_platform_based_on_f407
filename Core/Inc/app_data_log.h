@@ -30,5 +30,11 @@ AppDataLogStatus_t APP_DataLog_StartSession(void);
 AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app);
 AppDataLogStatus_t APP_DataLog_Flush(void);
 uint32_t           APP_DataLog_GetSampleId(void);
+/* 查询 SD 日志会话是否活跃（文件已打开且卷已挂载）→ AppState.sd_log_active */
+bool               APP_DataLog_IsReady(void);
+/* 返回自本次上电以来的累计落盘次数（每次 f_write + f_sync 成功计一次） */
+uint32_t           APP_DataLog_GetTotalWritten(void);
+/* 返回自本次上电以来的累计写错误次数（含写失败、f_sync 失败、lseek 失败） */
+uint32_t           APP_DataLog_GetErrorCount(void);
 
 #endif

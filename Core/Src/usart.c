@@ -24,11 +24,11 @@
 #include <string.h>
 
 /* --------------------------------------------------------------------------
- * USART2 DMA 循环接收缓冲化
+ * USART2 DMA 循环接收缓冲�?
  *
- * DMA1_Stream5_Channel4 以 CIRCULAR 模式持续接收，IDLE 中断检测帧间隔。
- * uart_dma_last_pos 记录 DMA 缓冲区中已被协议层消费的位置。
- * uart_dma_idle_flag 由 ISR 置 1，协议层轮询后清零。
+ * DMA1_Stream5_Channel4 �? CIRCULAR 模式持续接收，IDLE 中断�?测帧间隔�?
+ * uart_dma_last_pos 记录 DMA 缓冲区中已被协议层消费的位置�?
+ * uart_dma_idle_flag �? ISR �? 1，协议层轮询后清零�??
  * -------------------------------------------------------------------------- */
 static DMA_HandleTypeDef hdma_usart2_rx;
 static uint8_t  uart_dma_rx_buf[UART_DMA_RX_BUF_SIZE];
@@ -70,9 +70,9 @@ void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-  /* 启动 USART2 IDLE 中断 + DMA 循环接收。
-   * IDLE 中断在总线空闲（≥1 个字符时长无数据）时触发）
-   * 用于检测变长帧结束，免去逐字节轮询。 */
+  /* 启动 USART2 IDLE 中断 + DMA 循环接收�?
+   * IDLE 中断在�?�线空闲（≥1 个字符时长无数据）时触发�?
+   * 用于�?测变长帧结束，免去�?�字节轮询�?? */
   __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
   HAL_NVIC_SetPriority(USART2_IRQn, 3, 0);
   HAL_NVIC_EnableIRQ(USART2_IRQn);

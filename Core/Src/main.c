@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
+#include "iwdg.h"
 #include "rtc.h"
 #include "tim.h"
 #include "usart.h"
@@ -67,11 +68,12 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 /* 初始化共享状态，并让各模块完成自己的默认配置。 */
 static void app_state_init(AppState_t *app);
-/* 若当前轮次需要上报，则发送一帧测量报文。 */
+/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态。 */
 static void app_send_report_if_due(AppState_t *app);
 /* 若当前轮次需要刷新显示，则重绘当前测量页面。 */
 static void app_refresh_display_if_needed(AppState_t *app);
 static void app_schedule_periodic_refresh(AppState_t *app);
+static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -93,6 +95,8 @@ static void app_state_init(AppState_t *app)
 /* 把“是否上报”的时序控制收口到一个函数里，避免主循环继续膨胀。 */
 static void app_send_report_if_due(AppState_t *app)
 {
+  AppDataLogStatus_t log_status;
+
   if ((app == NULL) || (app->report_due == 0U))
   {
     return;
@@ -102,7 +106,8 @@ static void app_send_report_if_due(AppState_t *app)
   app->report_due = 0U;
 
   /* SD 卡日志：每次上报同期落盘 */
-  (void)APP_DataLog_WriteRecord(app);
+  log_status = APP_DataLog_WriteRecord(app);
+  app_update_sd_log_status(app, log_status);
 }
 
 /* OLED 刷新单独封装，让主循环更像调度器而不是细节堆场。 */
@@ -141,6 +146,19 @@ static void app_schedule_periodic_refresh(AppState_t *app)
   app->display_refresh_requested = 1U;
 }
 
+static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status)
+{
+  if (app == NULL)
+  {
+    return;
+  }
+
+  app->sd_log_active = APP_DataLog_IsReady() ? 1U : 0U;
+  app->sd_card_ready = app->sd_log_active;
+  app->sd_log_error = (status == APP_DATA_LOG_OK) ? 0U : (uint8_t)status;
+  app->sd_total_written = APP_DataLog_GetTotalWritten();
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -177,6 +195,8 @@ int main(void)
   MX_RTC_Init();
   MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
+  MX_IWDG_Init();
+  APP_Watchdog_Refresh();
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
   HAL_TIM_Base_Start_IT(&htim6);
@@ -194,6 +214,7 @@ int main(void)
       app_display_handle_buttons(&app);
       app_protocol_update_rtc_snapshot(&app);
       app_display_status_page(&app, "MAX30102 ERR", "CHECK SENSOR");
+      APP_Watchdog_Refresh();
       HAL_Delay(200U);
     }
   }
@@ -201,11 +222,12 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* SD 卡日志：提前初始化，不阻塞主路径 */
+  /* SD 日志只走 app_sd_file 的可失败、可重试路径；不要在开机阶段硬初始化 SDIO。 */
   APP_DataLog_Init();
-  (void)APP_DataLog_StartSession();
+  app_update_sd_log_status(&app, APP_DataLog_StartSession());
+  APP_Watchdog_Refresh();
 
-  /* 上电先采集一段”无手指”背景，建立 IR 基线。 */
+  /* 上电先采集一段“无手指”背景，建立 IR 基线。 */
   while (app_measurement_baseline_ready() == 0U)
   {
     app_protocol_poll_uart_commands(&app);
@@ -214,6 +236,7 @@ int main(void)
     while ((app_measurement_baseline_ready() == 0U) &&
            (app_measurement_collect_baseline_sample(&app) != 0U))
     {
+      APP_Watchdog_Refresh();
     }
 
     if ((HAL_GetTick() - last_status_tick) >= 200U)
@@ -226,7 +249,7 @@ int main(void)
                      (unsigned int)app_measurement_get_baseline_progress_percent());
       app_display_status_page(&app, "KEEP FINGER OFF", status_line);
     }
-
+    APP_Watchdog_Refresh();
     HAL_Delay(APP_MAIN_LOOP_DELAY_MS);
   }
 
@@ -298,6 +321,7 @@ int main(void)
           app_measurement_update_finger_state(&app);
           app_measurement_process(&app);
           app_measurement_update_periodic_flags(&app);
+          APP_Watchdog_Refresh();
           continue;
         }
 
@@ -313,6 +337,7 @@ int main(void)
     app_schedule_periodic_refresh(&app);
     app_send_report_if_due(&app);
     app_refresh_display_if_needed(&app);
+    APP_Watchdog_Refresh();
 
     /* Wait for next 10ms tick from TIM6 (WFI saves power while idle). */
     while (tim6_tick_flag == 0U)
@@ -351,7 +376,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLM = 8;
   RCC_OscInitStruct.PLL.PLLN = 336;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();

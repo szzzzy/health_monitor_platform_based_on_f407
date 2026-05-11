@@ -4,27 +4,54 @@
   * @brief   MicroSD card driver using SDIO 4-bit mode
   *
   * 初始化流程：
-  *   1. 400kHz 低速时钟 → HAL_SD_Init + HAL_SD_InitCard
-  *   2. 切换到 4-bit 宽总线
-  *   3. 切换到 21MHz 高速时钟
+  *   1. 400kHz 低速时钟 → HAL_SD_Init（HAL 内部完成卡识别）
+  *   2. 设置 12MHz 时钟分频并切换到 4-bit 宽总线
   *
   * 异常策略：
-  *   - 卡检测失败 → APP_SD_CARD_NOT_PRESENT
-  *   - 超时/CRC 错误 → APP_SD_CARD_ERROR，需重新 Init
+  *   - 低速初始化/卡识别失败 → APP_SD_CARD_INIT_FAILED
+  *   - 传输超时/CRC 错误 → APP_SD_CARD_ERROR 或 APP_SD_CARD_BUSY，需重新 Init
   ******************************************************************************
   */
 
 #include "app_sd_card.h"
 #include <string.h>
 
-#define APP_SD_INIT_CLK_DIV  208U    /* SDIOCLK / (208+2) ≈ 400kHz */
-#define APP_SD_FAST_CLK_DIV    2U    /* SDIOCLK / (2+2)   =  21MHz */
+#define APP_SD_INIT_CLK_DIV  118U    /* 48MHz SDIOCLK / (118+2) ~= 400kHz */
+#define APP_SD_FAST_CLK_DIV    2U    /* 48MHz SDIOCLK / (2+2)   =  12MHz */
 #define APP_SD_TIMEOUT      2000U    /* 2 秒 */
 
 static SD_HandleTypeDef        hsd;
 static HAL_SD_CardInfoTypeDef  card_info;
 static bool                    card_initialized = false;
 static uint32_t                block_count = 0;
+
+/*
+ * 等待 SD 卡从编程/接收状态回到传输空闲状态。
+ *
+ * 为什么需要：
+ *   HAL_SD_ReadBlocks / HAL_SD_WriteBlocks 返回 HAL_OK 只表示
+ *   "命令已发送并被卡确认"，不代表数据实际写入完毕。
+ *   卡在内部数据阶段可能仍处于编程状态，此时发起下一次读写
+ *   会收到忙响应或被 CRC 错误打断。
+ *   必须等卡回到 TRANSFER 状态后才能安全进行下一次访问。
+ *
+ * 超时策略：超时后立即 Deinit 卡，防止卡在异常状态时被重复访问，
+ * 让上层调用者感知到 APP_SD_CARD_BUSY 并做重试或上报。 */
+static AppSdCardStatus_t APP_SD_Card_WaitReady(uint32_t timeout_ms)
+{
+    uint32_t start_tick = HAL_GetTick();
+
+    while (HAL_SD_GetCardState(&hsd) != HAL_SD_CARD_TRANSFER)
+    {
+        if ((HAL_GetTick() - start_tick) >= timeout_ms)
+        {
+            APP_SD_Card_Deinit();
+            return APP_SD_CARD_BUSY;
+        }
+    }
+
+    return APP_SD_CARD_OK;
+}
 
 /* -------------------------------------------------------------------------- */
 /*  公共 API                                                                  */
@@ -52,7 +79,7 @@ AppSdCardStatus_t APP_SD_Card_Init(void)
         APP_SD_Card_Deinit();
     }
 
-    /* 第一阶段：低速模式初始化 */
+    /* 第一阶段：低速模式初始化并识别卡。HAL_SD_Init 内部会调用 HAL_SD_InitCard。 */
     hsd.Init.ClockEdge           = SDIO_CLOCK_EDGE_RISING;
     hsd.Init.ClockBypass         = SDIO_CLOCK_BYPASS_DISABLE;
     hsd.Init.ClockPowerSave      = SDIO_CLOCK_POWER_SAVE_DISABLE;
@@ -67,25 +94,26 @@ AppSdCardStatus_t APP_SD_Card_Init(void)
         return APP_SD_CARD_INIT_FAILED;
     }
 
-    /* 第二阶段：识别卡并获取信息 */
-    hal_ret = HAL_SD_InitCard(&hsd);
-    if (hal_ret != HAL_OK)
-    {
-        APP_SD_Card_Deinit();
-        return APP_SD_CARD_NOT_PRESENT;
-    }
-
     HAL_SD_GetCardInfo(&hsd, &card_info);
 
-    /* 第三阶段：切换到 4-bit 模式和高速时钟 */
+    /* 第二阶段：先更新高速分频，再让 HAL 在切换总线宽度时重配 SDIO 外设。 */
+    hsd.Init.ClockDiv = APP_SD_FAST_CLK_DIV;
     hal_ret = HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B);
     if (hal_ret != HAL_OK)
     {
-        HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_1B);
+        hsd.ErrorCode = HAL_SD_ERROR_NONE;
+        hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
+        hal_ret = HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_1B);
+        if (hal_ret != HAL_OK)
+        {
+            APP_SD_Card_Deinit();
+            return APP_SD_CARD_ERROR;
+        }
     }
-
-    hsd.Init.ClockDiv = APP_SD_FAST_CLK_DIV;
-    (void)HAL_SD_Init(&hsd);
+    else
+    {
+        hsd.Init.BusWide = SDIO_BUS_WIDE_4B;
+    }
 
     card_initialized = true;
     block_count      = card_info.LogBlockNbr *
@@ -96,9 +124,9 @@ AppSdCardStatus_t APP_SD_Card_Init(void)
 
 void APP_SD_Card_Deinit(void)
 {
-    if (card_initialized)
+    if (hsd.Instance == SDIO)
     {
-        HAL_SD_DeInit(&hsd);
+        (void)HAL_SD_DeInit(&hsd);
     }
     card_initialized = false;
     block_count = 0;
@@ -118,14 +146,19 @@ AppSdCardStatus_t APP_SD_Card_Read(uint8_t *buf, uint32_t sector, uint32_t count
         return APP_SD_CARD_ERROR;
     }
 
-    /* HAL_SD_ReadBlocks 是阻塞调用，含超时参数 */
+    /*
+     * HAL_SD_ReadBlocks 是阻塞调用，含超时参数。
+     * 失败时调用 Deinit，释放 SDIO 资源和卡状态，
+     * 以便上层通过定时重试机制（app_sd_file 60 秒间隔）重新 Init 卡。*/
     hal_ret = HAL_SD_ReadBlocks(&hsd, buf, sector * 512U, count, APP_SD_TIMEOUT);
     if (hal_ret != HAL_OK)
     {
+        APP_SD_Card_Deinit();
         return APP_SD_CARD_ERROR;
     }
 
-    return APP_SD_CARD_OK;
+    /* 读到数据不代表卡已空闲：等待卡回到 TRANSFER 状态再进行后续操作 */
+    return APP_SD_Card_WaitReady(APP_SD_TIMEOUT);
 }
 
 AppSdCardStatus_t APP_SD_Card_Write(const uint8_t *buf, uint32_t sector,
@@ -143,14 +176,18 @@ AppSdCardStatus_t APP_SD_Card_Write(const uint8_t *buf, uint32_t sector,
         return APP_SD_CARD_ERROR;
     }
 
-    /* HAL_SD_WriteBlocks 是阻塞调用，含超时参数 */
+    /*
+     * HAL_SD_WriteBlocks 是阻塞调用，含超时参数。
+     * 写失败时立即 Deinit，确保卡状态一致。*/
     hal_ret = HAL_SD_WriteBlocks(&hsd, (uint8_t *)buf, sector * 512U, count, APP_SD_TIMEOUT);
     if (hal_ret != HAL_OK)
     {
+        APP_SD_Card_Deinit();
         return APP_SD_CARD_ERROR;
     }
 
-    return APP_SD_CARD_OK;
+    /* 写命令被接受，但卡可能在内部编程阶段：等卡重新闲下来 */
+    return APP_SD_Card_WaitReady(APP_SD_TIMEOUT);
 }
 
 bool APP_SD_Card_IsPresent(void)

@@ -8,6 +8,7 @@ MDK-ARM/MAX30102_Simple_Test/
 
 # Debug/session config generated locally
 MDK-ARM/DebugConfig/
+.claude/
 
 # Common embedded build artifacts
 *.o
@@ -19,6 +20,8 @@ MDK-ARM/DebugConfig/
 *.lnp
 *.dep
 *.bak
+*.bak*
+*.utf8
 *.tmp
 
 # CMSIS examples, docs, and test suites not needed for this project
