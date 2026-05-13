@@ -66,8 +66,11 @@ void arm_bitreversal_32(uint32_t *pSrc, const uint16_t bitRevLength, const uint1
 #define MAX30102_BPM_MIN_EDGE_DELTA        2U
 #define MAX30102_BPM_MAX_PEAK_COUNT        24U
 #define MAX30102_BPM_RANGE_CAP_RMS_FACTOR  4U
+/* 心搏幅度估算用的半窗口（±10 样本 = ±100ms @100Hz），在峰值附近搜索局部最小值计算 peak-local_min。 */
+#define MAX30102_BPM_PEAK_AMP_HALF_WINDOW  10U
 #define MAX30102_SPO2_MIN_DC               1U
 #define MAX30102_SPO2_MIN_AC_RMS           40U
+/* 通用比值缩放因子 ×1000，用于 PI=(AC/DC)*1000 和 SpO2 R 比值计算。PI 存储值 = 标准 PI% × 10。 */
 #define MAX30102_SPO2_RATIO_SCALE          1000U
 #define MAX30102_FILTER_DC_SHIFT           4U
 #define MAX30102_INTR_STATUS_PPG_RDY       0x40U
@@ -1004,6 +1007,7 @@ void max30102_spo2_reset(MAX30102_SpO2_t *spo2_state)
   spo2_state->ir_square_sum = 0ULL;
   spo2_state->red_filtered_square_sum = 0ULL;
   spo2_state->ir_filtered_square_sum = 0ULL;
+  spo2_state->total_samples = 0U;
   biquad_reset();
 }
 
@@ -1091,6 +1095,12 @@ void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, u
   if (spo2_state->sample_count < MAX30102_SPO2_WINDOW_SIZE)
   {
     spo2_state->sample_count++;
+  }
+
+  /* total_samples 永不重置的全局累加器，给流式脉冲检测提供绝对采样编号参考。 */
+  if (spo2_state->total_samples < 0xFFFFFFFFUL)
+  {
+    spo2_state->total_samples++;
   }
 }
 
@@ -1298,6 +1308,19 @@ uint8_t max30102_calculate_spo2(const MAX30102_SpO2_t *spo2_state, uint8_t *spo2
  */
 uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_value)
 {
+  return max30102_calculate_bpm_with_pulse(spo2_state, bpm_value, NULL);
+}
+
+/*
+ * BPM + 脉冲信息联合计算：
+ * 与 max30102_calculate_bpm 使用相同的峰值检测逻辑，但额外通过 pulse_info
+ * 向上层流式脉冲检测器 (app_stream_pulse_update) 提供交叉校验数据，
+ * 解决原始窗口峰值算法在某些波形形态下漏检 IBI 的问题。
+ */
+uint8_t max30102_calculate_bpm_with_pulse(const MAX30102_SpO2_t *spo2_state,
+                                          uint8_t *bpm_value,
+                                          MAX30102_PulseInfo_t *pulse_info)
+{
   uint16_t i;
   uint16_t sample_index;
   uint16_t sample_count;
@@ -1339,8 +1362,16 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
   uint32_t bpm_estimate;
   uint32_t peak_span_samples;
   uint16_t interval_samples;
+  uint16_t latest_interval_samples;
+  uint16_t latest_peak_position;
+  uint32_t oldest_sample_number;
   int32_t filtered_value;
   uint8_t fallback_used = 0U;
+
+  if (pulse_info != NULL)
+  {
+    (void)memset(pulse_info, 0, sizeof(*pulse_info));
+  }
 
   if ((spo2_state == NULL) || (bpm_value == NULL))
   {
@@ -1659,6 +1690,69 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
       (bpm_estimate > MAX30102_BPM_MAX_RESULT))
   {
     return 0U;
+  }
+
+  /* 从窗口峰值中提取最近一次有效心搏信息，供上层 app_stream_pulse_update
+   * 做 IBI/HRV 输入——与流式检测互补，避免单一检测路径漏掉心搏。 */
+  if (pulse_info != NULL)
+  {
+    latest_interval_samples = 0U;
+    latest_peak_position = 0U;
+
+    for (i = (uint16_t)(peak_count - 1U); i > 0U; i--)
+    {
+      interval_samples = (uint16_t)(peak_positions[i] - peak_positions[i - 1U]);
+      if ((interval_samples >= min_peak_distance) && (interval_samples <= max_interval_samples))
+      {
+        latest_interval_samples = interval_samples;
+        latest_peak_position = peak_positions[i];
+        break;
+      }
+    }
+
+    /* 在峰值 ±10 样本窗口内搜索局部最小值，估算心搏幅度 peak-local_min，
+     * 该幅度值供 RIAV 呼吸率算法使用（呼吸调制体现在心搏幅度的周期性变化上）。 */
+    if ((latest_interval_samples != 0U) && (spo2_state->total_samples >= sample_count))
+    {
+      uint16_t peak_window_start;
+      uint16_t peak_window_end;
+      uint16_t peak_sample_index;
+      uint16_t peak_offset;
+      int32_t peak_value;
+      int32_t local_min;
+      int32_t local_value;
+
+      peak_window_start = (latest_peak_position > MAX30102_BPM_PEAK_AMP_HALF_WINDOW) ?
+                          (uint16_t)(latest_peak_position - MAX30102_BPM_PEAK_AMP_HALF_WINDOW) : 0U;
+      peak_window_end = (uint16_t)(latest_peak_position + MAX30102_BPM_PEAK_AMP_HALF_WINDOW);
+      if (peak_window_end >= sample_count)
+      {
+        peak_window_end = (uint16_t)(sample_count - 1U);
+      }
+
+      peak_sample_index = (uint16_t)((start_index + latest_peak_position) % MAX30102_SPO2_WINDOW_SIZE);
+      peak_value = spo2_state->ir_filtered_samples[peak_sample_index];
+      local_min = peak_value;
+
+      for (peak_offset = peak_window_start; peak_offset <= peak_window_end; peak_offset++)
+      {
+        peak_sample_index = (uint16_t)((start_index + peak_offset) % MAX30102_SPO2_WINDOW_SIZE);
+        local_value = spo2_state->ir_filtered_samples[peak_sample_index];
+        if (local_value < local_min)
+        {
+          local_min = local_value;
+        }
+      }
+
+      oldest_sample_number = spo2_state->total_samples - sample_count;
+      pulse_info->beat_valid = 1U;
+      pulse_info->interval_samples = latest_interval_samples;
+      pulse_info->latest_ibi_ms = (uint16_t)(((uint32_t)latest_interval_samples * 1000U +
+                                              (MAX30102_ALGO_SAMPLE_RATE_HZ / 2U)) /
+                                             MAX30102_ALGO_SAMPLE_RATE_HZ);
+      pulse_info->latest_peak_sample = oldest_sample_number + latest_peak_position;
+      pulse_info->beat_amplitude = (peak_value > local_min) ? (uint32_t)(peak_value - local_min) : 0U;
+    }
   }
 
   *bpm_value = (uint8_t)bpm_estimate;
