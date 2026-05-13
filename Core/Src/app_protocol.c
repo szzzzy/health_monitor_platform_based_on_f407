@@ -127,8 +127,11 @@ void app_protocol_send_sensor_report(AppState_t *app)
 }
 
 /*
- * 紧凑测量报文格式：
- * M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2
+ * 紧凑测量报文格式（约 25 字段，向后兼容旧 13 字段）：
+ * M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2,
+ *   rr_valid,rr,ibi_valid,ibi,hrv_valid,mean_ibi,sdnn,rmssd
+ *
+ * 末尾 8 个字段为新增 RR/IBI/HRV 扩展，旧上位机可忽略尾部字段继续解析前 13 个。
  */
 static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t buffer_size)
 {
@@ -141,7 +144,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   {
     (void)snprintf(buffer,
                    buffer_size,
-                   "M,%u,%04u%02u%02u,%02u%02u%02u,%lu,%lu,%lu,%u,%u,%u,%u,%u",
+                   "M,%u,%04u%02u%02u,%02u%02u%02u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
                    (unsigned int)app->rtc_time_valid,
                    (unsigned int)app->rtc_datetime.year,
                    (unsigned int)app->rtc_datetime.month,
@@ -156,13 +159,21 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
                    (unsigned int)app->bpm_valid,
                    (unsigned int)app->bpm_value,
                    (unsigned int)app->spo2_valid,
-                   (unsigned int)app->spo2_value);
+                   (unsigned int)app->spo2_value,
+                   (unsigned int)app->rr_valid,
+                   (unsigned int)app->rr_bpm,
+                   (unsigned int)app->ibi_valid,
+                   (unsigned int)app->latest_ibi_ms,
+                   (unsigned int)app->hrv_valid,
+                   (unsigned int)app->hrv_mean_ibi_ms,
+                   (unsigned int)app->hrv_sdnn_ms,
+                   (unsigned int)app->hrv_rmssd_ms);
   }
   else
   {
     (void)snprintf(buffer,
                    buffer_size,
-                   "M,%u,00000000,000000,%lu,%lu,%lu,%u,%u,%u,%u,%u",
+                   "M,%u,00000000,000000,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
                    (unsigned int)app->rtc_time_valid,
                    (unsigned long)app->red_value,
                    (unsigned long)app->ir_value,
@@ -171,7 +182,15 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
                    (unsigned int)app->bpm_valid,
                    (unsigned int)app->bpm_value,
                    (unsigned int)app->spo2_valid,
-                   (unsigned int)app->spo2_value);
+                   (unsigned int)app->spo2_value,
+                   (unsigned int)app->rr_valid,
+                   (unsigned int)app->rr_bpm,
+                   (unsigned int)app->ibi_valid,
+                   (unsigned int)app->latest_ibi_ms,
+                   (unsigned int)app->hrv_valid,
+                   (unsigned int)app->hrv_mean_ibi_ms,
+                   (unsigned int)app->hrv_sdnn_ms,
+                   (unsigned int)app->hrv_rmssd_ms);
   }
 
   return (uint16_t)strlen(buffer);

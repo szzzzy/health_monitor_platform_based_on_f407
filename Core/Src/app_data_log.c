@@ -13,7 +13,7 @@
 #include "rtc.h"
 #include <stdio.h>
 
-#define RECORDS_PER_CYCLE   8U
+#define RECORDS_PER_CYCLE   16U
 
 static uint32_t sample_id = 0U;
 static char     csv_header_written = 0;
@@ -85,14 +85,14 @@ AppDataLogStatus_t APP_DataLog_StartSession(void)
 }
 
 /*
- * 写一条完整的 8 字段 CSV 记录。
+ * 写一条完整的 CSV 记录（当前 16 字段：基础 8 项 + RR/IBI/HRV 扩展 8 项）。
  *
- * 每条记录包含：时间戳、采样号、手指标志、HR、SpO2、信号质量、PI 等。
- * 共调用 emit 8 次（每次写一行）。
+ * 每条记录包含：RED, IR, Baseline_IR, Finger, HR, SpO2, SignalQuality, PI_IR,
+ *   RR_Valid, RR, IBI_Valid, IBI, HRV_Valid, Mean_IBI, SDNN, RMSSD
+ * 共调用 emit 16 次（每次写一行）。
  *
  * 写入失败时的提前返回：
  *   任何一次 emit 返回非 OK 状态，立即终止后续字段的写入并向上传播错误。
- *   这避免了在 SD 卡已失效的情况下继续执行剩余 7 次格式化+写入操作。
  *   caller（main.c 的 app_send_report_if_due）会通过 app_update_sd_log_status
  *   将错误状态同步到 AppState，OLED 显示侧据此展示 SD 卡异常。
  */
@@ -143,6 +143,38 @@ AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app)
 
     (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->signal_ir_pi_x1000);
     write_ret = emit(ts, sid, st, "PI_IR", vb, "x1000");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->rr_valid);
+    write_ret = emit(ts, sid, st, "RR_Valid", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->rr_bpm);
+    write_ret = emit(ts, sid, st, "RR", vb, "bpm");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ibi_valid);
+    write_ret = emit(ts, sid, st, "IBI_Valid", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->latest_ibi_ms);
+    write_ret = emit(ts, sid, st, "IBI", vb, "ms");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_valid);
+    write_ret = emit(ts, sid, st, "HRV_Valid", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_mean_ibi_ms);
+    write_ret = emit(ts, sid, st, "Mean_IBI", vb, "ms");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_sdnn_ms);
+    write_ret = emit(ts, sid, st, "SDNN", vb, "ms");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_rmssd_ms);
+    write_ret = emit(ts, sid, st, "RMSSD", vb, "ms");
     if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     return APP_DATA_LOG_OK;

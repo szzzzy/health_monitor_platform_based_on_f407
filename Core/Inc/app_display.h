@@ -17,6 +17,8 @@ void app_display_reset_waveforms(void);
 void app_display_add_ir_sample(int32_t filtered_value);
 /* 向 RED 波形缓冲区压入一个带通滤波后的 PPG 样本。 */
 void app_display_add_red_sample(int32_t filtered_value);
+/* Mark a recently detected IR pulse peak on the pulse waveform. */
+void app_display_add_ir_pulse_marker(void);
 /* 根据当前页面绘制测量结果页。 */
 void app_display_measurement_page(const AppState_t *app);
 /* 绘制状态页，常用于开机、自检和基线采集阶段。 */

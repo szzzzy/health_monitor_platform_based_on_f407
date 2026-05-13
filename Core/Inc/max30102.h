@@ -111,6 +111,8 @@ typedef struct
   uint64_t ir_square_sum;
   uint64_t red_filtered_square_sum;
   uint64_t ir_filtered_square_sum;
+  /* 自传感器启动以来累计的样本总数，用于流式脉冲检测的全局时间参考。 */
+  uint32_t total_samples;
 } MAX30102_SpO2_t;
 
 typedef struct
@@ -130,6 +132,21 @@ typedef struct
   uint8_t read_ptr;
   uint8_t available_samples;
 } MAX30102_FifoDebug_t;
+
+/*
+ * 流式脉冲检测的输出信息：
+ * - 由 max30102_calculate_bpm_with_pulse 从窗口峰值中提取最近一次有效峰距，
+ *   供上层 app_measurement 的 app_stream_pulse_update 做 IBI/HRV 输入和交叉校验。
+ * - 字段与 app_stream_pulse_update 中自定义的检测逻辑协调一致。
+ */
+typedef struct
+{
+  uint8_t beat_valid;          /* 本次 BPM 计算窗口内是否检测到有效心搏 */
+  uint16_t interval_samples;   /* 峰距（样本数 @100Hz） */
+  uint16_t latest_ibi_ms;      /* 换算后的 IBI（毫秒） */
+  uint32_t latest_peak_sample; /* 峰在全局样本编号中的位置 */
+  uint32_t beat_amplitude;     /* 峰幅度（滤波后值） */
+} MAX30102_PulseInfo_t;
 
 HAL_StatusTypeDef max30102_init(void);
 HAL_StatusTypeDef max30102_write_reg(uint8_t reg_addr, uint8_t data);
@@ -176,6 +193,10 @@ uint8_t max30102_calculate_spo2(const MAX30102_SpO2_t *spo2_state, uint8_t *spo2
 
 /* 根据当前窗口内 IR 波形估算 BPM，返回 1 表示结果有效，0 表示暂时无有效结果。 */
 uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_value);
+/* 同 max30102_calculate_bpm，但额外提取最近一次有效心搏信息(pulse_info)供上层 HRV 模块使用。 */
+uint8_t max30102_calculate_bpm_with_pulse(const MAX30102_SpO2_t *spo2_state,
+                                          uint8_t *bpm_value,
+                                          MAX30102_PulseInfo_t *pulse_info);
 uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_SignalMetrics_t *metrics);
 uint8_t max30102_calculate_signal_quality(const MAX30102_SpO2_t *spo2_state,
                                           const MAX30102_SignalMetrics_t *metrics,

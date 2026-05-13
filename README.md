@@ -100,12 +100,20 @@ The `MAX30102 INT` pin is currently defined as `PE5` and controlled by `MAX30102
 
 ## 页面说明 / UI Pages
 
-- `BPM` 页：显示 `IR` 波形和心率  
-  `BPM` page: shows the `IR` waveform and heart rate
-- `SpO2` 页：显示 `RED` 波形和血氧  
-  `SpO2` page: shows the `RED` waveform and oxygen saturation
+- `PULSE` page: IR waveform, HR, latest IBI, rhythm state, and pulse markers.
+- `OXY` page: SpO2, PI, R ratio, RED/IR balance, and stacked IR/RED waveforms.
+- `VITALS` page: HR, RR, SQ, IBI, SDNN, RMSSD, PI, and full RTC date/time.
+
 - `DEBUG` 页：显示传感器原始值、`FIFO`、读写计数、错误恢复、`SQ/PI`  
   `DEBUG` page: shows raw sensor values, `FIFO`, read/write counters, recovery status, and `SQ/PI`
+
+## Metric Availability
+
+- `SQ`: based on IR/RED PI, AC RMS, channel balance, and window length; it is smoothed before display.
+- `R/BAL`: requires non-zero RED/IR DC and small but measurable RED/IR AC RMS. If the current frame is too weak, the last ratio may stay visible with `?`.
+- `IBI/REG`: requires two accepted pulse extrema with an interval from 300 ms to 2000 ms. `REG` shows after a valid `IBI`; high short-term variation is shown as `VAR`.
+- `SDNN/RMSSD`: requires at least 4 accepted `IBI` samples, so it appears several beats after `IBI`.
+- `RR`: requires `SQ >= 35`, at least 10 accepted beats, an 8 s or longer beat window, and visible pulse-amplitude modulation.
 
 ## 串口协议 / UART Protocol
 
@@ -115,14 +123,16 @@ By default, the firmware sends line-based text messages through `USART2`, making
 周期上报格式 / Periodic report format:
 
 ```text
-M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2
+M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2,rr_valid,rr,ibi_valid,ibi,hrv_valid,mean_ibi,sdnn,rmssd
 ```
 
 示例 / Example:
 
 ```text
-M,1,20260416,203015,53210,64892,41200,1,1,76,1,98
+M,1,20260416,203015,53210,64892,41200,1,1,76,1,98,1,16,1,789,1,790,35,42
 ```
+
+For appended metrics, `*_valid == 0` means the numeric value should be treated as invalid; transient invalid states may retain the last value for display/log context.
 
 校时命令 / Time-sync commands:
 
