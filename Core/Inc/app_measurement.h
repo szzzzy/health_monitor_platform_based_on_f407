@@ -20,9 +20,19 @@ typedef enum
   APP_MEASUREMENT_READ_ERROR
 } AppMeasurementReadStatus_t;
 
+/*
+ * 测量模块职责边界：
+ * - app_measurement: 流程编排、传感器读取、门控、输出状态协调。
+ * - app_hrv:         IBI 接受、32 拍 ring buffer、SDNN/RMSSD/SD1/SD2、rhythm_irregular。
+ * - app_rr:          RIAV amplitude buffer、RR 估计、SQ>=25 门控。
+ * - app_spo2_filter: SpO2 EMA、invalid/低SQ/motion 时不推进平滑。
+ * - app_motion:      PPG-only motion score、AC RMS baseline、迟滞状态。
+ */
+
 /* 初始化测量模块涉及的阈值等应用状态。 */
 void app_measurement_init_state(AppState_t *app);
-/* 清空基线、算法窗口与波形缓存，回到“待测量”状态。 */
+/* 清空基线、算法窗口、波形缓存与所有高级指标，回到”待测量”状态。
+ * 区别于测量输出重置（手指离开）：runtime reset 会清 HRV/RR 历史。 */
 void app_measurement_reset_runtime(void);
 /* 在基线采集阶段读一个样本并更新背景统计。 */
 uint8_t app_measurement_collect_baseline_sample(AppState_t *app);

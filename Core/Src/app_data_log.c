@@ -13,7 +13,7 @@
 #include "rtc.h"
 #include <stdio.h>
 
-#define RECORDS_PER_CYCLE   16U
+#define RECORDS_PER_CYCLE   26U
 
 static uint32_t sample_id = 0U;
 static char     csv_header_written = 0;
@@ -85,11 +85,13 @@ AppDataLogStatus_t APP_DataLog_StartSession(void)
 }
 
 /*
- * 写一条完整的 CSV 记录（当前 16 字段：基础 8 项 + RR/IBI/HRV 扩展 8 项）。
+ * 写一条完整的 CSV 记录（当前 26 字段：基础 8 项 + RR/IBI/HRV + motion/Poincare + 频域 HRV 扩展）。
  *
  * 每条记录包含：RED, IR, Baseline_IR, Finger, HR, SpO2, SignalQuality, PI_IR,
- *   RR_Valid, RR, IBI_Valid, IBI, HRV_Valid, Mean_IBI, SDNN, RMSSD
- * 共调用 emit 16 次（每次写一行）。
+ *   RR_Valid, RR, IBI_Valid, IBI, HRV_Valid, Mean_IBI, SDNN, RMSSD,
+ *   MotionArtifact, MotionScore, SD1, SD2, SD1_SD2, RhythmIrregular,
+ *   HRV_Freq_Valid, LF_Power, HF_Power, LF_HF
+ * 共调用 emit 26 次（每次写一行）。
  *
  * 写入失败时的提前返回：
  *   任何一次 emit 返回非 OK 状态，立即终止后续字段的写入并向上传播错误。
@@ -175,6 +177,46 @@ AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app)
 
     (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_rmssd_ms);
     write_ret = emit(ts, sid, st, "RMSSD", vb, "ms");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->motion_artifact);
+    write_ret = emit(ts, sid, st, "MotionArtifact", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->motion_score);
+    write_ret = emit(ts, sid, st, "MotionScore", vb, "0-100");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_sd1_ms);
+    write_ret = emit(ts, sid, st, "SD1", vb, "ms");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_sd2_ms);
+    write_ret = emit(ts, sid, st, "SD2", vb, "ms");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_sd1_sd2_x100);
+    write_ret = emit(ts, sid, st, "SD1_SD2", vb, "x100");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->rhythm_irregular);
+    write_ret = emit(ts, sid, st, "RhythmIrregular", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_freq_valid);
+    write_ret = emit(ts, sid, st, "HRV_Freq_Valid", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->hrv_lf_power_x100);
+    write_ret = emit(ts, sid, st, "LF_Power", vb, "ms2x100");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->hrv_hf_power_x100);
+    write_ret = emit(ts, sid, st, "HF_Power", vb, "ms2x100");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_lf_hf_x100);
+    write_ret = emit(ts, sid, st, "LF_HF", vb, "x100");
     if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
     return APP_DATA_LOG_OK;

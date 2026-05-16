@@ -74,10 +74,10 @@ void arm_bitreversal_32(uint32_t *pSrc, const uint16_t bitRevLength, const uint1
 #define MAX30102_SPO2_RATIO_SCALE          1000U
 #define MAX30102_FILTER_DC_SHIFT           4U
 #define MAX30102_INTR_STATUS_PPG_RDY       0x40U
-#define MAX30102_SIGNAL_QUALITY_IR_PI_GOOD 10U
-#define MAX30102_SIGNAL_QUALITY_RED_PI_GOOD 8U
-#define MAX30102_SIGNAL_QUALITY_IR_RMS_GOOD 96U
-#define MAX30102_SIGNAL_QUALITY_RED_RMS_GOOD 72U
+#define MAX30102_SIGNAL_QUALITY_IR_PI_GOOD 4U
+#define MAX30102_SIGNAL_QUALITY_RED_PI_GOOD 3U
+#define MAX30102_SIGNAL_QUALITY_IR_RMS_GOOD 24U
+#define MAX30102_SIGNAL_QUALITY_RED_RMS_GOOD 18U
 #define MAX30102_SIGNAL_QUALITY_WINDOW_GOOD 80U
 #define MAX30102_FIFO_DEPTH                32U
 #define MAX30102_FIFO_PTR_MASK             0x1FU
@@ -1186,6 +1186,12 @@ uint8_t max30102_calculate_signal_quality(const MAX30102_SpO2_t *spo2_state,
                                           uint8_t *signal_quality)
 {
   uint32_t quality_score;
+  uint32_t red_rms_for_quality;
+  uint32_t ir_rms_for_quality;
+  uint32_t red_centered_rms;
+  uint32_t ir_centered_rms;
+  uint32_t max_ac_rms;
+  uint32_t min_ac_rms;
   uint16_t max_pi;
   uint16_t min_pi;
 
@@ -1194,11 +1200,28 @@ uint8_t max30102_calculate_signal_quality(const MAX30102_SpO2_t *spo2_state,
     return 0U;
   }
 
+  /*
+   * filtered RMS is best for pulse detection, but during steady finger contact
+   * it can become very small after the bandpass/DC trackers settle. For SQ only,
+   * keep a conservative fallback from raw centered RMS so a still finger does
+   * not look worse than the initial contact transient.
+   */
+  red_centered_rms = max30102_calculate_centered_rms(spo2_state->red_sum,
+                                                     spo2_state->red_square_sum,
+                                                     spo2_state->sample_count);
+  ir_centered_rms = max30102_calculate_centered_rms(spo2_state->ir_sum,
+                                                    spo2_state->ir_square_sum,
+                                                    spo2_state->sample_count);
+  red_rms_for_quality = (red_centered_rms > metrics->red_ac_rms) ?
+                        red_centered_rms : metrics->red_ac_rms;
+  ir_rms_for_quality = (ir_centered_rms > metrics->ir_ac_rms) ?
+                       ir_centered_rms : metrics->ir_ac_rms;
+
   quality_score = 0U;
   quality_score += max30102_scale_score_u32(metrics->ir_pi_x1000, MAX30102_SIGNAL_QUALITY_IR_PI_GOOD, 30U);
   quality_score += max30102_scale_score_u32(metrics->red_pi_x1000, MAX30102_SIGNAL_QUALITY_RED_PI_GOOD, 20U);
-  quality_score += max30102_scale_score_u32(metrics->ir_ac_rms, MAX30102_SIGNAL_QUALITY_IR_RMS_GOOD, 20U);
-  quality_score += max30102_scale_score_u32(metrics->red_ac_rms, MAX30102_SIGNAL_QUALITY_RED_RMS_GOOD, 10U);
+  quality_score += max30102_scale_score_u32(ir_rms_for_quality, MAX30102_SIGNAL_QUALITY_IR_RMS_GOOD, 20U);
+  quality_score += max30102_scale_score_u32(red_rms_for_quality, MAX30102_SIGNAL_QUALITY_RED_RMS_GOOD, 10U);
   quality_score += max30102_scale_score_u32(spo2_state->sample_count, MAX30102_SIGNAL_QUALITY_WINDOW_GOOD, 5U);
 
   max_pi = metrics->red_pi_x1000;
@@ -1212,6 +1235,21 @@ uint8_t max30102_calculate_signal_quality(const MAX30102_SpO2_t *spo2_state,
   if (max_pi != 0U)
   {
     quality_score += ((uint32_t)min_pi * 15U + (max_pi / 2U)) / max_pi;
+  }
+  else
+  {
+    max_ac_rms = red_rms_for_quality;
+    min_ac_rms = ir_rms_for_quality;
+    if (max_ac_rms < min_ac_rms)
+    {
+      max_ac_rms = ir_rms_for_quality;
+      min_ac_rms = red_rms_for_quality;
+    }
+
+    if (max_ac_rms != 0U)
+    {
+      quality_score += ((uint32_t)min_ac_rms * 15U + (max_ac_rms / 2U)) / max_ac_rms;
+    }
   }
 
   if (quality_score > 100U)

@@ -204,22 +204,6 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
-  * @brief This function handles EXTI line[9:5] interrupts.
-  */
-void EXTI9_5_IRQHandler(void)
-{
-  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
-
-  /* USER CODE END EXTI9_5_IRQn 0 */
-#if (MAX30102_USE_INT_PIN != 0U)
-  HAL_GPIO_EXTI_IRQHandler(MAX30102_INT_Pin);
-#endif
-  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
-
-  /* USER CODE END EXTI9_5_IRQn 1 */
-}
-
-/**
   * @brief This function handles TIM6 global interrupt, DAC1 and DAC2 underrun error interrupts.
   */
 void TIM6_DAC_IRQHandler(void)
@@ -277,10 +261,10 @@ void I2C1_ER_IRQHandler(void)
   HAL_I2C_ER_IRQHandler(&hi2c1);
 }
 
-/* MAX30102 PPG_RDY 中断（PE5 下降沿）。
- * 若 PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发）
- * 系统会通过 TIM6 节拍兜底轮询。 */
-/* HAL GPIO EXTI 统一回调，按引脚分发。 */
+/* MAX30102 PPG_RDY 中断（PE5 下降沿）�?
+ * �? PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发�?
+ * 系统会�?�过 TIM6 节拍兜底轮询�? */
+/* HAL GPIO EXTI 统一回调，按引脚分发�? */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 #if (MAX30102_USE_INT_PIN != 0U)

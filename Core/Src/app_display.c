@@ -208,10 +208,20 @@ static void app_display_pulse_page(const AppState_t *app)
     return;
   }
 
-  (void)snprintf(title_line,
-                 sizeof(title_line),
-                 "PULSE     SQ:%u",
-                 (unsigned int)app->signal_quality);
+  if (app->motion_artifact != 0U)
+  {
+    (void)snprintf(title_line,
+                   sizeof(title_line),
+                   "PULSE MOT SQ:%u",
+                   (unsigned int)app->signal_quality);
+  }
+  else
+  {
+    (void)snprintf(title_line,
+                   sizeof(title_line),
+                   "PULSE     SQ:%u",
+                   (unsigned int)app->signal_quality);
+  }
 
   /* HR 末尾的 "?" 表示 bpm_valid=0 但 bpm_value 保留旧值。 */
   if ((app->finger_present != 0U) &&
@@ -285,11 +295,22 @@ static void app_display_oxy_page(const AppState_t *app)
   }
 
   /* PI 显示：存储值 = PI% × 10（例 PI=5.3% → 值 53），除以 10 取整+余数显示 X.X 格式。 */
-  (void)snprintf(title_line,
-                 sizeof(title_line),
-                 "OXY      PI:%u.%u",
-                 (unsigned int)(app->signal_ir_pi_x1000 / 10U),
-                 (unsigned int)(app->signal_ir_pi_x1000 % 10U));
+  if (app->motion_artifact != 0U)
+  {
+    (void)snprintf(title_line,
+                   sizeof(title_line),
+                   "OXY MOT PI:%u.%u",
+                   (unsigned int)(app->signal_ir_pi_x1000 / 10U),
+                   (unsigned int)(app->signal_ir_pi_x1000 % 10U));
+  }
+  else
+  {
+    (void)snprintf(title_line,
+                   sizeof(title_line),
+                   "OXY      PI:%u.%u",
+                   (unsigned int)(app->signal_ir_pi_x1000 / 10U),
+                   (unsigned int)(app->signal_ir_pi_x1000 % 10U));
+  }
 
   /* SpO2 末尾 "?" 含义同 HR：spo2_valid=0 但 spo2_value 保留旧值。 */
   if ((app->finger_present != 0U) &&
@@ -359,7 +380,14 @@ static void app_display_vitals_page(const AppState_t *app)
     return;
   }
 
-  (void)snprintf(line0, sizeof(line0), "VITALS   SQ:%u", (unsigned int)app->signal_quality);
+  if (app->motion_artifact != 0U)
+  {
+    (void)snprintf(line0, sizeof(line0), "VITALS M SQ:%u", (unsigned int)app->signal_quality);
+  }
+  else
+  {
+    (void)snprintf(line0, sizeof(line0), "VITALS   SQ:%u", (unsigned int)app->signal_quality);
+  }
   /* HR 和 RR 各自判断是否有数据可显示（互不依赖）。 */
   hr_visible = ((app->finger_present != 0U) &&
                 ((app->bpm_valid != 0U) || (app->bpm_value != 0U))) ? 1U : 0U;
@@ -601,9 +629,10 @@ static const char *app_get_balance_label(uint8_t balance_status)
 }
 
 /*
- * 心律规整度标签（基于 RMSSD）：
- * - RMSSD > 120 ms → "VAR"（变异性高，常见于年轻/健康人群）
- * - RMSSD <= 120 或 HRV 无效 → "OK"（心律较规整）
+ * 心律规整度标签（短窗口提示，不做诊断）：
+ * - rhythm_irregular=1 -> "IRR"
+ * - RMSSD > 120 ms -> "VAR"
+ * - HRV 无效或变异性不高 -> "OK"
  * 仅在手指在位且 IBI 有效时输出，否则 "--"。
  */
 static const char *app_get_regular_label(const AppState_t *app)
@@ -611,6 +640,11 @@ static const char *app_get_regular_label(const AppState_t *app)
   if ((app == NULL) || (app->finger_present == 0U) || (app->ibi_valid == 0U))
   {
     return "--";
+  }
+
+  if ((app->hrv_valid != 0U) && (app->rhythm_irregular != 0U))
+  {
+    return "IRR";
   }
 
   if ((app->hrv_valid != 0U) && (app->hrv_rmssd_ms > 120U))
@@ -1071,4 +1105,3 @@ static void app_format_rtc_lines(const AppState_t *app,
   (void)snprintf(time_line, time_line_size, "TIME --:--:--");
   (void)snprintf(date_line, date_line_size, "DATE ----.--.--");
 }
-

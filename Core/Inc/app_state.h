@@ -76,6 +76,15 @@ typedef struct
   uint8_t sensor_fifo_available_samples;
   uint8_t raw_signal_present;
   uint8_t signal_quality;
+  /*
+   * PPG-only motion 检测：不使用加速度计，纯从 PPG 信号特征推断。
+   * motion_artifact=1 → 冻结 HR/SpO2/RR 输出（valid=0，旧值保留）。
+   * Motion 期间不清 HRV/IBI ring buffer——只标 invalid。
+   * 手指离开 / runtime reset / sensor recovery 才会清 HRV/RR 历史。
+   */
+  uint8_t motion_artifact;
+  /* 原始 motion score 0–100，基于 AC RMS 尖峰 + RED/IR 平衡 + SQ 骤降三条信号合成。 */
+  uint8_t motion_score;
   /* PI：存储 (AC/DC) × 1000，即标准灌注指数(%) × 10。例如 PI=12.3% → 值 123。
    * OXY 页显示为 PI:12.3（除以 10 取整+余数）。uint16 承载 >25.5% 的 PI 值。 */
   uint16_t signal_ir_pi_x1000;
@@ -93,14 +102,44 @@ typedef struct
   uint8_t bpm_invalid_hold_count;
   uint8_t spo2_valid;
   uint8_t spo2_value;
-  /* IBI/HRV：由流式脉冲检测 (app_stream_pulse_update) 驱动。valid=1 表示 32 拍窗口内已有 >=4 个有效间隔。 */
+  /*
+   * IBI/HRV 由流式脉冲检测 (app_stream_pulse_update) 驱动。
+   * valid=1 表示 ring buffer 中已有 >=3 个有效间隔。
+   * 频域 HRV 仅提供 32 拍短窗口 LF/HF 估计，不实现 VLF，也不是标准 5 分钟频谱分析。
+   */
   uint8_t ibi_valid;
   uint16_t latest_ibi_ms;
   uint8_t hrv_valid;
   uint16_t hrv_mean_ibi_ms;
   uint16_t hrv_sdnn_ms;
   uint16_t hrv_rmssd_ms;
-  /* RR：比 IBI/HRV 更慢更严格——需要 SQ>=35、>=10 拍、>=8 秒窗口且脉搏幅度有明显调制。 */
+  /*
+   * SD1/SD2 是基于同一 32 拍 IBI ring buffer 的 Poincare 短窗口描述符，
+   * 不是诊断分类。
+   * SD1 = RMSSD / sqrt(2)  （短时变异性，Poincare 椭圆短轴）。
+   * SD2 = sqrt(2*SDNN^2 - SD1^2)  （长时变异性，Poincare 椭圆长轴）。
+   * SD1/SD2 x100 = 短/长期变异性比值。
+   */
+  uint16_t hrv_sd1_ms;
+  uint16_t hrv_sd2_ms;
+  uint16_t hrv_sd1_sd2_x100;
+  /*
+   * Short-window frequency HRV estimate from the same 32-beat IBI buffer.
+   * hrv_lf_power_x100 / hrv_hf_power_x100 are band powers in ms^2 x100.
+   * hrv_lf_hf_x100 is LF/HF x100. Non-diagnostic trend display only.
+   */
+  uint8_t hrv_freq_valid;
+  uint32_t hrv_lf_power_x100;
+  uint32_t hrv_hf_power_x100;
+  uint16_t hrv_lf_hf_x100;
+  /*
+   * 短窗口节律提示，不是诊断分类。
+   * 同时满足 RMSSD >= 120 ms 且 SD1/SD2 x100 >= 70 时置位。
+   * 高 SD1/SD2 比值 + 高 RMSSD 可能暗示节律不齐，
+   * 但判读需要临床上下文。
+   */
+  uint8_t rhythm_irregular;
+  /* RR：比 IBI/HRV 更慢——需要 SQ>=25、>=8 拍、>=6 秒窗口且脉搏幅度有明显调制。 */
   uint8_t rr_valid;
   uint8_t rr_bpm;
   /* R/BAL：由 RED/IR 的 AC RMS 和 DC 原始值计算比值 R，3:1 平滑。弱帧只标 invalid 不清旧值。 */

@@ -1,10 +1,10 @@
 # BME
 
 基于 `STM32F407ZGTx` 的 `MAX30102 + SSD1306 + RTC + USART2` 生理信号采集工程。  
-当前版本在 100 Hz 精确采样节拍、CMSIS-DSP 带通滤波、自相关 BPM、I2C DMA、独立看门狗和 SD 卡日志的基础上，完成了心率、血氧、波形显示、串口上报与 CSV 落盘的主链路，适合作为后续继续扩展 `AD8232`、`DMA/ADC`、`RTOS` 等功能的基础版本。
+当前版本在 100 Hz 精确采样节拍、CMSIS-DSP 带通滤波、自相关 BPM、I2C DMA、独立看门狗和 SD 卡日志的基础上，完成了心率、血氧、波形显示、串口上报与 CSV 落盘的主链路，适合作为后续继续扩展更强滤波、异常检测、`RTOS` 等功能的基础版本。
 
 This project is a physiological signal acquisition firmware based on `STM32F407ZGTx`, using `MAX30102 + SSD1306 + RTC + USART2`.  
-The current version builds on a 100 Hz precise sampling tick, CMSIS-DSP bandpass filtering, autocorrelation BPM, I2C DMA transfers, independent watchdog, and SD-card CSV logging. It covers the main pipeline of heart-rate estimation, SpO2 estimation, waveform display, UART reporting, and data logging, and is suitable as a base for future extensions such as `AD8232`, `DMA/ADC`, and `RTOS`.
+The current version builds on a 100 Hz precise sampling tick, CMSIS-DSP bandpass filtering, autocorrelation BPM, I2C DMA transfers, independent watchdog, and SD-card CSV logging. It covers the main pipeline of heart-rate estimation, SpO2 estimation, waveform display, UART reporting, and data logging, and is suitable as a base for future extensions such as stronger filtering, anomaly detection, and `RTOS`.
 
 ## 当前功能 / Current Features
 
@@ -100,9 +100,9 @@ The `MAX30102 INT` pin is currently defined as `PE5` and controlled by `MAX30102
 
 ## 页面说明 / UI Pages
 
-- `PULSE` page: IR waveform, HR, latest IBI, rhythm state, and pulse markers.
-- `OXY` page: SpO2, PI, R ratio, RED/IR balance, and stacked IR/RED waveforms.
-- `VITALS` page: HR, RR, SQ, IBI, SDNN, RMSSD, PI, and full RTC date/time.
+- `PULSE` page: IR waveform, HR, latest IBI, rhythm state, motion flag, and pulse markers.
+- `OXY` page: smoothed SpO2, PI, R ratio, RED/IR balance, motion flag, and stacked IR/RED waveforms.
+- `VITALS` page: HR, RR, SQ, motion flag, IBI, SDNN, RMSSD, PI, and full RTC date/time.
 
 - `DEBUG` 页：显示传感器原始值、`FIFO`、读写计数、错误恢复、`SQ/PI`  
   `DEBUG` page: shows raw sensor values, `FIFO`, read/write counters, recovery status, and `SQ/PI`
@@ -111,8 +111,10 @@ The `MAX30102 INT` pin is currently defined as `PE5` and controlled by `MAX30102
 
 - `SQ`: based on IR/RED PI, AC RMS, channel balance, and window length; it is smoothed before display.
 - `R/BAL`: requires non-zero RED/IR DC and small but measurable RED/IR AC RMS. If the current frame is too weak, the last ratio may stay visible with `?`.
-- `IBI/REG`: requires two accepted pulse extrema with an interval from 300 ms to 2000 ms. `REG` shows after a valid `IBI`; high short-term variation is shown as `VAR`.
-- `SDNN/RMSSD`: requires at least 4 accepted `IBI` samples, so it appears several beats after `IBI`.
+- `MotionArtifact`: PPG-only motion hint from AC RMS spikes, RED/IR imbalance, and sudden SQ drops. During motion, HR/SpO2/RR are held as old values with valid flags cleared.
+- `IBI/REG`: requires two accepted pulse extrema with an interval from 300 ms to 2000 ms. `REG` shows after a valid `IBI`; high short-term variation is shown as `VAR`, and the short-window irregular hint is shown as `IRR`.
+- `SDNN/RMSSD/SD1/SD2`: requires at least 4 accepted `IBI` samples, so it appears several beats after `IBI`. SD1/SD2 are short-window Poincare descriptors, not diagnostic labels.
+- `LF/HF`: short-window frequency HRV estimate from the 32-beat IBI buffer. It uses 4 Hz linear resampling, mean removal, Hann windowing, CMSIS-DSP RFFT, LF `0.04-0.15 Hz`, and HF `0.15-0.40 Hz`. `VLF` is not reported because a 32-beat window is too short for useful `<0.04 Hz` resolution. This is for engineering demonstration and trend observation only; it is not diagnostic and not standard 5-minute HRV spectral analysis.
 - `RR`: requires `SQ >= 35`, at least 10 accepted beats, an 8 s or longer beat window, and visible pulse-amplitude modulation.
 
 ## 串口协议 / UART Protocol
@@ -123,16 +125,16 @@ By default, the firmware sends line-based text messages through `USART2`, making
 周期上报格式 / Periodic report format:
 
 ```text
-M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2,rr_valid,rr,ibi_valid,ibi,hrv_valid,mean_ibi,sdnn,rmssd
+M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2,rr_valid,rr,ibi_valid,ibi,hrv_valid,mean_ibi,sdnn,rmssd,motion_artifact,motion_score,sd1,sd2,sd1_sd2_x100,rhythm_irregular,hrv_freq_valid,lf_power_x100,hf_power_x100,lf_hf_x100,signal_quality,raw_signal_present,signal_ir_pi_x1000,signal_red_pi_x1000,signal_ir_ac_rms,signal_red_ac_rms,spo2_ratio_valid,spo2_ratio_x1000,spo2_balance_status,baseline_range_ir,adaptive_finger_on_delta,adaptive_finger_off_delta,ir_signal_delta,ir_signal_span,red_signal_span,finger_on_confirm_count,finger_off_confirm_count,sensor_last_read_status,sensor_error_streak,sensor_fifo_write_ptr,sensor_fifo_read_ptr,sensor_fifo_overflow_count,sensor_fifo_available_samples,sensor_read_ok_count,sensor_read_busy_count,sensor_read_error_count,sensor_recover_count,sensor_last_sample_tick,sensor_sample_change_count,sensor_sample_same_count,sensor_last_i2c_error,rtc_read_ok,uart_rx_message_valid,uart_tx_message_valid,sd_card_ready,sd_log_active,sd_log_error,sd_total_written,display_refresh_count,display_last_refresh_tick,display_brightness_index,current_page
 ```
 
 示例 / Example:
 
 ```text
-M,1,20260416,203015,53210,64892,41200,1,1,76,1,98,1,16,1,789,1,790,35,42
+M,1,20260416,203015,53210,64892,41200,1,1,76,1,98,1,16,1,789,1,790,35,42,0,0,30,38,79,0,1,12500,9800,128,65,1,123,98,245,210,1,1200,1,3000,8000,4000,11892,12500,8300,2,0,1,0,5,4,0,3,12345,0,0,1,123456,85,12,0,1,1,1,1,1,0,1200,45,67890,1,0
 ```
 
-For appended metrics, `*_valid == 0` means the numeric value should be treated as invalid; transient invalid states may retain the last value for display/log context.
+For appended metrics, `*_valid == 0` means the numeric value should be treated as invalid; transient invalid states may retain the last value for display/log context. `lf_power_x100` and `hf_power_x100` are short-window band powers in `ms^2 x100`; `lf_hf_x100` is `LF/HF x100`. `signal_quality` is the realtime SQ score used by the OLED. `signal_ir_pi_x1000` and `signal_red_pi_x1000` store `(AC/DC) x1000`, equivalent to `PI% x10`, so display `123` as `12.3%`. `spo2_ratio_x1000` displays as `R/1000`; `spo2_balance_status` is `0=unknown, 1=OK, 2=LOW, 3=HIGH`.
 
 校时命令 / Time-sync commands:
 
@@ -287,6 +289,6 @@ T,success,rtc_valid,yyyymmdd,hhmmss,reason
 
 ## 当前状态 / Current Status
 
-这一版已经完成了 TIM6 100 Hz 精确节拍、MAX30102 轮询采样、I2C DMA 传输、CMSIS-DSP Butterworth 带通滤波、自相关 BPM、IWDG 看门狗和 SD 卡 CSV 日志的集成。系统以 10 ms 为周期运行，主循环在 `__WFI()` 低功耗等待中度过大部分时间。适合作为继续往 `AD8232` 心电、更强滤波、异常检测、`RTOS` 等方向扩展的基线。
+这一版已经完成了 TIM6 100 Hz 精确节拍、MAX30102 轮询采样、I2C DMA 传输、CMSIS-DSP Butterworth 带通滤波、自相关 BPM、IWDG 看门狗和 SD 卡 CSV 日志的集成。系统以 10 ms 为周期运行，主循环在 `__WFI()` 低功耗等待中度过大部分时间。适合作为继续往更强滤波、异常检测、`RTOS` 等方向扩展的基线。
 
-This version integrates a TIM6 100 Hz precise tick, MAX30102 polling-based sampling, I2C DMA transfers, CMSIS-DSP Butterworth bandpass filtering, autocorrelation BPM, IWDG watchdog, and SD-card CSV logging. The system runs on a 10 ms cycle, with the main loop spending most of its time in `__WFI()` low-power wait. It serves as a solid baseline for extensions into `AD8232` ECG, stronger filtering, anomaly detection, or `RTOS`.
+This version integrates a TIM6 100 Hz precise tick, MAX30102 polling-based sampling, I2C DMA transfers, CMSIS-DSP Butterworth bandpass filtering, autocorrelation BPM, IWDG watchdog, and SD-card CSV logging. The system runs on a 10 ms cycle, with the main loop spending most of its time in `__WFI()` low-power wait. It serves as a solid baseline for extensions into stronger filtering, anomaly detection, or `RTOS`.
