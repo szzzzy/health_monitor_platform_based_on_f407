@@ -19,11 +19,12 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "i2c.h"
-#include "iwdg.h"
 #include "rtc.h"
+#include "sdio.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
+#include "iwdg.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -46,9 +47,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define APP_UI_REFRESH_PERIOD_MS 200U
+#define APP_UI_REFRESH_PERIOD_MS 100U
 #define APP_MAIN_LOOP_DELAY_MS   5U
-#define APP_SENSOR_DRAIN_BUDGET  32U
+#define APP_SENSOR_DRAIN_BUDGET  8U
 
 /* USER CODE END PD */
 
@@ -61,6 +62,7 @@
 
 /* USER CODE BEGIN PV */
 volatile uint8_t tim6_tick_flag = 0;
+static AppState_t app;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,7 +72,7 @@ void SystemClock_Config(void);
 static void app_state_init(AppState_t *app);
 /* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态。 */
 static void app_send_report_if_due(AppState_t *app);
-/* 若当前轮次需要刷新显示，则重绘当前测量页面。 */
+/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态。 */
 static void app_refresh_display_if_needed(AppState_t *app);
 static void app_schedule_periodic_refresh(AppState_t *app);
 static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status);
@@ -168,7 +170,6 @@ static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status)
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-  AppState_t app;
   char status_line[32];
   uint32_t last_status_tick;
   /* USER CODE END 1 */
@@ -194,6 +195,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_RTC_Init();
   MX_TIM6_Init();
+  MX_SDIO_SD_Init();
   /* USER CODE BEGIN 2 */
   MX_IWDG_Init();
   APP_Watchdog_Refresh();
@@ -222,7 +224,7 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* SD 日志只走 app_sd_file 的可失败、可重试路径；不要在开机阶段硬初始化 SDIO。 */
+  /* SD 卡日志：每次上报同期落盘 */
   APP_DataLog_Init();
   app_update_sd_log_status(&app, APP_DataLog_StartSession());
   APP_Watchdog_Refresh();
@@ -297,7 +299,7 @@ int main(void)
      * - 轮询串口命令（DMA+IDLE，非阻塞）
      * - 处理按键（软件消抖）
      * - max30102_should_service_fifo() 门控传感器读取：
-     *    当前禁用 MAX30102 INT，按 TIM6 100 Hz 纯轮询 FIFO
+  *                        opensource.org/licenses/BSD-3-Clause
      * - 推进 BPM/SpO2 算法 + 波形显示
      * - 200 ms 周期统一上报 + 刷新 OLED
      */

@@ -24,11 +24,11 @@
 #include <string.h>
 
 /* --------------------------------------------------------------------------
- * USART2 DMA 循环接收缓冲�?
+ * USART2 DMA 寰幆鎺ユ敹缂撳啿鍖?
  *
- * DMA1_Stream5_Channel4 �? CIRCULAR 模式持续接收，IDLE 中断�?测帧间隔�?
- * uart_dma_last_pos 记录 DMA 缓冲区中已被协议层消费的位置�?
- * uart_dma_idle_flag �? ISR �? 1，协议层轮询后清零�??
+ * DMA1_Stream5_Channel4 浠? CIRCULAR 妯″紡鎸佺画鎺ユ敹锛孖DLE 涓柇妫?娴嬪抚闂撮殧銆?
+ * uart_dma_last_pos 璁板綍 DMA 缂撳啿鍖轰腑宸茶鍗忚灞傛秷璐圭殑浣嶇疆銆?
+ * uart_dma_idle_flag 鐢? ISR 缃? 1锛屽崗璁眰杞鍚庢竻闆躲??
  * -------------------------------------------------------------------------- */
 static DMA_HandleTypeDef hdma_usart2_rx;
 static uint8_t  uart_dma_rx_buf[UART_DMA_RX_BUF_SIZE];
@@ -70,9 +70,9 @@ void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-  /* 启动 USART2 IDLE 中断 + DMA 循环接收�?
-   * IDLE 中断在�?�线空闲（≥1 个字符时长无数据）时触发�?
-   * 用于�?测变长帧结束，免去�?�字节轮询�?? */
+  /* 鍚姩 USART2 IDLE 涓柇 + DMA 寰幆鎺ユ敹銆?
+   * IDLE 涓柇鍦ㄦ?荤嚎绌洪棽锛堚墺1 涓瓧绗︽椂闀挎棤鏁版嵁锛夋椂瑙﹀彂锛?
+   * 鐢ㄤ簬妫?娴嬪彉闀垮抚缁撴潫锛屽厤鍘婚?愬瓧鑺傝疆璇€?? */
   __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
   HAL_NVIC_SetPriority(USART2_IRQn, 3, 0);
   HAL_NVIC_EnableIRQ(USART2_IRQn);
@@ -106,7 +106,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN USART2_MspInit 1 */
-  /* USART2_RX DMA: DMA1_Stream5, Channel4, 循环模式 */
+  /* USART2_RX DMA: DMA1_Stream5, Channel4, 寰幆妯″紡 */
   {
     __HAL_RCC_DMA1_CLK_ENABLE();
 

@@ -1,0 +1,45 @@
+/*
+ * PPG-only motion artifact 检测——不使用加速度计，纯从 PPG 信号特征推断。
+ *
+ * 三条检测信号：
+ * 1. AC RMS 尖峰: RED 或 IR 当前 AC RMS 达到 baseline 的 3.0x 且增量 >=80。
+ * 2. RED/IR 平衡异常: AC ratio x1000 落在 [350, 2800] 之外，或 R/BAL 已偏。
+ * 3. SQ 骤降: raw_quality 从 >=45 前值骤降 >=25 点。
+ * 三条信号各自贡献分数，总分 >=60 确认 motion，<=30 确认退出。
+ *
+ * 迟滞状态机：
+ * - 进入: score >= 60 连续 5 拍确认 → motion_artifact = 1。
+ * - 退出: score <= 30 连续 30 拍确认 → motion_artifact = 0。
+ * - Motion 期间 AC RMS baseline 不更新（防止污染）。
+ * - 非 motion 期间 baseline 慢速跟踪 (shift=6)，维持自适应能力。
+ *
+ * Motion 期间的测量策略：
+ * - HR/SpO2/RR/IBI/HRV valid 被清零，旧值保留。
+ * - HRV/IBI ring buffer 不清——motion 结束可立即恢复。
+ * - 流式脉冲检测状态重置（避免跨 motion 的假 IBI）。
+ */
+#ifndef __APP_MOTION_H__
+#define __APP_MOTION_H__
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "app_state.h"
+#include "max30102.h"
+
+/* 清零内部状态与 app->motion_artifact / motion_score。 */
+void app_motion_reset(AppState_t *app);
+/*
+ * 每拍更新 motion score 与迟滞状态机。
+ * metrics==NULL 或 finger_present==0: 退化为"无信号"路径，score 归零并计数退出。
+ */
+void app_motion_update_artifact(AppState_t *app,
+                                const MAX30102_SignalMetrics_t *metrics,
+                                uint8_t raw_quality);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __APP_MOTION_H__ */
