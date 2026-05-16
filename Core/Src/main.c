@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : 主程序入口与应用层调�?
+  * @brief          : 主程序入口与应用层调试
   * @attention
   *
   * <h2><center>&copy; Copyright (c) 2026 STMicroelectronics.
@@ -68,11 +68,11 @@ static AppState_t app;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-/* 初始化共享状态，并让各模块完成自己的默认配置�? */
+/* 初始化共享状态，并让各模块完成自己的默认配置。 */
 static void app_state_init(AppState_t *app);
-/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状�?��?? */
+/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态。 */
 static void app_send_report_if_due(AppState_t *app);
-/* 若当前轮次需要刷新显示，则重绘当前测量页面�?? */
+/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态。 */
 static void app_refresh_display_if_needed(AppState_t *app);
 static void app_schedule_periodic_refresh(AppState_t *app);
 static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status);
@@ -80,7 +80,7 @@ static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status)
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/* 应用层统�?初始化入口，main 中只保留调度�? */
+/* 应用层统一初始化入口，main 中只保留调度。 */
 static void app_state_init(AppState_t *app)
 {
   if (app == NULL)
@@ -94,7 +94,7 @@ static void app_state_init(AppState_t *app)
   app_protocol_init();
 }
 
-/* 把�?�是否上报�?�的时序控制收口到一个函数里，避免主循环继续膨胀�? */
+/* 把“是否上报”的时序控制收口到一个函数里，避免主循环继续膨胀。 */
 static void app_send_report_if_due(AppState_t *app)
 {
   AppDataLogStatus_t log_status;
@@ -112,7 +112,7 @@ static void app_send_report_if_due(AppState_t *app)
   app_update_sd_log_status(app, log_status);
 }
 
-/* OLED 刷新单独封装，让主循环更像调度器而不是细节堆场�?? */
+/* OLED 刷新单独封装，让主循环更像调度器而不是细节堆场。 */
 static void app_refresh_display_if_needed(AppState_t *app)
 {
   if ((app == NULL) || (app->display_refresh_requested == 0U))
@@ -202,12 +202,12 @@ int main(void)
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
   HAL_TIM_Base_Start_IT(&htim6);
-  /* 启动显示、读�? RTC，并先给出开机状态页�? */
+  /* 启动显示、读取 RTC，并先给出开机状态页。 */
   ssd1306_Init();
   app_protocol_update_rtc_snapshot(&app);
   app_display_status_page(&app, "MAX30102 INIT", "SYSTEM BOOT");
 
-  /* 传感器初始化失败时，保留串口命令与错误状态显示，便于现场排查�? */
+  /* 传感器初始化失败时，保留串口命令与错误状态显示，便于现场排查。 */
   if (max30102_init() != HAL_OK)
   {
     while (1)
@@ -224,12 +224,12 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* SD 日志只走 app_sd_file 的可失败、可重试路径；不要在�?机阶段硬初始�? SDIO�? */
+  /* SD 卡日志：每次上报同期落盘 */
   APP_DataLog_Init();
   app_update_sd_log_status(&app, APP_DataLog_StartSession());
   APP_Watchdog_Refresh();
 
-  /* 上电先采集一段�?�无手指”背景，建立 IR 基线�? */
+  /* 上电先采集一段“无手指”背景，建立 IR 基线。 */
   while (app_measurement_baseline_ready() == 0U)
   {
     app_protocol_poll_uart_commands(&app);
@@ -255,7 +255,7 @@ int main(void)
     HAL_Delay(APP_MAIN_LOOP_DELAY_MS);
   }
 
-  /* 基线就绪后，给后台跟踪器播种并立即发送一帧初始状态�?? */
+  /* 基线就绪后，给后台跟踪器播种并立即发送一帧初始状态。 */
   app.baseline_ir = app_measurement_get_baseline_average();
   app.baseline_range_ir = app_measurement_get_baseline_range();
   {
@@ -275,7 +275,7 @@ int main(void)
   app.baseline_ir = app_measurement_get_tracked_baseline();
   app_protocol_send_sensor_report(&app);
 
-  /* 根据采集到的波动范围提示“稳�? / 噪声偏大”�?? */
+  /* 根据采集到的波动范围提示“稳定 / 噪声偏大”。 */
   (void)snprintf(status_line, sizeof(status_line), "BASE:%lu", (unsigned long)app.baseline_ir);
   if (app_measurement_baseline_is_stable() != 0U)
   {
@@ -296,10 +296,10 @@ int main(void)
   {
     /*
      * 主循环保持为”调度器”角色：
-     * - 轮询串口命令（DMA+IDLE，非阻塞�?
+     * - 轮询串口命令（DMA+IDLE，非阻塞）
      * - 处理按键（软件消抖）
      * - max30102_should_service_fifo() 门控传感器读取：
-     *    当前禁用 MAX30102 INT，按 TIM6 100 Hz 纯轮�? FIFO
+  *                        opensource.org/licenses/BSD-3-Clause
      * - 推进 BPM/SpO2 算法 + 波形显示
      * - 200 ms 周期统一上报 + 刷新 OLED
      */

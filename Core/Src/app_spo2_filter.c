@@ -1,15 +1,30 @@
+/**
+  ******************************************************************************
+  * @file    app_spo2_filter.c
+  * @brief   SpO2 输出平滑滤波器
+  *
+  * 对原始 SpO2 值施加 EMA（指数移动平均）平滑，减少逐拍抖动。
+  *
+  * 关键设计：低 SQ / invalid / motion 时不推进 EMA 状态，
+  * 防止无效数据污染平滑结果。旧值保留以供 UI 显示（带"?"标记），
+  * 但 spo2_valid 清零。
+  ******************************************************************************
+  */
+
 #include "app_spo2_filter.h"
 
 #include <string.h>
 
-#define APP_SPO2_EMA_OLD_WEIGHT 3U
-#define APP_SPO2_EMA_ROUNDING   2U
-#define APP_SPO2_EMA_DIVISOR    4U
+/* EMA 平滑参数：新值权重 25%，旧值权重 75% */
+#define APP_SPO2_EMA_OLD_WEIGHT 3U   /* 旧值乘数 */
+#define APP_SPO2_EMA_ROUNDING   2U   /* 四舍五入项 */
+#define APP_SPO2_EMA_DIVISOR    4U   /* 归一化除数 */
 
+/* EMA 内部状态 */
 static struct
 {
-  uint8_t initialized;
-  uint8_t value;
+  uint8_t initialized;  /* 1 = 已收到首帧有效值 */
+  uint8_t value;        /* 当前平滑后的 SpO2 值 */
 } spo2_smooth_state;
 
 void app_spo2_filter_reset(AppState_t *app)
