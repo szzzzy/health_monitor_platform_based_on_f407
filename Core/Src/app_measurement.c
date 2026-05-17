@@ -19,7 +19,9 @@
 #define APP_BPM_ACORR_BLEND_MAX_DIFF      12U
 #define APP_SIGNAL_QUALITY_MIN_FOR_SPO2   30U
 #define APP_SIGNAL_QUALITY_MIN_FOR_BPM    25U
-#define APP_ADVANCED_PULSE_STALE_SAMPLES  (MAX30102_ALGO_SAMPLE_RATE_HZ * 3U)
+#define APP_ADVANCED_PULSE_STALE_SAMPLES  (MAX30102_ALGO_SAMPLE_RATE_HZ * 8U)
+#define APP_CONTACT_SETTLE_SAMPLES        200U
+#define APP_PI_STALE_SAMPLES              (MAX30102_ALGO_SAMPLE_RATE_HZ * 5U)
 
 static uint8_t fifo_buf[6];
 static MAX30102_Baseline_t baseline_data;
@@ -244,6 +246,10 @@ void app_measurement_update_finger_state(AppState_t *app)
       app->finger_on_confirm_count = 0U;
       app_reset_measurement_outputs(app);
       app_ppg_signal_reset_envelope();
+      app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
+      app->ir_pi_ac_ema = 0U;
+      app->ir_pi_ac_ema_valid = 0U;
+      app->last_beat_sample = 0U;
       app->raw_signal_present = 1U;
       app->report_due = 1U;
       app->display_refresh_requested = 1U;
@@ -301,6 +307,25 @@ void app_measurement_process(AppState_t *app)
     return;
   }
 
+  /* 接触稳定倒计数：手指刚放上时抑制 motion/stale/beat detector */
+  if (app->contact_settle_samples > 0U)
+  {
+    app->contact_settle_samples--;
+    if (app->contact_settle_samples == 0U)
+    {
+      /* Warm-up 结束：重置全部高级算法状态，避免接触瞬态污染 */
+      app_ppg_pulse_reset();
+      app_hrv_reset(app);
+      app_rr_reset(app);
+      app_bpm_filter_reset(app);
+      app_spo2_filter_reset(app);
+      app->ir_pi_ac_ema = 0U;
+      app->ir_pi_ac_ema_valid = 0U;
+      app->last_beat_sample = 0U;
+      bpm_update_decimator = 0U;
+    }
+  }
+
   max30102_spo2_add_sample(&spo2_state, app->red_value, app->ir_value);
   if (max30102_spo2_get_latest_filtered(&spo2_state,
                                          &red_waveform_sample,
@@ -332,30 +357,57 @@ void app_measurement_process(AppState_t *app)
 
   if (app->motion_artifact != 0U)
   {
-    app->bpm_valid = 0U;
-    app_spo2_filter_update_output(app, 0U, 0U);
-    app_invalidate_advanced_outputs(app);
-    app_ppg_pulse_reset();
-    return;
+    if (app->contact_settle_samples > 0U)
+    {
+      app->motion_artifact = 0U;
+    }
+    else
+    {
+      app->bpm_valid = 0U;
+      app_spo2_filter_update_output(app, 0U, 0U);
+      app_invalidate_advanced_outputs(app);
+      return;
+    }
   }
 
-  if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+  if (app->contact_settle_samples == 0U)
   {
-    app->rr_valid = 0U;
-  }
-  else if (app->signal_quality < APP_RR_SIGNAL_QUALITY_MIN)
-  {
-    app->rr_valid = 0U;
-  }
+    if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+    {
+      app->rr_valid = 0U;
+    }
+    else if (app->signal_quality < APP_RR_SIGNAL_QUALITY_MIN)
+    {
+      app->rr_valid = 0U;
+    }
 
-  if (app_hrv_is_peak_stale(spo2_state.total_samples, APP_ADVANCED_PULSE_STALE_SAMPLES) != 0U)
-  {
-    app_invalidate_advanced_outputs(app);
-  }
+    if (app_hrv_is_peak_stale(spo2_state.total_samples, APP_ADVANCED_PULSE_STALE_SAMPLES) != 0U)
+    {
+      app_invalidate_advanced_outputs(app);
+    }
 
-  if (app_ppg_pulse_update(app, ir_waveform_sample, spo2_state.total_samples, &pulse_info) != 0U)
-  {
-    app_ppg_pulse_process_metrics(app, &pulse_info, spo2_state.total_samples);
+    /* Beat-based PI：从已接受 beat 的 peak-to-trough 幅度 EMA 计算。
+     * 无新 beat 时保持最近值，超过阈值标无效。 */
+    if (app->ir_pi_ac_ema_valid != 0U)
+    {
+      uint32_t ir_dc = (uint32_t)(spo2_state.ir_sum / spo2_state.sample_count);
+      if (ir_dc != 0U)
+      {
+        uint64_t pi = ((uint64_t)app->ir_pi_ac_ema * 1000ULL + (ir_dc / 2ULL)) / ir_dc;
+        app->signal_ir_pi_x1000 = (pi > 0xFFFFULL) ? 0xFFFFU : (uint16_t)pi;
+      }
+    }
+
+    if ((app->last_beat_sample != 0U) &&
+        ((spo2_state.total_samples - app->last_beat_sample) > APP_PI_STALE_SAMPLES))
+    {
+      app->ir_pi_ac_ema_valid = 0U;
+    }
+
+    if (app_ppg_pulse_update(app, ir_waveform_sample, spo2_state.total_samples, &pulse_info) != 0U)
+    {
+      app_ppg_pulse_process_metrics(app, &pulse_info, spo2_state.total_samples);
+    }
   }
 
   raw_spo2_valid = max30102_calculate_spo2(&spo2_state, &raw_spo2_value);
@@ -363,55 +415,58 @@ void app_measurement_process(AppState_t *app)
   {
     raw_spo2_valid = 0U;
   }
-  app_spo2_filter_update_output(app, raw_spo2_valid, raw_spo2_value);
-
-  bpm_update_decimator++;
-  if (bpm_update_decimator < APP_BPM_EVALUATE_INTERVAL_SAMPLES)
+  if (app->contact_settle_samples == 0U)
   {
-    return;
+    app_spo2_filter_update_output(app, raw_spo2_valid, raw_spo2_value);
   }
 
-  bpm_update_decimator = 0U;
-  raw_bpm_valid = max30102_calculate_bpm_with_pulse(&spo2_state, &raw_bpm_value, &pulse_info);
-
-  if (app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+  if (app->contact_settle_samples == 0U)
   {
-    acorr_bpm_valid = max30102_autocorr_bpm(&spo2_state, &acorr_bpm);
-  }
-
-  if ((raw_bpm_valid != 0U) && (acorr_bpm_valid != 0U))
-  {
-    uint8_t diff = (raw_bpm_value > acorr_bpm) ? (raw_bpm_value - acorr_bpm)
-                                               : (acorr_bpm - raw_bpm_value);
-    if (diff <= APP_BPM_ACORR_BLEND_MAX_DIFF)
+    bpm_update_decimator++;
+    if (bpm_update_decimator < APP_BPM_EVALUATE_INTERVAL_SAMPLES)
     {
-      raw_bpm_value = (uint8_t)(((uint16_t)raw_bpm_value + (uint16_t)acorr_bpm * 3U + 2U) / 4U);
+      return;
     }
-  }
-  else if (acorr_bpm_valid != 0U)
-  {
-    raw_bpm_valid = 1U;
-    raw_bpm_value = acorr_bpm;
-  }
 
-  if ((raw_bpm_valid != 0U) && (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM))
-  {
-    raw_bpm_valid = 0U;
-    pulse_info.beat_valid = 0U;
-  }
-
-  if (pulse_info.beat_valid != 0U)
-  {
-    app_ppg_pulse_process_metrics(app, &pulse_info, spo2_state.total_samples);
-  }
-  else if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM)
-  {
-    app->rr_valid = 0U;
-  }
-
-  if (app_bpm_filter_update(app, raw_bpm_valid, raw_bpm_value) != 0U)
-  {
     bpm_update_decimator = 0U;
+    raw_bpm_valid = max30102_calculate_bpm_with_pulse(&spo2_state, &raw_bpm_value, &pulse_info);
+
+    if (app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+    {
+      acorr_bpm_valid = max30102_autocorr_bpm(&spo2_state, &acorr_bpm);
+    }
+
+    if ((raw_bpm_valid != 0U) && (acorr_bpm_valid != 0U))
+    {
+      uint8_t diff = (raw_bpm_value > acorr_bpm) ? (raw_bpm_value - acorr_bpm)
+                                                 : (acorr_bpm - raw_bpm_value);
+      if (diff <= APP_BPM_ACORR_BLEND_MAX_DIFF)
+      {
+        raw_bpm_value = (uint8_t)(((uint16_t)raw_bpm_value + (uint16_t)acorr_bpm * 3U + 2U) / 4U);
+      }
+    }
+    else if (acorr_bpm_valid != 0U)
+    {
+      raw_bpm_valid = 1U;
+      raw_bpm_value = acorr_bpm;
+    }
+
+    if ((raw_bpm_valid != 0U) && (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM))
+    {
+      raw_bpm_valid = 0U;
+      pulse_info.beat_valid = 0U;
+    }
+
+    (void)pulse_info.beat_valid;
+    if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+    {
+      app->rr_valid = 0U;
+    }
+
+    if (app_bpm_filter_update(app, raw_bpm_valid, raw_bpm_value) != 0U)
+    {
+      bpm_update_decimator = 0U;
+    }
   }
 }
 
@@ -483,6 +538,10 @@ static void app_reset_measurement_outputs(AppState_t *app)
   app->ir_signal_delta = 0U;
   app->ir_signal_span = 0U;
   app->red_signal_span = 0U;
+  app->ir_pi_ac_ema = 0U;
+  app->ir_pi_ac_ema_valid = 0U;
+  app->last_beat_sample = 0U;
+  app->contact_settle_samples = 0U;
   app_oxy_status_reset(app);
   app_reset_advanced_metrics(app);
 }

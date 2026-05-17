@@ -39,8 +39,9 @@
 
 #define APP_HRV_IBI_HISTORY_SIZE       32U
 #define APP_HRV_MIN_VALID_IBI_COUNT    3U
-#define APP_HRV_JUMP_FILTER_MIN_COUNT  4U
-#define APP_HRV_IBI_JUMP_PERCENT       50U
+#define APP_HRV_JUMP_FILTER_MIN_COUNT  6U
+#define APP_HRV_MEDIAN_WINDOW          5U
+#define APP_HRV_IBI_JUMP_PERCENT       65U
 /* rhythm_irregular 阈值——短窗口提示，非诊断。 */
 #define APP_HRV_IRREGULAR_RMSSD_MS     120U
 #define APP_HRV_IRREGULAR_SD1_SD2_X100 70U
@@ -97,6 +98,7 @@ void app_hrv_reset(AppState_t *app)
 
   app->ibi_valid = 0U;
   app->latest_ibi_ms = 0U;
+  app->accepted_ibi_count = 0U;
   app->hrv_valid = 0U;
   app->hrv_mean_ibi_ms = 0U;
   app->hrv_sdnn_ms = 0U;
@@ -166,6 +168,10 @@ uint8_t app_hrv_add_ibi(AppState_t *app, uint16_t ibi_ms)
   {
     app->ibi_valid = 1U;
     app->latest_ibi_ms = ibi_ms;
+    if (app->accepted_ibi_count < 0xFFFFU)
+    {
+      app->accepted_ibi_count++;
+    }
   }
 
   app_hrv_update_outputs(app);
@@ -174,9 +180,13 @@ uint8_t app_hrv_add_ibi(AppState_t *app, uint16_t ibi_ms)
 
 static uint8_t app_hrv_accept_ibi(uint16_t ibi_ms)
 {
-  uint16_t i;
-  uint32_t sum;
-  uint16_t mean_ibi;
+  uint8_t  i;
+  uint8_t  j;
+  uint8_t  n;
+  uint8_t  idx;
+  uint16_t sorted[APP_HRV_MEDIAN_WINDOW];
+  uint16_t median_ibi;
+  uint16_t tmp;
 
   /* 绝对范围门禁。 */
   if ((ibi_ms < APP_HRV_IBI_MIN_MS) || (ibi_ms > APP_HRV_IBI_MAX_MS))
@@ -184,26 +194,46 @@ static uint8_t app_hrv_accept_ibi(uint16_t ibi_ms)
     return 0U;
   }
 
-  /* 相对跳变过滤：仅在 buffer 中已有 >=4 个 IBI 时启用。 */
+  /* 前几个 IBI 无条件接受，用于建立初始 buffer。 */
   if (hrv_state.count < APP_HRV_JUMP_FILTER_MIN_COUNT)
   {
     return 1U;
   }
 
-  sum = 0U;
-  for (i = 0U; i < hrv_state.count; i++)
+  /*
+   * 取最近 N 个已接受的 IBI，排序后求中位数。
+   * 中位数比均值更鲁棒，不受单个假 IBI（如接触瞬态产生的异常值）污染。
+   */
+  n = (hrv_state.count < APP_HRV_MEDIAN_WINDOW) ? hrv_state.count : APP_HRV_MEDIAN_WINDOW;
+  for (i = 0U; i < n; i++)
   {
-    sum += hrv_state.ibi_ms[i];
+    idx = (uint8_t)((hrv_state.write_index + APP_HRV_IBI_HISTORY_SIZE - 1U - i) % APP_HRV_IBI_HISTORY_SIZE);
+    sorted[i] = hrv_state.ibi_ms[idx];
   }
 
-  mean_ibi = (uint16_t)((sum + (hrv_state.count / 2U)) / hrv_state.count);
-  if (mean_ibi == 0U)
+  /* 插入排序（n ≤ 5，开销极小） */
+  for (i = 1U; i < n; i++)
+  {
+    tmp = sorted[i];
+    j = i;
+    while ((j > 0U) && (sorted[j - 1U] > tmp))
+    {
+      sorted[j] = sorted[j - 1U];
+      j--;
+    }
+    sorted[j] = tmp;
+  }
+
+  /* 中位数 */
+  median_ibi = sorted[n / 2U];
+  if (median_ibi == 0U)
   {
     return 1U;
   }
 
-  if (app_hrv_abs_diff_u32(ibi_ms, mean_ibi) >
-      (((uint32_t)mean_ibi * APP_HRV_IBI_JUMP_PERCENT) / 100U))
+  /* 距中位数偏差超过百分比阈值则拒绝 */
+  if (app_hrv_abs_diff_u32(ibi_ms, median_ibi) >
+      (((uint32_t)median_ibi * APP_HRV_IBI_JUMP_PERCENT) / 100U))
   {
     return 0U;
   }

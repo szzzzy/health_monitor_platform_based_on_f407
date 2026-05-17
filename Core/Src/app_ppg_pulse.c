@@ -1,24 +1,23 @@
 /**
   ******************************************************************************
   * @file    app_ppg_pulse.c
-  * @brief   PPG 脉搏波峰检测与 IBI 提取
+  * @brief   PPG 脉搏波峰检测与 IBI 提取（状态机型）
   *
-  * 在时间域对经过带通滤波的 PPG 信号进行逐点峰值检测，
-  * 提取逐拍间隔 (IBI)，推送至 HRV 和 RR 模块。
+  * 在带通滤波后的 PPG 信号上做状态机驱动的逐点峰/谷检测，
+  * 提取逐拍间隔 (IBI) 与 peak-to-trough 幅度，推送至 HRV 和 RR 模块。
   *
-  * 检测算法：
-  *   1. 维护 3 点滑动窗口 (previous2, previous1, current)
-  *   2. 基于信号 AC RMS 计算自适应阈值
-  *   3. 波峰/波谷检测 — 中间点需同时满足方向条件与幅值阈值
-  *   4. 突出度检验 — 峰/谷相对于两侧邻域必须高出/低于指定阈值
-  *   5. 极性交替 — 相邻有效峰必须交替（正向峰→负向谷→正向峰...）
-  *   6. 间隔约束 — IBI 必须在 [250ms, 2000ms] 生理范围内
+  * 检测算法（状态机）：
+  *   1. IDLE — 跟踪初始信号摆动，积累足够幅值后进入 RISING
+  *   2. RISING — 更新 local_max；信号从 local_max 回落 >= hysteresis → 确认峰
+  *   3. FALLING — 更新 local_min；信号从 local_min 回升 >= hysteresis → 确认谷
+  *   4. 每次确认峰时用 peak-to-trough 幅度更新 beat_amp_ema
+  *   5. 同极性峰间隔 (IBI) 必须在 [300ms, 2000ms] 范围内
+  *   6. hysteresis = max(2, beat_amp_ema / 4)，初始用噪声门限
   *
-  * 有效脉搏触发：
-  *   - 标记 HRV 模块的峰值可见性窗口
-  *   - 记录 IBI 到 HRV 环形缓冲区
-  *   - 推送脉搏幅值到 RR 模块（仅在 SQ ≥ 阈值时）
-  *   - 触发 OLED 波形上的脉搏标记
+  * 相比旧版 3 点相邻 prominence：
+  *   - 不受 PPG 峰顶圆滑导致的相邻点差过小问题影响
+  *   - beat_amplitude 是真正的 peak-to-trough，适合 RR/PI 模块
+  *   - 自适应 hysteresis 随信号强度自动调节
   ******************************************************************************
   */
 
@@ -30,25 +29,41 @@
 #include "app_hrv.h"
 #include "app_rr.h"
 
-/* 峰值检测阈值参数 */
-#define APP_STREAM_PULSE_MIN_RMS       4U    /* 绝对最小 AC RMS 阈值 */
-#define APP_STREAM_PULSE_THRESHOLD_DIV 4U    /* 阈值 = AC_RMS / 4 */
-#define APP_STREAM_PULSE_PROM_DIV      3U    /* 突出度 = 阈值 / 3 */
+/* 动态阈值参数 */
+#define APP_BEAT_NOISE_FLOOR_DIV    5U    /* 噪声门限 = AC_RMS / 5 */
+#define APP_BEAT_NOISE_FLOOR_MIN    2U    /* 绝对最小噪声门限 */
+#define APP_BEAT_NOISE_FLOOR_CAP    20U   /* 噪声门限上限，避免强信号时门槛过高 */
+#define APP_BEAT_HYSTERESIS_DIV     5U    /* 迟滞 = beat_amp_ema / 5 */
+#define APP_BEAT_HYSTERESIS_MIN     2U    /* 绝对最小迟滞 */
+#define APP_BEAT_EMA_NEW_WEIGHT     1U    /* EMA 新值权重 (1/8) */
+#define APP_BEAT_EMA_OLD_WEIGHT     7U    /* EMA 旧值权重 (7/8) */
+#define APP_BEAT_EMA_SHIFT          3U    /* 除数 = 2^3 = 8，用于手动 EMA */
 
-/* 流式峰值检测器内部状态 */
+/* 状态机状态 */
+#define BEAT_STATE_IDLE     0U
+#define BEAT_STATE_RISING   1U
+#define BEAT_STATE_FALLING  2U
+
+/* 流式 beat 检测器内部状态 */
 static struct
 {
-  int32_t previous2;          /* 倒数第 2 个样本 */
-  int32_t previous1;          /* 倒数第 1 个样本（被检测的候选点） */
-  uint8_t sample_count;       /* 已接收样本数（用于初始化窗口） */
-  uint8_t last_peak_valid;    /* 上一次检测到有效峰/谷 */
-  int8_t last_polarity;       /* 上一次峰/谷极性：+1=峰, -1=谷 */
-  uint32_t last_peak_sample;  /* 上一次峰/谷的样本序号 */
-} stream_pulse_state;
+  int32_t  local_max;           /* 当前上升段局部最大值 */
+  uint32_t local_max_sample;    /* local_max 的全局样本编号 */
+  int32_t  local_min;           /* 当前下降段局部最小值 */
+  uint32_t local_min_sample;    /* local_min 的全局样本编号 */
+  int32_t  prev_trough;         /* 上一个已确认谷值（用于 peak-to-trough 幅度） */
+  uint32_t prev_peak_sample;    /* 上一个已确认峰的全局样本编号 */
+  uint32_t beat_amp_ema;        /* peak-to-trough 幅度的 EMA */
+  uint8_t  beat_amp_ema_valid;  /* EMA 已初始化 */
+  uint8_t  state;               /* 当前状态机状态 */
+  uint8_t  sample_count;        /* 已接收样本计数（初始化用） */
+  int32_t  sample_buf[2];       /* 初始化窗口样本缓冲 */
+  uint32_t hysteresis;          /* 当前迟滞值（从 EMA 或噪声门限推导） */
+} beat;
 
 void app_ppg_pulse_reset(void)
 {
-  (void)memset(&stream_pulse_state, 0, sizeof(stream_pulse_state));
+  (void)memset(&beat, 0, sizeof(beat));
 }
 
 /*
@@ -70,17 +85,10 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
   const uint32_t max_interval_samples =
       (((uint32_t)APP_HRV_IBI_MAX_MS * MAX30102_ALGO_SAMPLE_RATE_HZ) + 999U) / 1000U;
 
-  uint32_t current_sample_number;
-  uint32_t candidate_sample_number;
+  uint32_t noise_floor;
   uint32_t interval_samples;
-  uint32_t threshold;
-  uint32_t prominence_threshold;
-  uint32_t positive_prominence = 0U;
-  uint32_t negative_prominence = 0U;
-  uint32_t magnitude = 0U;
-  int32_t neighbor_reference;
-  int8_t polarity = 0;
-  uint8_t pulse_detected = 0U;
+  uint32_t beat_amplitude;
+  uint8_t  pulse_detected = 0U;
 
   if (pulse_info != NULL)
   {
@@ -93,140 +101,154 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
     return 0U;
   }
 
-  /* 初始化 3 点窗口 */
-  if (stream_pulse_state.sample_count < 2U)
+  /* 初始化 2 点缓冲（用于确认初始运动方向） */
+  if (beat.sample_count < 2U)
   {
-    if (stream_pulse_state.sample_count == 0U)
+    beat.sample_buf[beat.sample_count] = filtered_sample;
+    beat.sample_count++;
+    if (beat.sample_count >= 2U)
     {
-      stream_pulse_state.previous1 = filtered_sample;
-      stream_pulse_state.sample_count = 1U;
-    }
-    else
-    {
-      stream_pulse_state.previous2 = stream_pulse_state.previous1;
-      stream_pulse_state.previous1 = filtered_sample;
-      stream_pulse_state.sample_count = 2U;
+      /* 用前两个样本初始化 local_min/local_max */
+      beat.local_min = (beat.sample_buf[0] < beat.sample_buf[1]) ?
+                        beat.sample_buf[0] : beat.sample_buf[1];
+      beat.local_max = (beat.sample_buf[0] > beat.sample_buf[1]) ?
+                        beat.sample_buf[0] : beat.sample_buf[1];
+      beat.local_min_sample = total_samples - 1U;
+      beat.local_max_sample = total_samples - 1U;
+      beat.state = BEAT_STATE_IDLE;
+      beat.prev_trough = beat.local_min;
     }
     return 0U;
   }
 
-  /* 自适应阈值：基于 IR 通道 AC RMS */
-  threshold = app->signal_ir_ac_rms / APP_STREAM_PULSE_THRESHOLD_DIV;
-  if (threshold < APP_STREAM_PULSE_MIN_RMS)
+  /* 噪声门限：基于 IR 通道带通 AC RMS */
+  noise_floor = app->signal_ir_ac_rms / APP_BEAT_NOISE_FLOOR_DIV;
+  if (noise_floor < APP_BEAT_NOISE_FLOOR_MIN)
   {
-    threshold = APP_STREAM_PULSE_MIN_RMS;
+    noise_floor = APP_BEAT_NOISE_FLOOR_MIN;
+  }
+  if (noise_floor > APP_BEAT_NOISE_FLOOR_CAP)
+  {
+    noise_floor = APP_BEAT_NOISE_FLOOR_CAP;
   }
 
-  /* 突出度阈值 = 幅值阈值 / 3，最小 2 LSB */
-  prominence_threshold = threshold / APP_STREAM_PULSE_PROM_DIV;
-  if (prominence_threshold < 2U)
+  /* 迟滞：从 EMA 推导，未初始化时用噪声门限 */
+  if (beat.beat_amp_ema_valid != 0U)
   {
-    prominence_threshold = 2U;
-  }
-
-  /*
-   * 正向峰检测：
-   *   prev1 > prev2 且 prev1 >= current 且 prev1 > threshold
-   * 突出度 = prev1 - max(prev2, current)
-   */
-  if ((stream_pulse_state.previous1 > stream_pulse_state.previous2) &&
-      (stream_pulse_state.previous1 >= filtered_sample) &&
-      (stream_pulse_state.previous1 > (int32_t)threshold))
-  {
-    neighbor_reference = (stream_pulse_state.previous2 > filtered_sample) ?
-                         stream_pulse_state.previous2 : filtered_sample;
-    if (stream_pulse_state.previous1 > neighbor_reference)
+    beat.hysteresis = beat.beat_amp_ema / APP_BEAT_HYSTERESIS_DIV;
+    if (beat.hysteresis < APP_BEAT_HYSTERESIS_MIN)
     {
-      positive_prominence = (uint32_t)(stream_pulse_state.previous1 - neighbor_reference);
+      beat.hysteresis = APP_BEAT_HYSTERESIS_MIN;
     }
+  }
+  else
+  {
+    beat.hysteresis = noise_floor;
   }
 
   /*
-   * 负向谷检测：
-   *   prev1 < prev2 且 prev1 <= current 且 prev1 < -threshold
-   * 突出度 = min(prev2, current) - prev1
+   * 状态机处理
    */
-  if ((stream_pulse_state.previous1 < stream_pulse_state.previous2) &&
-      (stream_pulse_state.previous1 <= filtered_sample) &&
-      (stream_pulse_state.previous1 < -((int32_t)threshold)))
+  if (beat.state == BEAT_STATE_IDLE)
   {
-    neighbor_reference = (stream_pulse_state.previous2 < filtered_sample) ?
-                         stream_pulse_state.previous2 : filtered_sample;
-    if (neighbor_reference > stream_pulse_state.previous1)
+    /* IDLE：跟踪信号摆动，积累足够幅值后切换到 RISING */
+    if (filtered_sample < beat.local_min)
     {
-      negative_prominence = (uint32_t)(neighbor_reference - stream_pulse_state.previous1);
+      beat.local_min = filtered_sample;
+      beat.local_min_sample = total_samples;
+    }
+    if (filtered_sample > beat.local_max)
+    {
+      beat.local_max = filtered_sample;
+      beat.local_max_sample = total_samples;
+    }
+
+    if ((beat.local_max - beat.local_min) >= (int32_t)noise_floor)
+    {
+      /* 信号摆动足够大，进入跟踪 */
+      beat.state = BEAT_STATE_RISING;
+      beat.prev_trough = beat.local_min;
+      beat.local_max = filtered_sample;
+      beat.local_max_sample = total_samples;
+    }
+  }
+  else if (beat.state == BEAT_STATE_RISING)
+  {
+    /* RISING：跟踪上升沿，检测峰 */
+    if (filtered_sample > beat.local_max)
+    {
+      beat.local_max = filtered_sample;
+      beat.local_max_sample = total_samples;
+    }
+    else if ((beat.local_max - filtered_sample) >= (int32_t)beat.hysteresis)
+    {
+      /* 峰确认：信号从 local_max 回落 >= hysteresis */
+      beat_amplitude = (uint32_t)(beat.local_max - beat.prev_trough);
+
+      /* 仅当幅度超过噪声门限才接受 */
+      if (beat_amplitude >= noise_floor)
+      {
+        /* 更新 peak-to-trough 幅度的 EMA */
+        if (beat.beat_amp_ema_valid != 0U)
+        {
+          beat.beat_amp_ema = ((beat.beat_amp_ema * APP_BEAT_EMA_OLD_WEIGHT) +
+                               (beat_amplitude * APP_BEAT_EMA_NEW_WEIGHT) +
+                               (1U << (APP_BEAT_EMA_SHIFT - 1U))) >> APP_BEAT_EMA_SHIFT;
+        }
+        else
+        {
+          beat.beat_amp_ema = beat_amplitude;
+          beat.beat_amp_ema_valid = 1U;
+        }
+
+        /* 计算 IBI（从上一个峰到当前峰） */
+        if (beat.prev_peak_sample != 0U)
+        {
+          interval_samples = beat.local_max_sample - beat.prev_peak_sample;
+          if ((interval_samples >= min_interval_samples) &&
+              (interval_samples <= max_interval_samples))
+          {
+            /* 有效脉搏！ */
+            pulse_info->beat_valid = 1U;
+            pulse_info->interval_samples = (uint16_t)interval_samples;
+            pulse_info->latest_ibi_ms = (uint16_t)((interval_samples * 1000U +
+                                                    (MAX30102_ALGO_SAMPLE_RATE_HZ / 2U)) /
+                                                   MAX30102_ALGO_SAMPLE_RATE_HZ);
+            pulse_info->latest_peak_sample = beat.local_max_sample;
+            pulse_info->beat_amplitude = beat_amplitude;
+            pulse_detected = 1U;
+          }
+        }
+
+        beat.prev_peak_sample = beat.local_max_sample;
+      }
+
+      /* 切换到下降跟踪 */
+      beat.local_min = filtered_sample;
+      beat.local_min_sample = total_samples;
+      beat.state = BEAT_STATE_FALLING;
+    }
+  }
+  else /* BEAT_STATE_FALLING */
+  {
+    /* FALLING：跟踪下降沿，检测谷 */
+    if (filtered_sample < beat.local_min)
+    {
+      beat.local_min = filtered_sample;
+      beat.local_min_sample = total_samples;
+    }
+    else if ((filtered_sample - beat.local_min) >= (int32_t)beat.hysteresis)
+    {
+      /* 谷确认：信号从 local_min 回升 >= hysteresis */
+      beat.prev_trough = beat.local_min;
+
+      /* 切换到上升跟踪 */
+      beat.local_max = filtered_sample;
+      beat.local_max_sample = total_samples;
+      beat.state = BEAT_STATE_RISING;
     }
   }
 
-  /* 选择突出度更大的极性方向作为本次检测结果 */
-  if ((positive_prominence >= prominence_threshold) ||
-      (negative_prominence >= prominence_threshold))
-  {
-    if (positive_prominence >= negative_prominence)
-    {
-      polarity = 1;
-      magnitude = (uint32_t)stream_pulse_state.previous1;
-    }
-    else
-    {
-      polarity = -1;
-      magnitude = (uint32_t)(-stream_pulse_state.previous1);
-    }
-  }
-
-  /* 极性交替检验与 IBI 计算 */
-  if ((polarity != 0) && (total_samples >= 2U))
-  {
-    current_sample_number = total_samples - 1U;
-    candidate_sample_number = current_sample_number - 1U;
-
-    if (stream_pulse_state.last_peak_valid == 0U)
-    {
-      /* 首个有效峰/谷：记录但不输出 IBI */
-      stream_pulse_state.last_peak_valid = 1U;
-      stream_pulse_state.last_polarity = polarity;
-      stream_pulse_state.last_peak_sample = candidate_sample_number;
-    }
-    else if (polarity != stream_pulse_state.last_polarity)
-    {
-      /* 极性交替但间隔过长 → 可能漏峰，更新参考但不输出 */
-      interval_samples = candidate_sample_number - stream_pulse_state.last_peak_sample;
-      if (interval_samples > max_interval_samples)
-      {
-        stream_pulse_state.last_polarity = polarity;
-        stream_pulse_state.last_peak_sample = candidate_sample_number;
-      }
-    }
-    else
-    {
-      /* 同极性 → 可能是一个完整周期 */
-      interval_samples = candidate_sample_number - stream_pulse_state.last_peak_sample;
-      if (interval_samples > max_interval_samples)
-      {
-        /* 间隔过长 → 仅更新参考位置 */
-        stream_pulse_state.last_peak_sample = candidate_sample_number;
-      }
-      else if (interval_samples >= min_interval_samples)
-      {
-        /* 有效脉搏！更新参考并输出 IBI */
-        stream_pulse_state.last_peak_sample = candidate_sample_number;
-        pulse_info->beat_valid = 1U;
-        pulse_info->interval_samples = (uint16_t)interval_samples;
-
-        /* 样本数 → 毫秒 (四舍五入) */
-        pulse_info->latest_ibi_ms = (uint16_t)((interval_samples * 1000U +
-                                                (MAX30102_ALGO_SAMPLE_RATE_HZ / 2U)) /
-                                               MAX30102_ALGO_SAMPLE_RATE_HZ);
-        pulse_info->latest_peak_sample = candidate_sample_number;
-        pulse_info->beat_amplitude = magnitude;
-        pulse_detected = 1U;
-      }
-    }
-  }
-
-  /* 滑动窗口前进 */
-  stream_pulse_state.previous2 = stream_pulse_state.previous1;
-  stream_pulse_state.previous1 = filtered_sample;
   return pulse_detected;
 }
 
@@ -236,8 +258,9 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
  * 流程：
  *   1. HRV 峰值可见性窗口检查（防同一脉搏被重复标记）
  *   2. 记录 IBI 到 HRV 环形缓冲区
- *   3. 触发 OLED 脉搏标记
- *   4. 推送振幅到 RR 模块（仅在信号质量达标时）
+ *   3. 更新 beat-based PI EMA
+ *   4. 触发 OLED 脉搏标记
+ *   5. 推送振幅到 RR 模块（仅在信号质量达标时）
  */
 void app_ppg_pulse_process_metrics(AppState_t *app,
                                    const MAX30102_PulseInfo_t *pulse_info,
@@ -260,9 +283,27 @@ void app_ppg_pulse_process_metrics(AppState_t *app,
     return;
   }
 
+  /* 更新 beat-based PI EMA（每个 accepted beat 更新一次） */
+  if (pulse_info->beat_amplitude != 0U)
+  {
+    if (app->ir_pi_ac_ema_valid != 0U)
+    {
+      app->ir_pi_ac_ema = ((app->ir_pi_ac_ema * APP_BEAT_EMA_OLD_WEIGHT) +
+                           ((uint32_t)pulse_info->beat_amplitude * APP_BEAT_EMA_NEW_WEIGHT) +
+                           (1U << (APP_BEAT_EMA_SHIFT - 1U))) >> APP_BEAT_EMA_SHIFT;
+    }
+    else
+    {
+      app->ir_pi_ac_ema = pulse_info->beat_amplitude;
+      app->ir_pi_ac_ema_valid = 1U;
+    }
+  }
+
+  app->last_beat_sample = total_samples;
+  (void)total_samples;
+
   /* 触发 OLED 波形脉搏标记点 */
   app_display_add_ir_pulse_marker();
-  (void)total_samples;
 
   /* RR 呼吸率：仅在信号质量达标时推送振幅值 */
   if ((app->signal_quality >= APP_RR_SIGNAL_QUALITY_MIN) && (pulse_info->beat_amplitude != 0U))

@@ -1132,6 +1132,8 @@ uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_
 {
   uint16_t sample_count;
   uint64_t denominator;
+  uint32_t red_pi_rms;
+  uint32_t ir_pi_rms;
 
   if ((spo2_state == NULL) || (metrics == NULL))
   {
@@ -1149,13 +1151,34 @@ uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_
   metrics->red_ac_rms = max30102_calculate_window_rms(spo2_state->red_filtered_square_sum, sample_count);
   metrics->ir_ac_rms = max30102_calculate_window_rms(spo2_state->ir_filtered_square_sum, sample_count);
 
+  /*
+   * PI uses max(filtered RMS, raw centered RMS) as the AC source.
+   * Filtered RMS decays after the DC tracker settles on a steady finger,
+   * but the raw centered RMS retains the true pulse amplitude.
+   * Filtered RMS is kept unchanged for pulse detection and SQ scoring.
+   */
+  red_pi_rms = max30102_calculate_centered_rms(spo2_state->red_sum,
+                                               spo2_state->red_square_sum,
+                                               sample_count);
+  ir_pi_rms = max30102_calculate_centered_rms(spo2_state->ir_sum,
+                                              spo2_state->ir_square_sum,
+                                              sample_count);
+  if (red_pi_rms < metrics->red_ac_rms)
+  {
+    red_pi_rms = metrics->red_ac_rms;
+  }
+  if (ir_pi_rms < metrics->ir_ac_rms)
+  {
+    ir_pi_rms = metrics->ir_ac_rms;
+  }
+
   metrics->red_pi_x1000 = 0U;
   metrics->ir_pi_x1000 = 0U;
 
   denominator = metrics->red_dc;
   if (denominator != 0ULL)
   {
-    uint64_t red_pi = (((uint64_t)metrics->red_ac_rms * MAX30102_SPO2_RATIO_SCALE) +
+    uint64_t red_pi = (((uint64_t)red_pi_rms * MAX30102_SPO2_RATIO_SCALE) +
                        (denominator / 2ULL)) / denominator;
     if (red_pi > 0xFFFFULL)
     {
@@ -1168,7 +1191,7 @@ uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_
   denominator = metrics->ir_dc;
   if (denominator != 0ULL)
   {
-    uint64_t ir_pi = (((uint64_t)metrics->ir_ac_rms * MAX30102_SPO2_RATIO_SCALE) +
+    uint64_t ir_pi = (((uint64_t)ir_pi_rms * MAX30102_SPO2_RATIO_SCALE) +
                       (denominator / 2ULL)) / denominator;
     if (ir_pi > 0xFFFFULL)
     {

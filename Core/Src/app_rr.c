@@ -26,9 +26,9 @@
 #include "max30102.h"
 
 #define APP_RR_RIAV_HISTORY_SIZE  32U
-#define APP_RR_MIN_BEAT_COUNT     8U
-/* 6 秒最小时间窗口（100 Hz 采样率）。 */
-#define APP_RR_MIN_WINDOW_SAMPLES 600U
+#define APP_RR_MIN_BEAT_COUNT     6U
+/* 4 秒最小时间窗口（100 Hz 采样率）。 */
+#define APP_RR_MIN_WINDOW_SAMPLES 400U
 #define APP_RR_MIN_RESULT         8U
 #define APP_RR_MAX_RESULT         30U
 /* 调制深度须 >= amplitude_mean / 25 (4%) 且 >= 4 个原始单位。 */

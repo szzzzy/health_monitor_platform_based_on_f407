@@ -86,9 +86,14 @@ typedef struct
   /* 原始 motion score 0–100，基于 AC RMS 尖峰 + RED/IR 平衡 + SQ 骤降三条信号合成。 */
   uint8_t motion_score;
   /* PI：存储 (AC/DC) × 1000，即标准灌注指数(%) × 10。例如 PI=12.3% → 值 123。
-   * OXY 页显示为 PI:12.3（除以 10 取整+余数）。uint16 承载 >25.5% 的 PI 值。 */
+   * OXY 页显示为 PI:12.3（除以 10 取整+余数）。uint16 承载 >25.5% 的 PI 值。
+   * signal_ir_pi_x1000 由 beat-based EMA 计算（ir_pi_ac_ema / ir_dc），
+   * 不再从窗口 RMS 推导，避免稳定佩戴后 PI 衰减到 0.1。 */
   uint16_t signal_ir_pi_x1000;
   uint16_t signal_red_pi_x1000;
+  uint32_t ir_pi_ac_ema;       /* accepted beat peak-to-trough amplitude 的 EMA */
+  uint8_t  ir_pi_ac_ema_valid; /* 置 1 后至少有一个已接受的 beat */
+  uint32_t last_beat_sample;   /* 上一次接受 beat 的全局样本编号，用于 stale 判定 */
   uint8_t sensor_last_read_status;
   uint8_t sensor_error_streak;
   uint8_t finger_present;
@@ -109,6 +114,7 @@ typedef struct
    */
   uint8_t ibi_valid;
   uint16_t latest_ibi_ms;
+  uint16_t accepted_ibi_count;  /* 本次测量接受的 IBI 总数（调试用） */
   uint8_t hrv_valid;
   uint16_t hrv_mean_ibi_ms;
   uint16_t hrv_sdnn_ms;
@@ -149,6 +155,7 @@ typedef struct
   uint8_t refresh_div;
   uint8_t finger_on_confirm_count;
   uint8_t finger_off_confirm_count;
+  uint16_t contact_settle_samples; /* 手指刚放上后的接触稳定倒计数（100Hz 节拍） */
   uint8_t report_due;
   uint8_t display_refresh_requested;
   uint8_t display_brightness_index;

@@ -25,22 +25,22 @@
 
 #define APP_MOTION_RMS_BASE_SHIFT      6U
 #define APP_MOTION_MIN_BASELINE_RMS    8U
-/* RMS 尖峰：当前值 >= baseline × 3.0 且增量 >= 80。 */
-#define APP_MOTION_RMS_SPIKE_X100      300U
-#define APP_MOTION_RMS_SPIKE_MIN_DELTA 80U
+/* RMS 尖峰：当前值 >= baseline × 4.0 且增量 >= 120。 */
+#define APP_MOTION_RMS_SPIKE_X100      400U
+#define APP_MOTION_RMS_SPIKE_MIN_DELTA 120U
 #define APP_MOTION_RMS_SPIKE_SCORE     25U
 /* RED/IR 平衡异常：比值落在 [0.35, 2.80] 以外。 */
 #define APP_MOTION_BALANCE_LOW_X1000   350U
 #define APP_MOTION_BALANCE_HIGH_X1000  2800U
 #define APP_MOTION_BALANCE_SCORE       25U
-/* SQ 骤降：从 >=45 的前一值单步下降 >=25。 */
+/* SQ 骤降：从 >=45 的前一值单步下降 >=30。 */
 #define APP_MOTION_SQ_DROP_MIN_PREV    45U
-#define APP_MOTION_SQ_DROP_DELTA       25U
-#define APP_MOTION_SQ_DROP_SCORE       35U
-/* 迟滞阈值与确认计数。 */
-#define APP_MOTION_SCORE_ON            60U
+#define APP_MOTION_SQ_DROP_DELTA       30U
+#define APP_MOTION_SQ_DROP_SCORE       25U
+/* 迟滞阈值与确认计数。进入更严格：score≥75 连续 20 拍。 */
+#define APP_MOTION_SCORE_ON            75U
 #define APP_MOTION_SCORE_OFF           30U
-#define APP_MOTION_ON_CONFIRM_SAMPLES  5U
+#define APP_MOTION_ON_CONFIRM_SAMPLES  20U
 #define APP_MOTION_OFF_CONFIRM_SAMPLES 30U
 
 static struct

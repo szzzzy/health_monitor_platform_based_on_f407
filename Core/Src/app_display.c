@@ -61,6 +61,8 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
                                  uint8_t height,
                                  uint8_t dotted,
                                  uint8_t markers);
+static uint8_t app_display_text_width_px(const char *s);
+static void app_display_draw_right(uint8_t y, const char *s);
 static void app_display_pulse_page(const AppState_t *app);
 static void app_display_oxy_page(const AppState_t *app);
 static void app_display_vitals_page(const AppState_t *app);
@@ -188,182 +190,163 @@ void app_display_measurement_page(const AppState_t *app)
 }
 
 /*
- * PULSE 页（原 BPM 页升级）：
- * 显示 HR + IBI + 心律标签 + IR 波形 + 脉搏检测标记。
- * HR/IBI 的 valid 字段控制末尾 "?" 后缀：valid=0 但值非零时显示旧值+"?"，
- * 表示信号短暂中断但保留上一帧结果供参考。
- *
- * RTC 时间/日期集中放在 VITALS/DEBUG 页，PULSE 页保留波形和节律信息。
+ * PULSE 页：2 行文本 + 全高 IR 波形 (y=16..63, 48px)。
+ * y=0: 左侧 HR+IBI，右侧 SQ（如 "SQ42" 或 "M"）。
+ * y=8: 左侧 REG/状态标签，右侧页面标题。
  */
 static void app_display_pulse_page(const AppState_t *app)
 {
-  char title_line[24];
-  char hr_line[24];
-  char ibi_line[24];
-  char state_line[24];
+  char line0[32];
+  char line0r[16];
+  char line1[32];
+  char line1r[8];
 
-  if (app == NULL)
+  if (app == NULL) { return; }
+
+  /* --- y=0 左侧：HR + IBI；两者独立显示，避免 HR 短暂无效时隐藏 IBI。 --- */
+  if (app->finger_present != 0U)
   {
-    return;
+    uint8_t pos;
+
+    if ((app->bpm_valid != 0U) || (app->bpm_value != 0U))
+    {
+      pos = (uint8_t)snprintf(line0, sizeof(line0), "HR:%u%s",
+                              (unsigned int)app->bpm_value,
+                              (app->bpm_valid != 0U) ? "" : "?");
+    }
+    else
+    {
+      pos = (uint8_t)snprintf(line0, sizeof(line0), "HR:--");
+    }
+
+    if ((app->ibi_valid != 0U) || (app->latest_ibi_ms != 0U))
+    {
+      (void)snprintf(line0 + pos, sizeof(line0) - (size_t)pos,
+                     " I:%u%s", (unsigned int)app->latest_ibi_ms,
+                     (app->ibi_valid != 0U) ? "" : "?");
+    }
+    else
+    {
+      (void)snprintf(line0 + pos, sizeof(line0) - (size_t)pos, " I:--");
+    }
+  }
+  else
+  {
+    (void)snprintf(line0, sizeof(line0), "HR:-- I:--");
   }
 
+  /* --- y=0 右侧：SQ --- */
   if (app->motion_artifact != 0U)
   {
-    (void)snprintf(title_line,
-                   sizeof(title_line),
-                   "PULSE MOT SQ:%u",
-                   (unsigned int)app->signal_quality);
+    (void)snprintf(line0r, sizeof(line0r), "M");
   }
   else
   {
-    (void)snprintf(title_line,
-                   sizeof(title_line),
-                   "PULSE     SQ:%u",
-                   (unsigned int)app->signal_quality);
+    (void)snprintf(line0r, sizeof(line0r), "SQ%u", (unsigned int)app->signal_quality);
   }
 
-  /* HR 末尾的 "?" 表示 bpm_valid=0 但 bpm_value 保留旧值。 */
-  if ((app->finger_present != 0U) &&
-      ((app->bpm_valid != 0U) || (app->bpm_value != 0U)))
+  /* --- y=8 左侧：心律标签 --- */
+  if (app->motion_artifact != 0U)
   {
-    (void)snprintf(hr_line,
-                   sizeof(hr_line),
-                   "HR %u%s BPM",
-                   (unsigned int)app->bpm_value,
-                   (app->bpm_valid != 0U) ? "" : "?");
+    (void)snprintf(line1, sizeof(line1), "MOT");
   }
   else
   {
-    (void)snprintf(hr_line, sizeof(hr_line), "HR -- BPM");
+    (void)snprintf(line1, sizeof(line1), "REG:%s", app_get_regular_label(app));
   }
 
-  /* IBI 末尾 "?" 含义同上；REG 标签基于 RMSSD 判断心律是否规整。 */
-  if ((app->finger_present != 0U) &&
-      ((app->ibi_valid != 0U) || (app->latest_ibi_ms != 0U)))
-  {
-    (void)snprintf(ibi_line,
-                   sizeof(ibi_line),
-                   "IBI %u%sMS REG:%s",
-                   (unsigned int)app->latest_ibi_ms,
-                   (app->ibi_valid != 0U) ? "" : "?",
-                   app_get_regular_label(app));
-  }
-  else
-  {
-    (void)snprintf(ibi_line, sizeof(ibi_line), "IBI --MS REG:--");
-  }
-
-  (void)snprintf(state_line,
-                 sizeof(state_line),
-                 "IR %s B:%s",
-                 (app->finger_present != 0U) ? "WAVE" : "----",
-                 app_get_brightness_short_label(app->display_brightness_index));
+  /* --- y=8 右侧：页面标题（原亮度位置） --- */
+  (void)snprintf(line1r, sizeof(line1r), "PULSE");
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, title_line);
-  ssd1306_DrawString(0, 8, hr_line);
-  ssd1306_DrawString(0, 16, ibi_line);
-  ssd1306_DrawString(0, 24, state_line);
-  waveform_buffer_draw(&ir_waveform,
-                       0U,
-                       OLED_WAVEFORM_TOP_Y,
-                       SSD1306_WIDTH,
-                       OLED_WAVEFORM_HEIGHT,
-                       0U,
-                       1U);
+  ssd1306_DrawString(0, 0, line0);
+  app_display_draw_right(0, line0r);
+  ssd1306_DrawString(0, 8, line1);
+  app_display_draw_right(8, line1r);
+  waveform_buffer_draw(&ir_waveform, 0U, 16U, SSD1306_WIDTH, 48U, 0U, 1U);
   ssd1306_UpdateScreen();
 }
 
 /*
- * OXY 页（原 SpO2 页升级）：
- * 显示 SpO2 + R/BAL 比值 + 双通道波形（IR 实线 + RED 虚线）。
- * R 末尾 "?" 同 PULSE 页含义：spo2_ratio_valid=0 但旧值保留。
- *
- * RTC 时间/日期集中放在 VITALS/DEBUG 页，OXY 页保留双通道波形空间。
+ * OXY 页：2 行文本 + IR 波形 (y=16..39, 24px) + RED 波形 (y=40..63, 24px)。
+ * y=0: 左侧 SpO2+R，右侧 "O" 标题 + PI。
+ * y=8: 左侧 BAL/MOT/SQ，右侧亮度和简短状态。
  */
 static void app_display_oxy_page(const AppState_t *app)
 {
-  char title_line[24];
-  char spo2_line[24];
-  char ratio_line[24];
-  char wave_line[24];
+  char line0[32];
+  char line0r[16];
+  char line1[32];
+  char line1r[8];
 
-  if (app == NULL)
-  {
-    return;
-  }
+  if (app == NULL) { return; }
 
-  /* PI 显示：存储值 = PI% × 10（例 PI=5.3% → 值 53），除以 10 取整+余数显示 X.X 格式。 */
-  if (app->motion_artifact != 0U)
-  {
-    (void)snprintf(title_line,
-                   sizeof(title_line),
-                   "OXY MOT PI:%u.%u",
-                   (unsigned int)(app->signal_ir_pi_x1000 / 10U),
-                   (unsigned int)(app->signal_ir_pi_x1000 % 10U));
-  }
-  else
-  {
-    (void)snprintf(title_line,
-                   sizeof(title_line),
-                   "OXY      PI:%u.%u",
-                   (unsigned int)(app->signal_ir_pi_x1000 / 10U),
-                   (unsigned int)(app->signal_ir_pi_x1000 % 10U));
-  }
-
-  /* SpO2 末尾 "?" 含义同 HR：spo2_valid=0 但 spo2_value 保留旧值。 */
+  /* --- y=0 左侧：SpO2 + R --- */
   if ((app->finger_present != 0U) &&
       ((app->spo2_valid != 0U) || (app->spo2_value != 0U)))
   {
-    (void)snprintf(spo2_line,
-                   sizeof(spo2_line),
-                   "SPO2 %u%sP",
-                   (unsigned int)app->spo2_value,
-                   (app->spo2_valid != 0U) ? "" : "?");
+    uint8_t sp_len = (uint8_t)(snprintf(line0, sizeof(line0), "SpO2:%u%s",
+                                        (unsigned int)app->spo2_value,
+                                        (app->spo2_valid != 0U) ? "" : "?"));
+    if ((app->spo2_ratio_valid != 0U) || (app->spo2_ratio_x1000 != 0U))
+    {
+      (void)snprintf(line0 + sp_len, sizeof(line0) - (size_t)sp_len,
+                     " R:%u.%02u%s",
+                     (unsigned int)(app->spo2_ratio_x1000 / 1000U),
+                     (unsigned int)((app->spo2_ratio_x1000 % 1000U) / 10U),
+                     (app->spo2_ratio_valid != 0U) ? "" : "?");
+    }
   }
   else
   {
-    (void)snprintf(spo2_line, sizeof(spo2_line), "SPO2 --P");
+    (void)snprintf(line0, sizeof(line0), "SpO2:-- R:--");
   }
 
-  /* R/BAL：R 比值 ×1000 显示为 X.XX 格式；BAL 分级 LOW/OK/HIGH。 */
-  if ((app->finger_present != 0U) &&
-      ((app->spo2_ratio_valid != 0U) || (app->spo2_ratio_x1000 != 0U)))
+  /* --- y=0 右侧：PI --- */
+  if (app->motion_artifact != 0U)
   {
-    (void)snprintf(ratio_line,
-                   sizeof(ratio_line),
-                   "R:%u.%02u%s BAL:%s",
-                   (unsigned int)(app->spo2_ratio_x1000 / 1000U),
-                   (unsigned int)((app->spo2_ratio_x1000 % 1000U) / 10U),
-                   (app->spo2_ratio_valid != 0U) ? "" : "?",
-                   app_get_balance_label(app->spo2_balance_status));
+    (void)snprintf(line0r, sizeof(line0r), "M");
   }
   else
   {
-    (void)snprintf(ratio_line, sizeof(ratio_line), "R:-- BAL:--");
+    (void)snprintf(line0r, sizeof(line0r), "PI%u.%u",
+                   (unsigned int)(app->signal_ir_pi_x1000 / 10U),
+                   (unsigned int)(app->signal_ir_pi_x1000 % 10U));
   }
 
-  /* 双通道波形：上半部 IR 实线 + 下半部 RED 虚线（隔点绘制）。 */
-  (void)snprintf(wave_line, sizeof(wave_line), "IR/RD WAVE");
+  /* --- y=8 左侧：BAL + SQ --- */
+  if (app->motion_artifact != 0U)
+  {
+    (void)snprintf(line1, sizeof(line1), "MOT");
+  }
+  else
+  {
+    (void)snprintf(line1, sizeof(line1), "BAL:%s SQ:%u",
+                   app_get_balance_label(app->spo2_balance_status),
+                   (unsigned int)app->signal_quality);
+  }
+
+  /* --- y=8 右侧：页面标题（原亮度位置） --- */
+  (void)snprintf(line1r, sizeof(line1r), "OXY");
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, title_line);
-  ssd1306_DrawString(0, 8, spo2_line);
-  ssd1306_DrawString(0, 16, ratio_line);
-  ssd1306_DrawString(0, 24, wave_line);
-  waveform_buffer_draw(&ir_waveform, 0U, 32U, SSD1306_WIDTH, 16U, 0U, 0U);
-  waveform_buffer_draw(&red_waveform, 0U, 48U, SSD1306_WIDTH, 16U, 1U, 0U);
+  ssd1306_DrawString(0, 0, line0);
+  app_display_draw_right(0, line0r);
+  ssd1306_DrawString(0, 8, line1);
+  app_display_draw_right(8, line1r);
+  waveform_buffer_draw(&ir_waveform,  0U, 16U, SSD1306_WIDTH, 24U, 0U, 0U);
+  waveform_buffer_draw(&red_waveform, 0U, 40U, SSD1306_WIDTH, 24U, 1U, 0U);
   ssd1306_UpdateScreen();
 }
 
 /*
- * VITALS 汇总页：在一个页面同时展示 HR / RR / IBI / SDNN / RMSSD / PI / SQ / RTC。
- * 无波形，纯文本 8 行布局，充分利用 128×64 OLED 的垂直空间。
- * 每行末尾 "?" 遵循统一约定：valid=0 但值非零时显示旧值。
+ * VITALS 汇总页：8 行纯文本。
+ * y=0: 左侧 HR+RR，右侧 "V" 标题 + SQ。
  */
 static void app_display_vitals_page(const AppState_t *app)
 {
-  char line0[24];
+  char line0[32];
+  char line0r[16];
   char line1[24];
   char line2[24];
   char line3[24];
@@ -376,189 +359,179 @@ static void app_display_vitals_page(const AppState_t *app)
   uint16_t hrv_sdnn_display;
   uint16_t hrv_rmssd_display;
 
-  if (app == NULL)
-  {
-    return;
-  }
+  if (app == NULL) { return; }
 
-  if (app->motion_artifact != 0U)
-  {
-    (void)snprintf(line0, sizeof(line0), "VITALS M SQ:%u", (unsigned int)app->signal_quality);
-  }
-  else
-  {
-    (void)snprintf(line0, sizeof(line0), "VITALS   SQ:%u", (unsigned int)app->signal_quality);
-  }
-  /* HR 和 RR 各自判断是否有数据可显示（互不依赖）。 */
+  /* --- y=0 左侧：HR + RR --- */
   hr_visible = ((app->finger_present != 0U) &&
                 ((app->bpm_valid != 0U) || (app->bpm_value != 0U))) ? 1U : 0U;
   rr_visible = ((app->finger_present != 0U) &&
                 ((app->rr_valid != 0U) || (app->rr_bpm != 0U))) ? 1U : 0U;
 
-  if ((hr_visible != 0U) && (rr_visible != 0U))
+  if ((hr_visible != 0U) || (rr_visible != 0U))
   {
-    (void)snprintf(line1,
-                   sizeof(line1),
-                   "HR:%u%s RR:%u%s",
-                   (unsigned int)app->bpm_value,
-                   (app->bpm_valid != 0U) ? "" : "?",
-                   (unsigned int)app->rr_bpm,
-                   (app->rr_valid != 0U) ? "" : "?");
+    uint8_t pos = 0U;
+    if (hr_visible != 0U)
+    {
+      pos += (uint8_t)(snprintf(line0 + pos, sizeof(line0) - (size_t)pos,
+                                "HR:%u%s",
+                                (unsigned int)app->bpm_value,
+                                (app->bpm_valid != 0U) ? "" : "?"));
+    }
+    else { pos += (uint8_t)(snprintf(line0 + pos, sizeof(line0) - (size_t)pos, "HR:--")); }
+    pos += (uint8_t)(snprintf(line0 + pos, sizeof(line0) - (size_t)pos, " "));
+    if (rr_visible != 0U)
+    {
+      (void)snprintf(line0 + pos, sizeof(line0) - (size_t)pos,
+                     "RR:%u%s", (unsigned int)app->rr_bpm,
+                     (app->rr_valid != 0U) ? "" : "?");
+    }
+    else { (void)snprintf(line0 + pos, sizeof(line0) - (size_t)pos, "RR:--"); }
   }
-  else if (hr_visible != 0U)
+  else { (void)snprintf(line0, sizeof(line0), "HR:-- RR:--"); }
+
+  /* --- y=0 右侧：短标题 + SQ --- */
+  if (app->motion_artifact != 0U)
   {
-    (void)snprintf(line1,
-                   sizeof(line1),
-                   "HR:%u%s RR:--",
-                   (unsigned int)app->bpm_value,
-                   (app->bpm_valid != 0U) ? "" : "?");
-  }
-  else if (rr_visible != 0U)
-  {
-    (void)snprintf(line1,
-                   sizeof(line1),
-                   "HR:-- RR:%u%s",
-                   (unsigned int)app->rr_bpm,
-                   (app->rr_valid != 0U) ? "" : "?");
+    (void)snprintf(line0r, sizeof(line0r), "V M");
   }
   else
   {
-    (void)snprintf(line1, sizeof(line1), "HR:-- RR:--");
+    (void)snprintf(line0r, sizeof(line0r), "V SQ%u", (unsigned int)app->signal_quality);
   }
 
+  /* --- y=8: IBI --- */
   if ((app->finger_present != 0U) &&
       ((app->ibi_valid != 0U) || (app->latest_ibi_ms != 0U)))
   {
-    (void)snprintf(line2,
-                   sizeof(line2),
-                   "IBI:%u%sMS",
+    (void)snprintf(line1, sizeof(line1), "IBI:%u%sMS",
                    (unsigned int)app->latest_ibi_ms,
                    (app->ibi_valid != 0U) ? "" : "?");
   }
-  else
-  {
-    (void)snprintf(line2, sizeof(line2), "IBI:--MS");
-  }
+  else { (void)snprintf(line1, sizeof(line1), "IBI:--MS"); }
 
+  /* --- y=16: SDNN + RMSSD --- */
   if ((app->finger_present != 0U) &&
       ((app->hrv_valid != 0U) || (app->hrv_sdnn_ms != 0U) || (app->hrv_rmssd_ms != 0U)))
   {
     hrv_sdnn_display = (app->hrv_sdnn_ms > 9999U) ? 9999U : app->hrv_sdnn_ms;
     hrv_rmssd_display = (app->hrv_rmssd_ms > 9999U) ? 9999U : app->hrv_rmssd_ms;
-    (void)snprintf(line3,
-                   sizeof(line3),
-                   "SDNN:%u%s RMSSD:%u%s",
+    (void)snprintf(line2, sizeof(line2), "SDNN:%u%s RMSSD:%u%s",
                    (unsigned int)hrv_sdnn_display,
                    (app->hrv_valid != 0U) ? "" : "?",
                    (unsigned int)hrv_rmssd_display,
                    (app->hrv_valid != 0U) ? "" : "?");
   }
-  else
-  {
-    (void)snprintf(line3, sizeof(line3), "SDNN:-- RMSSD:--");
-  }
+  else { (void)snprintf(line2, sizeof(line2), "SDNN:-- RMSSD:--"); }
 
-  (void)snprintf(line4,
-                 sizeof(line4),
-                 "PI:%u.%u Q:%s",
+  /* --- y=24: SD1 + SD2 --- */
+  if (app->hrv_valid != 0U)
+  {
+    (void)snprintf(line3, sizeof(line3), "SD1:%u SD2:%u",
+                   (unsigned int)app->hrv_sd1_ms, (unsigned int)app->hrv_sd2_ms);
+  }
+  else { (void)snprintf(line3, sizeof(line3), "SD1:-- SD2:--"); }
+
+  /* --- y=32: PI --- */
+  (void)snprintf(line4, sizeof(line4), "PI:%u.%u",
                  (unsigned int)(app->signal_ir_pi_x1000 / 10U),
-                 (unsigned int)(app->signal_ir_pi_x1000 % 10U),
-                 app_get_quality_label(app));
+                 (unsigned int)(app->signal_ir_pi_x1000 % 10U));
+
+  /* --- y=40: RTC status --- */
   (void)snprintf(line5, sizeof(line5), "%s", app_get_rtc_status_label(app));
   app_format_rtc_lines(app, time_line, sizeof(time_line), date_line, sizeof(date_line));
 
+  /* --- Draw --- */
   ssd1306_Clear(SSD1306_COLOR_BLACK);
   ssd1306_DrawString(0, 0, line0);
+  app_display_draw_right(0, line0r);
   ssd1306_DrawString(0, 8, line1);
   ssd1306_DrawString(0, 16, line2);
   ssd1306_DrawString(0, 24, line3);
   ssd1306_DrawString(0, 32, line4);
   ssd1306_DrawString(0, 40, line5);
-  ssd1306_DrawString(0, 48, time_line);
-  ssd1306_DrawString(0, 56, date_line);
+  ssd1306_DrawString(0, 48, time_line);   /* 蓝色 RTC */
+  ssd1306_DrawString(0, 56, date_line);   /* 蓝色 RTC */
   ssd1306_UpdateScreen();
 }
 
-/* 调试页改为文本总览，方便现场直接看关键运行参数。 */
+/*
+ * 调试页：黄色区 (y=0,8) 放原始值，蓝色区 (y>=16) 放 RTC 和运行统计。
+ */
 static void app_display_debug_page(const AppState_t *app)
 {
   char time_line[32];
-  char line_signal[24];
+  char line_signal[32];
+  char line_signal_r[8];
   char line_fifo[24];
   char line_ok_busy[24];
   char line_err_recover[24];
   char line_quality[24];
-  char line_display[32];
-  char line_status[24];
+  char line_tail[32];
 
-  if (app == NULL)
-  {
-    return;
-  }
+  if (app == NULL) { return; }
 
+  /* RTC 时间放在蓝色区 y=16 */
   if (app->rtc_read_ok != 0U)
   {
-    (void)snprintf(time_line,
-                   sizeof(time_line),
-                   "DEBUG %02u:%02u:%02u",
+    (void)snprintf(time_line, sizeof(time_line),
+                   "%02u:%02u:%02u",
                    (unsigned int)app->rtc_datetime.hours,
                    (unsigned int)app->rtc_datetime.minutes,
                    (unsigned int)app->rtc_datetime.seconds);
   }
-  else
-  {
-    (void)snprintf(time_line, sizeof(time_line), "DEBUG --:--:--");
-  }
+  else { (void)snprintf(time_line, sizeof(time_line), "--:--:--"); }
 
-  (void)snprintf(line_signal,
-                 sizeof(line_signal),
+  /* --- y=0 左侧：原始 R/I，右侧："D" 或 warm-up 倒计时 --- */
+  (void)snprintf(line_signal, sizeof(line_signal),
                  "R:%lu I:%lu",
                  (unsigned long)app->red_value,
                  (unsigned long)app->ir_value);
-  (void)snprintf(line_fifo,
-                 sizeof(line_fifo),
+  if (app->contact_settle_samples > 0U)
+  {
+    (void)snprintf(line_signal_r, sizeof(line_signal_r), "W%u",
+                   (unsigned int)app->contact_settle_samples);
+  }
+  else
+  {
+    (void)snprintf(line_signal_r, sizeof(line_signal_r), "D");
+  }
+
+  (void)snprintf(line_fifo, sizeof(line_fifo),
                  "W:%u R:%u A:%u",
                  (unsigned int)app->sensor_fifo_write_ptr,
                  (unsigned int)app->sensor_fifo_read_ptr,
                  (unsigned int)app->sensor_fifo_available_samples);
-  (void)snprintf(line_ok_busy,
-                 sizeof(line_ok_busy),
-                 "OK:%lu B:%lu",
+  (void)snprintf(line_ok_busy, sizeof(line_ok_busy),
+                 "OK:%lu B:%lu ER:%lu",
                  (unsigned long)app->sensor_read_ok_count,
-                 (unsigned long)app->sensor_read_busy_count);
-  (void)snprintf(line_err_recover,
-                 sizeof(line_err_recover),
-                 "ER:%lu RC:%lu",
-                 (unsigned long)app->sensor_read_error_count,
-                 (unsigned long)app->sensor_recover_count);
-  (void)snprintf(line_quality,
-                 sizeof(line_quality),
-                 "Q:%u PI:%u/%u",
+                 (unsigned long)app->sensor_read_busy_count,
+                 (unsigned long)app->sensor_read_error_count);
+  (void)snprintf(line_err_recover, sizeof(line_err_recover),
+                 "RC:%lu M:%u a%u",
+                 (unsigned long)app->sensor_recover_count,
+                 (unsigned int)app->motion_score,
+                 (unsigned int)(app->motion_artifact));
+  (void)snprintf(line_quality, sizeof(line_quality),
+                 "SQ:%u PI:%u.%u I:%u",
                  (unsigned int)app->signal_quality,
-                 (unsigned int)app->signal_ir_pi_x1000,
-                 (unsigned int)app->signal_red_pi_x1000);
-  (void)snprintf(line_display,
-                 sizeof(line_display),
-                 "D:%lu O:%u B:%u",
-                 (unsigned long)app->display_refresh_count,
-                 (unsigned int)app->sensor_fifo_overflow_count,
-                 (unsigned int)(app->display_brightness_index + 1U));
-
-  (void)snprintf(line_status,
-                 sizeof(line_status),
-                 "S:%s E:%lX",
-                 app_get_sensor_status_string(app),
-                 (unsigned long)app->sensor_last_i2c_error);
+                 (unsigned int)(app->signal_ir_pi_x1000 / 10U),
+                 (unsigned int)(app->signal_ir_pi_x1000 % 10U),
+                 (unsigned int)app->accepted_ibi_count);
+  (void)snprintf(line_tail, sizeof(line_tail),
+                 "H:%u N:%u R:%u",
+                 (unsigned int)(app->hrv_valid),
+                 (unsigned int)(app->hrv_sdnn_ms > 999U ? 999U : app->hrv_sdnn_ms),
+                 (unsigned int)(app->hrv_rmssd_ms > 999U ? 999U : app->hrv_rmssd_ms));
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, time_line);
-  ssd1306_DrawString(0, 8, line_signal);
-  ssd1306_DrawString(0, 16, line_fifo);
-  ssd1306_DrawString(0, 24, line_ok_busy);
-  ssd1306_DrawString(0, 32, line_err_recover);
-  ssd1306_DrawString(0, 40, line_quality);
-  ssd1306_DrawString(0, 48, line_display);
-  ssd1306_DrawString(0, 56, line_status);
+  ssd1306_DrawString(0, 0, line_signal);        /* 黄色：原始 RED/IR */
+  app_display_draw_right(0, line_signal_r);      /* 黄色右侧："D" */
+  ssd1306_DrawString(0, 8, line_fifo);           /* 黄色：FIFO */
+  ssd1306_DrawString(0, 16, time_line);          /* 蓝色 RTC */
+  ssd1306_DrawString(0, 24, line_ok_busy);       /* OK/BUSY/ER 合并 */
+  ssd1306_DrawString(0, 32, line_err_recover);   /* RC + motion */
+  ssd1306_DrawString(0, 40, line_quality);       /* SQ + PI + IBI 计数 */
+  ssd1306_DrawString(0, 48, line_tail);          /* HRV: valid + SDNN + RMSSD */
   ssd1306_UpdateScreen();
 }
 
@@ -633,24 +606,35 @@ static const char *app_get_balance_label(uint8_t balance_status)
 
 /*
  * 心律规整度标签（短窗口提示，不做诊断）：
- * - rhythm_irregular=1 -> "IRR"
- * - RMSSD > 120 ms -> "VAR"
- * - HRV 无效或变异性不高 -> "OK"
- * 仅在手指在位且 IBI 有效时输出，否则 "--"。
+ * - finger_present==0 或 latest_ibi_ms==0 → "--"
+ * - hrv_valid==0 但有 IBI → "WAIT"（积累中）
+ * - hrv_valid==1 且 rhythm_irregular==1 → "IRR"
+ * - hrv_valid==1 且 RMSSD > 120ms → "VAR"
+ * - hrv_valid==1 且以上不满足 → "OK"
  */
 static const char *app_get_regular_label(const AppState_t *app)
 {
-  if ((app == NULL) || (app->finger_present == 0U) || (app->ibi_valid == 0U))
+  if ((app == NULL) || (app->finger_present == 0U))
   {
     return "--";
   }
 
-  if ((app->hrv_valid != 0U) && (app->rhythm_irregular != 0U))
+  if (app->latest_ibi_ms == 0U)
+  {
+    return "--";
+  }
+
+  if (app->hrv_valid == 0U)
+  {
+    return "WAIT";
+  }
+
+  if (app->rhythm_irregular != 0U)
   {
     return "IRR";
   }
 
-  if ((app->hrv_valid != 0U) && (app->hrv_rmssd_ms > 120U))
+  if (app->hrv_rmssd_ms > 120U)
   {
     return "VAR";
   }
@@ -679,33 +663,30 @@ static const char *app_get_rtc_status_label(const AppState_t *app)
   return "RTC RUN";
 }
 
-/* 绘制简化状态页，常用于启动、自检与基线采集阶段。 */
+/*
+ * 绘制简化状态页，常用于启动、自检与基线采集阶段。
+ * 黄色区 (y=0) 放标题，蓝色区 (y>=16) 放 RTC 时间/日期。
+ */
 void app_display_status_page(const AppState_t *app, const char *status_line_1, const char *status_line_2)
 {
   char time_line[32];
   char date_line[32];
   char uart_line[24];
-  char brightness_line[24];
 
   app_format_rtc_lines(app, time_line, sizeof(time_line), date_line, sizeof(date_line));
 
-  (void)snprintf(uart_line,
-                 sizeof(uart_line),
+  (void)snprintf(uart_line, sizeof(uart_line),
                  "UART R:%s T:%s",
                  ((app != NULL) && app->uart_rx_message_valid) ? "VLD" : "INV",
                  ((app != NULL) && app->uart_tx_message_valid) ? "VLD" : "INV");
-  (void)snprintf(brightness_line,
-                 sizeof(brightness_line),
-                 "OLED BRT:%s",
-                 (app != NULL) ? app_get_brightness_label(app->display_brightness_index) : "MID");
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, time_line);
-  ssd1306_DrawString(0, 8, date_line);
-  ssd1306_DrawString(0, 16, (status_line_1 != NULL) ? status_line_1 : "");
-  ssd1306_DrawString(0, 24, (status_line_2 != NULL) ? status_line_2 : "");
-  ssd1306_DrawString(0, 32, uart_line);
-  ssd1306_DrawString(0, 40, brightness_line);
+  ssd1306_DrawString(0, 0, "STATUS");          /* 黄色标题 */
+  ssd1306_DrawString(0, 16, time_line);        /* 蓝色 RTC */
+  ssd1306_DrawString(0, 24, date_line);        /* 蓝色 RTC */
+  ssd1306_DrawString(0, 32, (status_line_1 != NULL) ? status_line_1 : "");
+  ssd1306_DrawString(0, 40, (status_line_2 != NULL) ? status_line_2 : "");
+  ssd1306_DrawString(0, 48, uart_line);
   ssd1306_UpdateScreen();
 }
 
@@ -900,7 +881,12 @@ static void waveform_buffer_mark_latest(WaveformBuffer_t *waveform)
   waveform->markers[marker_index] = 1U;
 }
 
-/* 把最近一屏样本映射到 OLED 指定区域，绘制成连续折线。 */
+/*
+ * 动态缩放波形绘制：扫描可见样本的 min/max，把数据映射到 y+1..y+height-2，
+ * 上下各留 1px 边距，避免峰/谷被屏幕边缘截断。
+ * 若所有样本相等，绘制水平中线。
+ * 脉搏标记放在波形区域底部 3 行，不进入主要波形显示区。
+ */
 static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
                                  uint8_t x,
                                  uint8_t y,
@@ -912,21 +898,23 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
   uint16_t i;
   uint16_t sample_count;
   uint16_t start_index;
-  uint8_t prev_y = 0U;
-  uint8_t draw_y;
-  uint8_t line_y;
   uint16_t sample_index;
-  int32_t center_y;
-  int32_t half_height;
-  int32_t draw_y_i;
-  int32_t sample_value;
-  uint32_t display_scale;
+  uint8_t  prev_y = 0U;
+  uint8_t  draw_y;
+  uint8_t  line_y;
+  int32_t  sample_value;
+  int32_t  vis_min;
+  int32_t  vis_max;
+  int32_t  vis_range;
+  int32_t  map_top;       /* 映射目标区域上界 (y+1) */
+  int32_t  map_bot;       /* 映射目标区域下界 (y+height-2) */
+  int32_t  map_range;     /* map_bot - map_top */
+  int32_t  draw_y_i;
+  uint8_t  marker_base;   /* 脉搏标记底部起始 y */
 
-  if ((waveform == NULL) || (width == 0U) || (height == 0U))
-  {
-    return;
-  }
+  if ((waveform == NULL) || (width == 0U) || (height == 0U)) { return; }
 
+  /* 空缓冲 → 画中线 */
   if (waveform->sample_count == 0U)
   {
     draw_y = (uint8_t)(y + (height / 2U));
@@ -941,10 +929,7 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
   }
 
   sample_count = waveform->sample_count;
-  if (sample_count > width)
-  {
-    sample_count = width;
-  }
+  if (sample_count > width) { sample_count = width; }
 
   if (waveform->sample_count < SSD1306_WIDTH)
   {
@@ -955,49 +940,48 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
     start_index = waveform->write_index;
   }
 
-  center_y = (int32_t)y + ((int32_t)height / 2L);
-  half_height = ((int32_t)height / 2L) - 1L;
-  if (half_height < 1L)
-  {
-    half_height = 1L;
-  }
-
-  display_scale = (waveform->scale_estimate * WAVEFORM_AGC_HEADROOM_NUM) /
-                  WAVEFORM_AGC_HEADROOM_DEN;
-  if (display_scale < WAVEFORM_AGC_MIN_SCALE)
-  {
-    display_scale = WAVEFORM_AGC_MIN_SCALE;
-  }
-  else if (display_scale > WAVEFORM_AGC_MAX_SCALE)
-  {
-    display_scale = WAVEFORM_AGC_MAX_SCALE;
-  }
-
+  /* 第 1 遍：扫描可见样本范围 */
+  vis_min = INT32_MAX;
+  vis_max = INT32_MIN;
   for (i = 0U; i < sample_count; i++)
   {
     sample_index = (uint16_t)((start_index + i) % SSD1306_WIDTH);
     sample_value = waveform->samples[sample_index];
-    if (sample_value > (int32_t)display_scale)
-    {
-      sample_value = (int32_t)display_scale;
-    }
-    else if (sample_value < -((int32_t)display_scale))
-    {
-      sample_value = -((int32_t)display_scale);
-    }
+    if (sample_value < vis_min) { vis_min = sample_value; }
+    if (sample_value > vis_max) { vis_max = sample_value; }
+  }
 
-    draw_y_i = center_y - (int32_t)(((int64_t)sample_value * (int64_t)half_height) /
-                                    (int64_t)display_scale);
-    if (draw_y_i < (int32_t)y)
-    {
-      draw_y_i = (int32_t)y;
-    }
-    else if (draw_y_i >= ((int32_t)y + (int32_t)height))
-    {
-      draw_y_i = (int32_t)y + (int32_t)height - 1L;
-    }
+  vis_range = vis_max - vis_min;
+  if (vis_range < 4) { vis_range = 4; }  /* 极小信号时保持最小显示幅度 */
+
+  /* 映射区间：y+1 到 y+height-2，上下各 1px margin */
+  map_top = (int32_t)y + 1;
+  map_bot = (int32_t)y + (int32_t)height - 2;
+  if (map_bot < map_top) { map_bot = map_top; }
+  map_range = map_bot - map_top;
+
+  /* 第 2 遍：绘制 */
+  for (i = 0U; i < sample_count; i++)
+  {
+    sample_index = (uint16_t)((start_index + i) % SSD1306_WIDTH);
+    sample_value = waveform->samples[sample_index];
+
+    /* clamp 到可见范围，防单个毛刺压扁整体 */
+    if (sample_value > vis_max) { sample_value = vis_max; }
+    if (sample_value < vis_min) { sample_value = vis_min; }
+
+    /* 映射：vis_min → map_bot(底部), vis_max → map_top(顶部) */
+    draw_y_i = map_bot - (int32_t)(((int64_t)(sample_value - vis_min) *
+                                    (int64_t)map_range + ((int64_t)vis_range / 2LL)) /
+                                   (int64_t)vis_range);
+
+    /* 硬钳位防止越界 */
+    if (draw_y_i < (int32_t)y)       { draw_y_i = (int32_t)y; }
+    if (draw_y_i >= (int32_t)(y + height)) { draw_y_i = (int32_t)(y + height - 1); }
 
     draw_y = (uint8_t)draw_y_i;
+
+    /* 虚线模式时隔点绘制，实线时绘制 + 连线 */
     if ((dotted == 0U) || ((i & 1U) == 0U))
     {
       ssd1306_DrawPixel((uint8_t)(x + i), draw_y, SSD1306_COLOR_WHITE);
@@ -1007,41 +991,64 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
     {
       if (prev_y < draw_y)
       {
-        for (line_y = prev_y; line_y <= draw_y; line_y++)
+        for (line_y = (uint8_t)(prev_y + 1U); line_y <= draw_y; line_y++)
         {
           ssd1306_DrawPixel((uint8_t)(x + i), line_y, SSD1306_COLOR_WHITE);
         }
       }
-      else
+      else if (prev_y > draw_y)
       {
-        for (line_y = draw_y; line_y <= prev_y; line_y++)
+        for (line_y = (uint8_t)(draw_y + 1U); line_y <= prev_y; line_y++)
         {
           ssd1306_DrawPixel((uint8_t)(x + i), line_y, SSD1306_COLOR_WHITE);
         }
       }
     }
 
-    /* 在波形底部绘制脉搏标记箭头（向下三角形），标识每个检测到的心搏位置。 */
-    if ((markers != 0U) && (waveform->markers[sample_index] != 0U) && (height >= 8U))
+    /* 脉搏标记：放在波形区域底部 3 行（小箭头），不占用主显示空间 */
+    if ((markers != 0U) && (waveform->markers[sample_index] != 0U) && (height >= 6U))
     {
-      uint8_t marker_y = (uint8_t)(y + height - 4U);
-      ssd1306_DrawPixel((uint8_t)(x + i), marker_y, SSD1306_COLOR_WHITE);
-      if (marker_y + 1U < (uint8_t)(y + height))
+      marker_base = (uint8_t)(y + height - 3U);
+      /* 垂直 2px 竖线 */
+      ssd1306_DrawPixel((uint8_t)(x + i), marker_base, SSD1306_COLOR_WHITE);
+      if (marker_base + 1U < (uint8_t)(y + height))
       {
-        ssd1306_DrawPixel((uint8_t)(x + i), (uint8_t)(marker_y + 1U), SSD1306_COLOR_WHITE);
+        ssd1306_DrawPixel((uint8_t)(x + i), (uint8_t)(marker_base + 1U), SSD1306_COLOR_WHITE);
       }
-      if ((i > 0U) && (marker_y + 2U < (uint8_t)(y + height)))
+      /* 底部三角：左右各 1px */
+      if ((i > 0U) && (marker_base + 2U < (uint8_t)(y + height)))
       {
-        ssd1306_DrawPixel((uint8_t)(x + i - 1U), (uint8_t)(marker_y + 2U), SSD1306_COLOR_WHITE);
+        ssd1306_DrawPixel((uint8_t)(x + i - 1U), (uint8_t)(marker_base + 2U), SSD1306_COLOR_WHITE);
       }
-      if (((uint8_t)(x + i + 1U) < SSD1306_WIDTH) && (marker_y + 2U < (uint8_t)(y + height)))
+      if (((uint8_t)(x + i + 1U) < SSD1306_WIDTH) && (marker_base + 2U < (uint8_t)(y + height)))
       {
-        ssd1306_DrawPixel((uint8_t)(x + i + 1U), (uint8_t)(marker_y + 2U), SSD1306_COLOR_WHITE);
+        ssd1306_DrawPixel((uint8_t)(x + i + 1U), (uint8_t)(marker_base + 2U), SSD1306_COLOR_WHITE);
       }
     }
 
     prev_y = draw_y;
   }
+}
+
+/* 计算字符串在 SSD1306 上的像素宽度（5x7 字体 + 1px 间距 ≈ 6px/字符）。 */
+static uint8_t app_display_text_width_px(const char *s)
+{
+  uint8_t w = 0U;
+  if (s != NULL) { while (*s) { w += 6U; s++; } }
+  return w;
+}
+
+/* 在指定行右对齐绘制字符串。x = 128 - 文本宽度，不越界。 */
+static void app_display_draw_right(uint8_t y, const char *s)
+{
+  uint8_t w;
+  int16_t pos_x;
+
+  if (s == NULL) { return; }
+  w = app_display_text_width_px(s);
+  pos_x = (int16_t)SSD1306_WIDTH - (int16_t)w;
+  if (pos_x < 0) { pos_x = 0; }
+  ssd1306_DrawString((uint8_t)pos_x, y, s);
 }
 
 /* 把 RTC 星期枚举转成 OLED 上显示的简短英文缩写。 */

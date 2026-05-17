@@ -30,8 +30,8 @@ extern "C" {
 
 #include "app_state.h"
 
-#define APP_HRV_IBI_MIN_MS 300U
-#define APP_HRV_IBI_MAX_MS 2000U
+#define APP_HRV_IBI_MIN_MS 250U
+#define APP_HRV_IBI_MAX_MS 2400U
 
 /* 清零所有 IBI 历史和输出值——手指离开/测量重置时调用。 */
 void app_hrv_reset(AppState_t *app);
