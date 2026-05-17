@@ -47,7 +47,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define APP_UI_REFRESH_PERIOD_MS 100U
 #define APP_MAIN_LOOP_DELAY_MS   5U
 #define APP_SENSOR_DRAIN_BUDGET  8U
 
@@ -74,7 +73,6 @@ static void app_state_init(AppState_t *app);
 static void app_send_report_if_due(AppState_t *app);
 /* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态。 */
 static void app_refresh_display_if_needed(AppState_t *app);
-static void app_schedule_periodic_refresh(AppState_t *app);
 static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status);
 /* USER CODE END PFP */
 
@@ -125,27 +123,6 @@ static void app_refresh_display_if_needed(AppState_t *app)
   app->display_refresh_count++;
   app->display_last_refresh_tick = HAL_GetTick();
   app->display_refresh_requested = 0U;
-}
-
-static void app_schedule_periodic_refresh(AppState_t *app)
-{
-  static uint32_t last_refresh_tick = 0U;
-  uint32_t now;
-
-  if (app == NULL)
-  {
-    return;
-  }
-
-  now = HAL_GetTick();
-  if ((now - last_refresh_tick) < APP_UI_REFRESH_PERIOD_MS)
-  {
-    return;
-  }
-
-  last_refresh_tick = now;
-  app->report_due = 1U;
-  app->display_refresh_requested = 1U;
 }
 
 static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status)
@@ -298,8 +275,7 @@ int main(void)
      * 主循环保持为”调度器”角色：
      * - 轮询串口命令（DMA+IDLE，非阻塞）
      * - 处理按键（软件消抖）
-     * - max30102_should_service_fifo() 门控传感器读取：
-  *                        opensource.org/licenses/BSD-3-Clause
+     * - max30102_should_service_fifo() 门控传感器读取
      * - 推进 BPM/SpO2 算法 + 波形显示
      * - 200 ms 周期统一上报 + 刷新 OLED
      */
@@ -336,7 +312,6 @@ int main(void)
       }
     }
 
-    app_schedule_periodic_refresh(&app);
     app_send_report_if_due(&app);
     app_refresh_display_if_needed(&app);
     APP_Watchdog_Refresh();

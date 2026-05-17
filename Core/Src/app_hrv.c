@@ -54,6 +54,7 @@
 #define APP_HRV_FREQ_HF_MAX_HZ         0.40f
 #define APP_HRV_FREQ_EPSILON           1.0e-6f
 #define APP_HRV_PI_F32                 3.14159265f
+#define APP_HRV_DUPLICATE_PEAK_WINDOW_SAMPLES 12U
 
 static struct
 {
@@ -125,7 +126,8 @@ void app_hrv_invalidate_outputs(AppState_t *app)
 uint8_t app_hrv_mark_peak_seen(uint32_t peak_sample)
 {
   if ((hrv_state.last_peak_valid != 0U) &&
-      (hrv_state.last_peak_sample == peak_sample))
+      (app_hrv_abs_diff_u32(peak_sample, hrv_state.last_peak_sample) <=
+       APP_HRV_DUPLICATE_PEAK_WINDOW_SAMPLES))
   {
     return 0U;
   }

@@ -150,7 +150,7 @@ AppSdCardStatus_t APP_SD_Card_Read(uint8_t *buf, uint32_t sector, uint32_t count
      * HAL_SD_ReadBlocks 是阻塞调用，含超时参数。
      * 失败时调用 Deinit，释放 SDIO 资源和卡状态，
      * 以便上层通过定时重试机制（app_sd_file 60 秒间隔）重新 Init 卡。*/
-    hal_ret = HAL_SD_ReadBlocks(&hsd, buf, sector * 512U, count, APP_SD_TIMEOUT);
+    hal_ret = HAL_SD_ReadBlocks(&hsd, buf, sector, count, APP_SD_TIMEOUT);
     if (hal_ret != HAL_OK)
     {
         APP_SD_Card_Deinit();
@@ -179,7 +179,7 @@ AppSdCardStatus_t APP_SD_Card_Write(const uint8_t *buf, uint32_t sector,
     /*
      * HAL_SD_WriteBlocks 是阻塞调用，含超时参数。
      * 写失败时立即 Deinit，确保卡状态一致。*/
-    hal_ret = HAL_SD_WriteBlocks(&hsd, (uint8_t *)buf, sector * 512U, count, APP_SD_TIMEOUT);
+    hal_ret = HAL_SD_WriteBlocks(&hsd, (uint8_t *)buf, sector, count, APP_SD_TIMEOUT);
     if (hal_ret != HAL_OK)
     {
         APP_SD_Card_Deinit();

@@ -193,8 +193,7 @@ void app_display_measurement_page(const AppState_t *app)
  * HR/IBI 的 valid 字段控制末尾 "?" 后缀：valid=0 但值非零时显示旧值+"?"，
  * 表示信号短暂中断但保留上一帧结果供参考。
  *
- * FIXME: RTC 时间/日期已从此页移除，旧 BPM 页在顶部两行显示时间和日期。
- * 生理信号监测中 RTC 是必要参考，应恢复到此页或通过 TIME/STATUS 页承接。
+ * RTC 时间/日期集中放在 VITALS/DEBUG 页，PULSE 页保留波形和节律信息。
  */
 static void app_display_pulse_page(const AppState_t *app)
 {
@@ -280,7 +279,7 @@ static void app_display_pulse_page(const AppState_t *app)
  * 显示 SpO2 + R/BAL 比值 + 双通道波形（IR 实线 + RED 虚线）。
  * R 末尾 "?" 同 PULSE 页含义：spo2_ratio_valid=0 但旧值保留。
  *
- * FIXME: RTC 时间/日期已从此页移除，同 PULSE 页的问题。
+ * RTC 时间/日期集中放在 VITALS/DEBUG 页，OXY 页保留双通道波形空间。
  */
 static void app_display_oxy_page(const AppState_t *app)
 {
@@ -374,6 +373,8 @@ static void app_display_vitals_page(const AppState_t *app)
   char date_line[32];
   uint8_t hr_visible;
   uint8_t rr_visible;
+  uint16_t hrv_sdnn_display;
+  uint16_t hrv_rmssd_display;
 
   if (app == NULL)
   {
@@ -439,16 +440,18 @@ static void app_display_vitals_page(const AppState_t *app)
     (void)snprintf(line2, sizeof(line2), "IBI:--MS");
   }
 
-  /* FIXME: SDNN/RMSSD 未遵循 "?" 约定——hrv_valid=0 时直接显示 "--"，
-   * 而 HR/IBI/RR 在 valid=0 但值非零时会显示旧值+"?"。
-   * 若希望统一行为，应改为：hrv_valid!=0 时显示数值，否则数值非零时显示 "value?"，全零时 "--"。 */
-  if ((app->finger_present != 0U) && (app->hrv_valid != 0U))
+  if ((app->finger_present != 0U) &&
+      ((app->hrv_valid != 0U) || (app->hrv_sdnn_ms != 0U) || (app->hrv_rmssd_ms != 0U)))
   {
+    hrv_sdnn_display = (app->hrv_sdnn_ms > 9999U) ? 9999U : app->hrv_sdnn_ms;
+    hrv_rmssd_display = (app->hrv_rmssd_ms > 9999U) ? 9999U : app->hrv_rmssd_ms;
     (void)snprintf(line3,
                    sizeof(line3),
-                   "SDNN:%u RMSSD:%u",
-                   (unsigned int)((app->hrv_sdnn_ms > 9999U) ? 9999U : app->hrv_sdnn_ms),
-                   (unsigned int)((app->hrv_rmssd_ms > 9999U) ? 9999U : app->hrv_rmssd_ms));
+                   "SDNN:%u%s RMSSD:%u%s",
+                   (unsigned int)hrv_sdnn_display,
+                   (app->hrv_valid != 0U) ? "" : "?",
+                   (unsigned int)hrv_rmssd_display,
+                   (app->hrv_valid != 0U) ? "" : "?");
   }
   else
   {
