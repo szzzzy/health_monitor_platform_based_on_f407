@@ -18,7 +18,7 @@
 
 #define APP_SD_INIT_CLK_DIV  118U    /* 48MHz SDIOCLK / (118+2) ~= 400kHz */
 #define APP_SD_FAST_CLK_DIV    2U    /* 48MHz SDIOCLK / (2+2)   =  12MHz */
-#define APP_SD_TIMEOUT      2000U    /* 2 秒 */
+#define APP_SD_TIMEOUT       200U    /* 200 ms — 典型 4 扇区写 <10 ms，20x 余量；超时即 Deinit 避免阻塞主循环 */
 
 static SD_HandleTypeDef        hsd;
 static HAL_SD_CardInfoTypeDef  card_info;

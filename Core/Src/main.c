@@ -201,9 +201,11 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* SD 卡日志：每次上报同期落盘 */
+  /* SD 卡日志：延迟到首次 APP_DataLog_WriteRecord() 时懒启动，
+   * 避免坏卡/无卡在启动阶段阻塞主功能（MAX30102/OLED/RTC/按键/串口）。
+   * 此处仅初始化内部静态变量，不执行硬件访问。 */
   APP_DataLog_Init();
-  app_update_sd_log_status(&app, APP_DataLog_StartSession());
+  app_update_sd_log_status(&app, APP_DATA_LOG_OK);
   APP_Watchdog_Refresh();
 
   /* 上电先采集一段“无手指”背景，建立 IR 基线。 */
@@ -312,8 +314,26 @@ int main(void)
       }
     }
 
-    app_send_report_if_due(&app);
+    /* 基于 HAL_GetTick() 的独立 200ms 显示刷新节拍。
+     * 不依赖 MAX30102 采样是否成功 —— SD 阻塞导致 FIFO 溢出、读失败时，
+     * app_measurement_update_periodic_flags 不会运行，此计时器确保
+     * OLED/RTC 仍能按 200ms 周期刷新。 */
+    {
+      static uint32_t last_display_tick = 0;
+      uint32_t now = HAL_GetTick();
+      if ((now - last_display_tick) >= 200U)
+      {
+        last_display_tick = now;
+        app.display_refresh_requested = 1U;
+      }
+    }
+
+    /* 显示优先于 SD 日志写入：
+     * 若 SD 写入阻塞（FatFs/sync/HAL 超时），OLED 已在当前迭代刷新完毕。
+     * 注意 app_refresh_display_if_needed 只执行一次 ssd1306_UpdateScreen，
+     * 不触碰 SD 卡，本身是 O(1) I2C 操作。 */
     app_refresh_display_if_needed(&app);
+    app_send_report_if_due(&app);
     APP_Watchdog_Refresh();
 
     /* Wait for next 10ms tick from TIM6 (WFI saves power while idle). */

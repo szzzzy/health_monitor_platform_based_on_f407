@@ -109,6 +109,20 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
     return RES_ERROR;
 }
 
+/*
+ * 显式标记磁盘不可用。
+ *
+ * APP_SD_Card_Deinit() 只在 app_sd_card 层重置 card_initialized，
+ * FatFs 层的 disk_status_flags 不会自动同步。此函数由错误恢复路径
+ *（close_session_after_error / StopSession）调用，确保 FatFs 感知
+ * 到卡已断开，后续 disk_read/disk_write 在 STA_NOINIT 检查时快速返回
+ * RES_NOTRDY，不再尝试 HAL_SD I/O，避免在已 Deinit 的卡上二次阻塞。
+ */
+void sd_diskio_invalidate(void)
+{
+    disk_status_flags |= STA_NOINIT;
+}
+
 DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
 {
     uint32_t blk_cnt;

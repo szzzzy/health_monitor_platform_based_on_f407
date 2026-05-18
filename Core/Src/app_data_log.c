@@ -70,17 +70,23 @@ void APP_DataLog_Init(void)
     csv_header_written = 0;
 }
 
+/*
+ * 启动 SD 日志会话并写入 CSV 表头。
+ *
+ * 每次新会话都写入表头，因为可能遇到以下场景：
+ *   - 日期翻日 → 新文件需要表头
+ *   - 错误恢复 → 上一会话异常终止，文件末尾可能不完整
+ * 重复表头行不影响 CSV 解析器（标准允许注释/头行出现在任意位置），
+ * 且每个表头仅 56 字节，代价可忽略。
+ */
 AppDataLogStatus_t APP_DataLog_StartSession(void)
 {
     AppSdFileStatus_t ret = APP_SdFile_StartSession();
     if (ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)ret;
 
-    if (!csv_header_written)
-    {
-        ret = APP_SdFile_Write(CSV_HEADER);
-        if (ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)ret;
-        csv_header_written = 1;
-    }
+    ret = APP_SdFile_Write(CSV_HEADER);
+    if (ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)ret;
+    csv_header_written = 1;
     return APP_DATA_LOG_OK;
 }
 
@@ -98,6 +104,15 @@ AppDataLogStatus_t APP_DataLog_StartSession(void)
  *   caller（main.c 的 app_send_report_if_due）会通过 app_update_sd_log_status
  *   将错误状态同步到 AppState，OLED 显示侧据此展示 SD 卡异常。
  */
+/*
+ * 写一条完整的 CSV 记录（当前 26 字段）。
+ *
+ * 懒启动策略：
+ *   若 SD 日志会话尚未就绪，先尝试 APP_DataLog_StartSession() 挂载 SD、
+ *   创建/打开 CSV 并写入表头。失败时 StartSession 内部会记录退避时间戳
+ *  （RETRY_INTERVAL_MS），后续写入在退避期内快速返回，不阻塞主循环。
+ *   成功时 APP_SdFile_Write 会正常缓冲数据。
+ */
 AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app)
 {
     char ts[24], st[8], vb[24];
@@ -105,6 +120,14 @@ AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app)
     AppSdFileStatus_t write_ret;
 
     if (app == NULL) return APP_DATA_LOG_CLOSED;
+
+    /* 懒启动：延迟到首次写入时才挂载 SD，避免坏卡/无卡阻塞启动流程。
+     * APP_DataLog_StartSession() 内部已含 60s 退避 + CSV 表头写入。 */
+    if (!APP_DataLog_IsReady())
+    {
+        AppDataLogStatus_t ret = APP_DataLog_StartSession();
+        if (ret != APP_DATA_LOG_OK) return ret;
+    }
 
     fmt_ts(&app->rtc_datetime, ts, sizeof(ts));
 

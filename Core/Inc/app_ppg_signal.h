@@ -21,7 +21,7 @@ extern "C" {
 /* 手指状态确认计数阈值 */
 #define APP_PPG_SIGNAL_FINGER_ON_CONFIRM_COUNT  8U    /* 就位需连续确认 8 拍 */
 #define APP_PPG_SIGNAL_FINGER_OFF_CONFIRM_COUNT 75U   /* 离开需连续确认 75 拍 (750ms) */
-#define APP_PPG_SIGNAL_REACQUIRE_NOISE_IR       3000UL /* 重新采集背景的噪声阈值 */
+#define APP_PPG_SIGNAL_REACQUIRE_NOISE_IR       1000UL /* 重捕获噪声种子；保持 finger-on 阈值不高于默认 6000 */
 
 /* 初始化自适应手指检测阈值为默认值 */
 void app_ppg_signal_init_state(AppState_t *app);
