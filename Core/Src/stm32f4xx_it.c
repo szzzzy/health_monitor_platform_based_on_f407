@@ -261,10 +261,10 @@ void I2C1_ER_IRQHandler(void)
   HAL_I2C_ER_IRQHandler(&hi2c1);
 }
 
-/* MAX30102 PPG_RDY 中断（PE5 下降沿）。
- * 若 PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发）
- * 系统会通过 TIM6 节拍兜底轮询。 */
-/* HAL GPIO EXTI 统一回调，按引脚分发。 */
+/* MAX30102 PPG_RDY 中断（PE5 下降沿）�?
+ * �? PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发�?
+ * 系统会�?�过 TIM6 节拍兜底轮询�? */
+/* HAL GPIO EXTI 统一回调，按引脚分发�? */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 #if (MAX30102_USE_INT_PIN != 0U)

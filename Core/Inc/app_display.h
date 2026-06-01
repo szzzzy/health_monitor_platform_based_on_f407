@@ -19,6 +19,12 @@ void app_display_add_ir_sample(int32_t filtered_value);
 void app_display_add_red_sample(int32_t filtered_value);
 /* Mark a recently detected IR pulse peak on the pulse waveform. */
 void app_display_add_ir_pulse_marker(void);
+/* Clear only the ECG waveform buffer. PPG contact changes must not affect it. */
+void app_display_reset_ecg_waveform(void);
+/* Push one filtered ECG sample into the ECG waveform buffer. */
+void app_display_add_ecg_sample(int32_t filtered_value);
+/* Mark a recently detected ECG R peak on the ECG waveform. */
+void app_display_add_ecg_r_peak_marker(void);
 /* 根据当前页面绘制测量结果页。 */
 void app_display_measurement_page(const AppState_t *app);
 /* 绘制状态页，常用于开机、自检和基线采集阶段。 */

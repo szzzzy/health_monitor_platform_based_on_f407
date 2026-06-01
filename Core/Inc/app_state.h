@@ -25,6 +25,7 @@ typedef enum
   DISPLAY_PAGE_BPM = 0U,
   DISPLAY_PAGE_SPO2,
   DISPLAY_PAGE_VITALS,
+  DISPLAY_PAGE_ECG,
   DISPLAY_PAGE_DEBUG,
   DISPLAY_PAGE_COUNT
 } DisplayPage_t;
@@ -174,6 +175,24 @@ typedef struct
   uint8_t  sd_log_active;
   uint8_t  sd_log_error;
   uint32_t sd_total_written;
+  /* ECG 状态：原始 ADC 值、滤波后 AC 值、导联脱落标志 */
+  uint16_t ecg_raw;
+  int16_t  ecg_filtered;
+  uint8_t  ecg_lead_off;
+  uint8_t  ecg_valid;
+  uint8_t  ecg_hr;
+  uint16_t ecg_rr_ms;
+  uint32_t ecg_r_peak_ms;
+  /* ECG 可观测状态计数器 */
+  uint32_t ecg_sample_count;
+  uint32_t ecg_adc_fail_count;
+  uint32_t ecg_dma_overflow_count;
+  uint32_t ecg_adc_sat_count;
+  uint32_t ecg_lead_off_count;
+  uint32_t ecg_no_r_peak_timeout_count;
+  /* PTT 状态 */
+  uint8_t  ptt_valid;
+  uint16_t ptt_ms;
 } AppState_t;
 
 #ifdef __cplusplus

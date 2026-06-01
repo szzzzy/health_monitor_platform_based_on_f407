@@ -21,10 +21,10 @@
 #include "rtc.h"
 
 /* USER CODE BEGIN 0 */
-/* 备份域 magic 字：写 BKP_DR0 标记 RTC 已初始化，写 BKP_DR1 标记时间已校时 */
+/* 备份�? magic 字：�? BKP_DR0 标记 RTC 已初始化，写 BKP_DR1 标记时间已校�? */
 #define APP_RTC_BKP_INIT_MAGIC    0xA5A5U
 #define APP_RTC_BKP_VALID_MAGIC   0x5A5AU
-/* RTC 年份基数：STM32 HAL 年份寄存器仅存 0–99 偏移量 */
+/* RTC 年份基数：STM32 HAL 年份寄存器仅�? 0�?99 偏移�? */
 #define APP_RTC_DEFAULT_YEAR      2000U
 
 static uint8_t app_rtc_is_leap_year(uint16_t year);
@@ -69,8 +69,8 @@ void MX_RTC_Init(void)
   }
 
   /* USER CODE BEGIN Check_RTC_BKUP */
-  /* 备份域检查：若 RTC 从未初始化（BKP_DR0 ≠ MAGIC），
-   * 则将时间归零并标记已初始化。后续通过串口 SETTIME 命令校时。 */
+  /* 备份域检查：�? RTC 从未初始化（BKP_DR0 �? MAGIC），
+   * 则将时间归零并标记已初始化�?�后续�?�过串口 SETTIME 命令校时�? */
   HAL_PWR_EnableBkUpAccess();
 
   if (app_rtc_is_initialized() == 0U)
@@ -170,11 +170,11 @@ void HAL_RTC_MspDeInit(RTC_HandleTypeDef* rtcHandle)
 
 /* USER CODE BEGIN 1 */
 /*
- * 读取 RTC 当前日期时间。
+ * 读取 RTC 当前日期时间�?
  *
- * HAL_RTC_GetTime 必须先于 HAL_RTC_GetDate 调用（STM32 HAL 要求：
- * 读 Time 会锁存 Date，确保时间/日期来自同一时刻）。
- * 年份从 HAL 的 0–99 偏移量还原为四位年份。
+ * HAL_RTC_GetTime 必须先于 HAL_RTC_GetDate 调用（STM32 HAL 要求�?
+ * �? Time 会锁�? Date，确保时�?/日期来自同一时刻）�??
+ * 年份�? HAL �? 0�?99 偏移量还原为四位年份�?
  */
 HAL_StatusTypeDef APP_RTC_GetDateTime(APP_RTC_DateTime_t *date_time)
 {
@@ -207,10 +207,10 @@ HAL_StatusTypeDef APP_RTC_GetDateTime(APP_RTC_DateTime_t *date_time)
 }
 
 /*
- * 设置 RTC 日期时间（由串口 SETTIME 命令调用）。
+ * 设置 RTC 日期时间（由串口 SETTIME 命令调用）�??
  *
- * 写入前校验日期合法性，写入成功后标记备份域 MAGIC 字，
- * 使 APP_RTC_IsTimeValid() 返回 true。
+ * 写入前校验日期合法�?�，写入成功后标记备份域 MAGIC 字，
+ * �? APP_RTC_IsTimeValid() 返回 true�?
  */
 HAL_StatusTypeDef APP_RTC_SetDateTime(const APP_RTC_DateTime_t *date_time)
 {
@@ -227,14 +227,14 @@ HAL_StatusTypeDef APP_RTC_SetDateTime(const APP_RTC_DateTime_t *date_time)
   return HAL_OK;
 }
 
-/* 查询 RTC 时间是否已通过 SETTIME 命令校时过（BKP_DR1 存有 VALID_MAGIC）。 */
+/* 查询 RTC 时间是否已�?�过 SETTIME 命令校时过（BKP_DR1 存有 VALID_MAGIC）�?? */
 uint8_t APP_RTC_IsTimeValid(void)
 {
   HAL_PWR_EnableBkUpAccess();
   return (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1) == APP_RTC_BKP_VALID_MAGIC) ? 1U : 0U;
 }
 
-/* 闰年判定：能被 400 整除 → 是；能被 100 整除 → 否；能被 4 整除 → 是。 */
+/* 闰年判定：能�? 400 整除 �? 是；能被 100 整除 �? 否；能被 4 整除 �? 是�?? */
 static uint8_t app_rtc_is_leap_year(uint16_t year)
 {
   if ((year % 400U) == 0U)
@@ -250,7 +250,7 @@ static uint8_t app_rtc_is_leap_year(uint16_t year)
   return ((year % 4U) == 0U) ? 1U : 0U;
 }
 
-/* 返回指定年月的天数（考虑闰年 2 月 = 29 天）。 */
+/* 返回指定年月的天数（考虑闰年 2 �? = 29 天）�? */
 static uint8_t app_rtc_get_days_in_month(uint16_t year, uint8_t month)
 {
   switch (month)
@@ -278,7 +278,7 @@ static uint8_t app_rtc_get_days_in_month(uint16_t year, uint8_t month)
   }
 }
 
-/* Zeller 公式变体：根据年月日计算星期（0=周日, 1=周一, ..., 6=周六）。 */
+/* Zeller 公式变体：根据年月日计算星期�?0=周日, 1=周一, ..., 6=周六）�?? */
 static uint8_t app_rtc_calculate_weekday(uint16_t year, uint8_t month, uint8_t day)
 {
   static const uint8_t month_offset[] = {0U, 3U, 2U, 5U, 0U, 3U, 5U, 1U, 4U, 6U, 2U, 4U};
@@ -319,7 +319,7 @@ static uint8_t app_rtc_calculate_weekday(uint16_t year, uint8_t month, uint8_t d
   }
 }
 
-/* 校验日期时间结构体各字段是否在合法范围内。 */
+/* 校验日期时间结构体各字段是否在合法范围内�? */
 static uint8_t app_rtc_is_datetime_valid(const APP_RTC_DateTime_t *date_time)
 {
   uint8_t days_in_month;
@@ -353,7 +353,7 @@ static uint8_t app_rtc_is_datetime_valid(const APP_RTC_DateTime_t *date_time)
   return 1U;
 }
 
-/* 将校验通过的日期时间写入 RTC 硬件寄存器（BIN 格式）。 */
+/* 将校验�?�过的日期时间写�? RTC 硬件寄存器（BIN 格式）�?? */
 static HAL_StatusTypeDef app_rtc_apply_datetime(const APP_RTC_DateTime_t *date_time)
 {
   RTC_TimeTypeDef time = {0};
@@ -388,20 +388,20 @@ static HAL_StatusTypeDef app_rtc_apply_datetime(const APP_RTC_DateTime_t *date_t
   return HAL_OK;
 }
 
-/* 写备份域寄存器 BKP_DR0，标记 RTC 已完成首次初始化。 */
+/* 写备份域寄存�? BKP_DR0，标�? RTC 已完成首次初始化�? */
 static void app_rtc_mark_initialized(void)
 {
   HAL_PWR_EnableBkUpAccess();
   HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, APP_RTC_BKP_INIT_MAGIC);
 }
 
-/* 读备份域寄存器 BKP_DR0，判断 RTC 是否已完成首次初始化。 */
+/* 读备份域寄存�? BKP_DR0，判�? RTC 是否已完成首次初始化�? */
 static uint8_t app_rtc_is_initialized(void)
 {
   return (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) == APP_RTC_BKP_INIT_MAGIC) ? 1U : 0U;
 }
 
-/* 写备份域寄存器 BKP_DR1，标记/清除 RTC 时间已校时标志。 */
+/* 写备份域寄存�? BKP_DR1，标�?/清除 RTC 时间已校时标志�?? */
 static void app_rtc_mark_time_valid(uint8_t is_valid)
 {
   HAL_PWR_EnableBkUpAccess();

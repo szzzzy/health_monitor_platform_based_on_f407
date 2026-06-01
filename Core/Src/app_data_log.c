@@ -242,6 +242,34 @@ AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app)
     write_ret = emit(ts, sid, st, "LF_HF", vb, "x100");
     if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
 
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ecg_valid);
+    write_ret = emit(ts, sid, st, "ECG_Valid", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ecg_hr);
+    write_ret = emit(ts, sid, st, "ECG_HR", vb, "bpm");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ecg_rr_ms);
+    write_ret = emit(ts, sid, st, "ECG_RR", vb, "ms");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ecg_lead_off);
+    write_ret = emit(ts, sid, st, "ECG_LeadOff", vb, "flags");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%d", (int)app->ecg_filtered);
+    write_ret = emit(ts, sid, st, "ECG_Filtered", vb, "LSB");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ptt_valid);
+    write_ret = emit(ts, sid, st, "PTT_Valid", vb, "bool");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
+    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ptt_ms);
+    write_ret = emit(ts, sid, st, "PTT", vb, "ms");
+    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
+
     return APP_DATA_LOG_OK;
 }
 

@@ -62,6 +62,11 @@ void app_measurement_process(AppState_t *app);
 void app_measurement_update_periodic_flags(AppState_t *app);
 void app_measurement_recover_sensor(AppState_t *app);
 
+/* MAX30102 无新样本看门狗 — 当 sensor_last_sample_tick 长时间未更新时，
+ * 强制执行 I2C 总线恢复 + max30102_init()。
+ * 在主循环每轮和 baseline 采集循环中均需调用。 */
+void app_measurement_service_sensor_watchdog(AppState_t *app);
+
 #ifdef __cplusplus
 }
 #endif

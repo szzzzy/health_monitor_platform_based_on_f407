@@ -1,15 +1,13 @@
 /**
   ******************************************************************************
   * @file    app_ptt.h
-  * @brief   PTT（脉搏传导时间）计算模块
+  * @brief   PTT (脉搏传导时间) — ECG R 峰 → PPG 脉搏波峰时间差
   *
-  * PTT 定义为 ECG R 峰到 PPG 脉搏波峰之间的时间差，反映动脉硬度与血压趋势。
+  * PTT 反映动脉硬度趋势，用于无袖带血压估算的输入特征。
+  * 正常成人 PTT 约 150–400 ms，本模块接受 60–600 ms。
   *
-  * 本模块维护一个最近的 ECG R 峰时间戳环形缓冲区，
-  * 当 PPG 模块检测到脉搏波峰时，查找对应的 ECG 参考 R 峰，
-  * 计算 PTT = PPG 波峰时间 - ECG R 峰时间。
-  *
-  * PTT 有效范围：60-600 ms，超出范围的结果被标记为无效。
+  * 统一时间基准：ECG R 峰时间戳 (HAL_GetTick ms) 与 PPG 波峰时间戳
+  * (通过样本序号反推到 ms) 使用同一 HAL Tick 时钟。
   ******************************************************************************
   */
 #ifndef __APP_PTT_H__
@@ -21,14 +19,11 @@ extern "C" {
 
 #include "app_state.h"
 
-/* 重置 PTT 状态与 ECG 峰值历史 */
 void app_ptt_reset(AppState_t *app);
-
-/* 将新的 ECG R 峰时间戳写入历史环形缓冲区 */
 void app_ptt_add_ecg_peak(uint32_t r_peak_ms);
-
-/* PPG 波峰到达时调用：查找匹配的 ECG R 峰，计算 PTT 并更新 AppState */
-void app_ptt_update_from_ppg_peak(AppState_t *app, uint32_t ppg_peak_sample, uint32_t ppg_total_samples);
+void app_ptt_update_from_ppg_peak(AppState_t *app,
+                                  uint32_t ppg_peak_sample,
+                                  uint32_t ppg_total_samples);
 
 #ifdef __cplusplus
 }

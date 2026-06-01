@@ -1,81 +1,57 @@
 /**
   ******************************************************************************
   * @file    app_ptt.c
-  * @brief   PTT（脉搏传导时间）计算
+  * @brief   PTT 计算：PPG 脉搏波峰时刻 − ECG R 峰时刻
   *
-  * PTT = PPG 脉搏波峰时刻 - ECG R 峰时刻
-  *
-  * 生理意义：
-  *   PTT 与动脉硬度负相关，可作为无袖带血压估算的输入特征。
-  *   正常成人 PTT 范围约 150-400 ms，本模块接受 60-600 ms。
-  *
-  * 实现要点：
-  *   1. 维护最近 4 个 ECG R 峰时间戳的环形缓冲区
-  *   2. PPG 波峰到达时，将 PPG 样本序号换算为绝对时间
-  *   3. 在 ECG 历史中查找 PPG 波峰之前最近的 R 峰作为参考
-  *   4. PTT = PPG 波峰时间 - ECG R 峰时间
-  *   5. 超出 [MIN, MAX] 范围的结果标记为无效
+  * 维护最近 4 个 ECG R 峰时间戳环形缓冲区。
+  * PPG 波峰到达时查找其之前最近的 ECG R 峰，计算时间差。
+  * PTT ∈ [60, 600] ms，越界结果标记无效并清零。
+  * 导联脱落、手指离开、ECG/PPG 复位时清空 PTT 状态。
   ******************************************************************************
   */
 
 #include "app_ptt.h"
-
 #include <string.h>
 
-/* PTT 有效范围：60-600 ms */
 #define APP_PTT_MIN_MS                60U
 #define APP_PTT_MAX_MS                600U
-
-/* ECG R 峰环形缓冲区大小 */
 #define APP_PTT_ECG_PEAK_HISTORY_SIZE 4U
 
-/* ECG 峰值历史环形缓冲区 */
 static struct
 {
-  uint32_t r_peak_ms[APP_PTT_ECG_PEAK_HISTORY_SIZE]; /* 时间戳数组 */
-  uint8_t count;       /* 已存储的有效条目数 (≤ HISTORY_SIZE) */
-  uint8_t write_index; /* 下一次写入位置 */
+  uint32_t r_peak_ms[APP_PTT_ECG_PEAK_HISTORY_SIZE];
+  uint8_t  count;
+  uint8_t  write_index;
 } ptt_ecg_state;
 
-/* === 内部辅助函数 ========================================================== */
+/* PPG 样本序号 → 绝对 ms 时间戳 */
+static uint32_t app_ptt_ppg_sample_to_ms(const AppState_t *app,
+                                         uint32_t peak_sample,
+                                         uint32_t total_samples);
 
-/* 将 PPG 样本序号换算为绝对时间 (ms)
- * 基于当前传感器总样本数和最后采样时刻反推 */
-static uint32_t app_ptt_ppg_peak_sample_to_ms(const AppState_t *app,
-                                              uint32_t ppg_peak_sample,
-                                              uint32_t ppg_total_samples);
-
-/* 在 ECG R 峰历史中查找 PPG 波峰之前最近的一个 */
-static uint8_t app_ptt_find_reference_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms);
+/* 在 ECG 历史中查找 PPG 波峰之前最近的有效 R 峰 */
+static uint8_t app_ptt_find_ref_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms);
 
 /* ========================================================================== */
-/*  PTT 模块重置                                                               */
+/*  PTT 模块重置 — 清空 ECG 峰历史与 AppState PTT 字段                          */
 /* ========================================================================== */
 void app_ptt_reset(AppState_t *app)
 {
   (void)memset(&ptt_ecg_state, 0, sizeof(ptt_ecg_state));
-
-  if (app == NULL)
+  if (app != NULL)
   {
-    return;
+    app->ptt_valid = 0U;
+    app->ptt_ms    = 0U;
   }
-
-  app->ptt_valid = 0U;
-  app->ptt_ms = 0U;
 }
 
 /* ========================================================================== */
-/*  记录新的 ECG R 峰到环形缓冲区                                               */
-/*  由 app_ecg 模块在检测到有效 R 峰后调用                                      */
+/*  ECG 有效 R 峰到达 → 写入环形缓冲区                                          */
 /* ========================================================================== */
 void app_ptt_add_ecg_peak(uint32_t r_peak_ms)
 {
-  if (r_peak_ms == 0UL)
-  {
-    return;
-  }
+  if (r_peak_ms == 0UL) return;
 
-  /* 环形写入 */
   ptt_ecg_state.r_peak_ms[ptt_ecg_state.write_index] = r_peak_ms;
   ptt_ecg_state.write_index = (uint8_t)((ptt_ecg_state.write_index + 1U) %
                                         APP_PTT_ECG_PEAK_HISTORY_SIZE);
@@ -86,30 +62,20 @@ void app_ptt_add_ecg_peak(uint32_t r_peak_ms)
 }
 
 /* ========================================================================== */
-/*  PPG 波峰到达时调用：查找匹配的 ECG R 峰，计算 PTT                           */
+/*  PPG 有效波峰到达 → 查找匹配 ECG R 峰 → 计算 PTT                             */
 /*                                                                             */
-/*  前置条件：                                                                  */
-/*    - ECG 信号有效 (ecg_valid != 0)                                          */
-/*    - 导联未脱落 (ecg_lead_off == 0)                                         */
-/*    - 存在最近的 ECG R 峰时间戳                                               */
-/*                                                                             */
-/*  步骤：                                                                      */
-/*    1. 将 PPG 样本序号转换为绝对时间戳                                        */
-/*    2. 在 ECG 峰值历史中查找 PPG 波峰之前最近的 R 峰                          */
-/*    3. 计算时间差并验证是否在 [60, 600] ms 范围内                             */
+/*  前置条件：ECG 有效、导联未脱落、已有 ECG R 峰记录                             */
+/*  任一前置条件失败 → 标记 ptt_valid=0                                         */
 /* ========================================================================== */
-void app_ptt_update_from_ppg_peak(AppState_t *app, uint32_t ppg_peak_sample, uint32_t ppg_total_samples)
+void app_ptt_update_from_ppg_peak(AppState_t *app,
+                                  uint32_t ppg_peak_sample,
+                                  uint32_t ppg_total_samples)
 {
-  uint32_t ppg_peak_ms;
-  uint32_t r_peak_ms;
-  uint32_t ptt_ms;
+  uint32_t ppg_peak_ms, r_peak_ms, ptt_ms, ppg_age_ms;
 
-  if (app == NULL)
-  {
-    return;
-  }
+  if (app == NULL) return;
 
-  /* 前置条件检查 */
+  /* 前置条件 */
   if ((app->ecg_valid == 0U) ||
       (app->ecg_lead_off != 0U) ||
       (app->ecg_r_peak_ms == 0UL))
@@ -118,102 +84,90 @@ void app_ptt_update_from_ppg_peak(AppState_t *app, uint32_t ppg_peak_sample, uin
     return;
   }
 
-  /* 1. PPG 样本序号 → 绝对时间 */
-  ppg_peak_ms = app_ptt_ppg_peak_sample_to_ms(app, ppg_peak_sample, ppg_total_samples);
+  ppg_peak_ms = app_ptt_ppg_sample_to_ms(app, ppg_peak_sample, ppg_total_samples);
 
-  /* 2. 查找 ECG 参考 R 峰 */
-  if (app_ptt_find_reference_r_peak(ppg_peak_ms, &r_peak_ms) == 0U)
+  /*
+   * 时间基准可靠性检查：
+   * PPG 样本在 FIFO 积压后批量补读时，sensor_last_sample_tick 是
+   * 消费时刻而非真实采样时刻，导致 ppg_peak_ms 推算值偏晚。
+   * 若推算的峰值年龄 > 30 ms，说明存在 FIFO 积压延迟，PTT 不可信。
+   */
+  ppg_age_ms = (HAL_GetTick() >= ppg_peak_ms) ? (HAL_GetTick() - ppg_peak_ms) : 0U;
+  if (ppg_age_ms > 30U)
   {
     app->ptt_valid = 0U;
     return;
   }
 
-  /* 3. 计算 PTT 并验证范围 */
+  if (app_ptt_find_ref_r_peak(ppg_peak_ms, &r_peak_ms) == 0U)
+  {
+    app->ptt_valid = 0U;
+    return;
+  }
+
   ptt_ms = ppg_peak_ms - r_peak_ms;
+
+  /* 越界检查：PTT 必须在 [MIN, MAX] ms 内 */
   if ((ptt_ms < APP_PTT_MIN_MS) || (ptt_ms > APP_PTT_MAX_MS))
   {
     app->ptt_valid = 0U;
     return;
   }
 
-  app->ptt_ms = (uint16_t)ptt_ms;
+  app->ptt_ms    = (uint16_t)ptt_ms;
   app->ptt_valid = 1U;
 }
 
 /* ========================================================================== */
-/*  PPG 样本序号 → 绝对时间戳 (ms)                                              */
+/*  PPG 样本序号 → ms 时间戳                                                    */
 /*                                                                             */
-/*  原理：                                                                      */
-/*    已知最后采样时刻 sensor_last_sample_tick (HAL Tick)，                     */
-/*    以及当前总样本数 ppg_total_samples。                                      */
-/*    PPG 波峰样本与最后样本之间的时间差 = 样本数差 × 采样周期 (10 ms)。       */
-/*    波峰时刻 = sensor_last_sample_tick - 时间差。                             */
+/*  PPG 在 100 Hz 节拍下采样 (10 ms/样本)，最后样本时刻为                        */
+/*  sensor_last_sample_tick (HAL Tick)。                                        */
+/*  PPG 波峰时刻 = last_tick − (total − 1 − peak_sample) × 10 ms               */
 /* ========================================================================== */
-static uint32_t app_ptt_ppg_peak_sample_to_ms(const AppState_t *app,
-                                              uint32_t ppg_peak_sample,
-                                              uint32_t ppg_total_samples)
+static uint32_t app_ptt_ppg_sample_to_ms(const AppState_t *app,
+                                         uint32_t peak_sample,
+                                         uint32_t total_samples)
 {
-  uint32_t current_sample;
-  uint32_t delta_samples;
-  uint32_t delta_ms;
+  uint32_t last_sample, delta_samples, delta_ms;
 
-  if ((app == NULL) || (ppg_total_samples == 0U))
-  {
-    return HAL_GetTick();
-  }
+  if ((app == NULL) || (total_samples == 0U)) return HAL_GetTick();
 
-  /* 最后样本序号 = 总样本数 - 1 */
-  current_sample = ppg_total_samples - 1U;
+  last_sample = total_samples - 1U;
+  if (peak_sample > last_sample) return app->sensor_last_sample_tick;
 
-  /* 波峰样本序号不能超过最后样本 */
-  if (ppg_peak_sample > current_sample)
-  {
-    return app->sensor_last_sample_tick;
-  }
-
-  delta_samples = current_sample - ppg_peak_sample;
+  delta_samples = last_sample - peak_sample;
   delta_ms = delta_samples * APP_SAMPLE_PERIOD_MS;
 
-  /* 时间差不能超过传感器运行时间 */
-  if (delta_ms > app->sensor_last_sample_tick)
-  {
-    return 0UL;
-  }
+  if (delta_ms > app->sensor_last_sample_tick) return 0UL;
 
   return app->sensor_last_sample_tick - delta_ms;
 }
 
 /* ========================================================================== */
-/*  在 ECG R 峰历史中查找 PPG 波峰之前最近的 R 峰                               */
+/*  在 ECG R 峰历史中查找 PPG 波峰之前最近的一个                                  */
 /*                                                                             */
-/*  搜索策略：从最新到最旧遍历环形缓冲区，返回第一个 ≤ ppg_peak_ms 的峰。       */
-/*  这保证 PTT = PPG 时刻 - 该 PPG 波之前的最后一个 ECG R 峰。                  */
+/*  从最新到最旧遍历环形缓冲区，返回第一个 ≤ ppg_peak_ms 的 R 峰。               */
+/*  这使得 PTT = max(PPG 时间 − 该 PPG 波之前最近的 ECG R 峰)。                  */
 /* ========================================================================== */
-static uint8_t app_ptt_find_reference_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms)
+static uint8_t app_ptt_find_ref_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms)
 {
-  uint8_t i;
-  uint8_t index;
-  uint32_t candidate_ms;
+  uint8_t  i, index;
+  uint32_t candidate;
 
-  if ((r_peak_ms == NULL) || (ptt_ecg_state.count == 0U))
-  {
-    return 0U;
-  }
+  if ((r_peak_ms == NULL) || (ptt_ecg_state.count == 0U)) return 0U;
 
-  /* 从最新条目 (write_index - 1) 向最旧遍历 */
   for (i = 0U; i < ptt_ecg_state.count; i++)
   {
     index = (uint8_t)((ptt_ecg_state.write_index + APP_PTT_ECG_PEAK_HISTORY_SIZE - 1U - i) %
                       APP_PTT_ECG_PEAK_HISTORY_SIZE);
-    candidate_ms = ptt_ecg_state.r_peak_ms[index];
+    candidate = ptt_ecg_state.r_peak_ms[index];
 
-    /* 找到第一个 ≤ PPG 波峰时刻的 R 峰 */
-    if ((candidate_ms != 0UL) && (candidate_ms <= ppg_peak_ms))
+    if ((candidate != 0UL) && (candidate <= ppg_peak_ms))
     {
-      *r_peak_ms = candidate_ms;
+      *r_peak_ms = candidate;
       return 1U;
     }
   }
-
   return 0U;
 }

@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : 主程序入口与应用层调试
+  * @brief          : 主程序入口与应用层调�?
   * @attention
   *
   * <h2><center>&copy; Copyright (c) 2026 STMicroelectronics.
@@ -24,18 +24,20 @@
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
-#include "iwdg.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
 
+#include "adc.h"
 #include "app_data_log.h"
 #include "app_display.h"
+#include "app_ecg.h"
 #include "app_measurement.h"
 #include "app_protocol.h"
 #include "app_sd_card.h"
+#include "iwdg.h"
 #include "max30102.h"
 #include "ssd1306.h"
 /* USER CODE END Includes */
@@ -67,18 +69,18 @@ static AppState_t app;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-/* 初始化共享状态，并让各模块完成自己的默认配置。 */
+/* 初始化共享状态，并让各模块完成自己的默认配置�? */
 static void app_state_init(AppState_t *app);
-/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态。 */
+/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状�?��?? */
 static void app_send_report_if_due(AppState_t *app);
-/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态。 */
+/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状�?��?? */
 static void app_refresh_display_if_needed(AppState_t *app);
 static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/* 应用层统一初始化入口，main 中只保留调度。 */
+/* 应用层统�?初始化入口，main 中只保留调度�? */
 static void app_state_init(AppState_t *app)
 {
   if (app == NULL)
@@ -92,7 +94,7 @@ static void app_state_init(AppState_t *app)
   app_protocol_init();
 }
 
-/* 把“是否上报”的时序控制收口到一个函数里，避免主循环继续膨胀。 */
+/* 把�?�是否上报�?�的时序控制收口到一个函数里，避免主循环继续膨胀�? */
 static void app_send_report_if_due(AppState_t *app)
 {
   AppDataLogStatus_t log_status;
@@ -110,7 +112,7 @@ static void app_send_report_if_due(AppState_t *app)
   app_update_sd_log_status(app, log_status);
 }
 
-/* OLED 刷新单独封装，让主循环更像调度器而不是细节堆场。 */
+/* OLED 刷新单独封装，让主循环更像调度器而不是细节堆场�?? */
 static void app_refresh_display_if_needed(AppState_t *app)
 {
   if ((app == NULL) || (app->display_refresh_requested == 0U))
@@ -179,12 +181,12 @@ int main(void)
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
   HAL_TIM_Base_Start_IT(&htim6);
-  /* 启动显示、读取 RTC，并先给出开机状态页。 */
+  /* 启动显示、读�? RTC，并先给出开机状态页�? */
   ssd1306_Init();
   app_protocol_update_rtc_snapshot(&app);
   app_display_status_page(&app, "MAX30102 INIT", "SYSTEM BOOT");
 
-  /* 传感器初始化失败时，保留串口命令与错误状态显示，便于现场排查。 */
+  /* 传感器初始化失败时，保留串口命令与错误状态显示，便于现场排查�? */
   if (max30102_init() != HAL_OK)
   {
     while (1)
@@ -201,14 +203,14 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* SD 卡日志：延迟到首次 APP_DataLog_WriteRecord() 时懒启动，
-   * 避免坏卡/无卡在启动阶段阻塞主功能（MAX30102/OLED/RTC/按键/串口）。
-   * 此处仅初始化内部静态变量，不执行硬件访问。 */
+  /* SD 卡日志：延迟到首�? APP_DataLog_WriteRecord() 时懒启动�?
+   * 避免坏卡/无卡在启动阶段阻塞主功能（MAX30102/OLED/RTC/按键/串口）�??
+   * 此处仅初始化内部静�?�变量，不执行硬件访问�?? */
   APP_DataLog_Init();
   app_update_sd_log_status(&app, APP_DATA_LOG_OK);
   APP_Watchdog_Refresh();
 
-  /* 上电先采集一段“无手指”背景，建立 IR 基线。 */
+  /* 上电先采集一段�?�无手指”背景，建立 IR 基线�? */
   while (app_measurement_baseline_ready() == 0U)
   {
     app_protocol_poll_uart_commands(&app);
@@ -219,6 +221,8 @@ int main(void)
     {
       APP_Watchdog_Refresh();
     }
+
+    app_measurement_service_sensor_watchdog(&app);
 
     if ((HAL_GetTick() - last_status_tick) >= 200U)
     {
@@ -234,7 +238,7 @@ int main(void)
     HAL_Delay(APP_MAIN_LOOP_DELAY_MS);
   }
 
-  /* 基线就绪后，给后台跟踪器播种并立即发送一帧初始状态。 */
+  /* 基线就绪后，给后台跟踪器播种并立即发送一帧初始状态�?? */
   app.baseline_ir = app_measurement_get_baseline_average();
   app.baseline_range_ir = app_measurement_get_baseline_range();
   {
@@ -254,7 +258,7 @@ int main(void)
   app.baseline_ir = app_measurement_get_tracked_baseline();
   app_protocol_send_sensor_report(&app);
 
-  /* 根据采集到的波动范围提示“稳定 / 噪声偏大”。 */
+  /* 根据采集到的波动范围提示“稳�? / 噪声偏大”�?? */
   (void)snprintf(status_line, sizeof(status_line), "BASE:%lu", (unsigned long)app.baseline_ir);
   if (app_measurement_baseline_is_stable() != 0U)
   {
@@ -267,6 +271,9 @@ int main(void)
 
   app.report_due = 1U;
   app.display_refresh_requested = 1U;
+
+  /* ECG ADC 在 PPG 基线完成后启动，避免 baseline 阶段（~5 秒）DMA 无消费导致必然覆盖 */
+  app_ecg_adc_start();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -275,12 +282,14 @@ int main(void)
   {
     /*
      * 主循环保持为”调度器”角色：
-     * - 轮询串口命令（DMA+IDLE，非阻塞）
+     * - 消费 ECG DMA 样本 (TIM3 250 Hz �? DMA �? 本循环每拍消�?)
+     * - 轮询串口命令（DMA+IDLE，非阻塞�?
      * - 处理按键（软件消抖）
-     * - max30102_should_service_fifo() 门控传感器读取
+     * - max30102_should_service_fifo() 门控传感器读�?
      * - 推进 BPM/SpO2 算法 + 波形显示
      * - 200 ms 周期统一上报 + 刷新 OLED
      */
+    app_ecg_process_samples(&app);
     app_protocol_poll_uart_commands(&app);
     app_display_handle_buttons(&app);
 
@@ -314,10 +323,13 @@ int main(void)
       }
     }
 
-    /* 基于 HAL_GetTick() 的独立 200ms 显示刷新节拍。
-     * 不依赖 MAX30102 采样是否成功 —— SD 阻塞导致 FIFO 溢出、读失败时，
-     * app_measurement_update_periodic_flags 不会运行，此计时器确保
-     * OLED/RTC 仍能按 200ms 周期刷新。 */
+    /* Drain queued samples before declaring MAX30102 stale. */
+    app_measurement_service_sensor_watchdog(&app);
+
+    /* 基于 HAL_GetTick() 的独�? 200ms 显示刷新节拍�?
+     * 不依�? MAX30102 采样是否成功 —�?? SD 阻塞导致 FIFO 溢出、读失败时，
+     * app_measurement_update_periodic_flags 不会运行，此计时器确�?
+     * OLED/RTC 仍能�? 200ms 周期刷新�? */
     {
       static uint32_t last_display_tick = 0;
       uint32_t now = HAL_GetTick();
@@ -328,10 +340,10 @@ int main(void)
       }
     }
 
-    /* 显示优先于 SD 日志写入：
-     * 若 SD 写入阻塞（FatFs/sync/HAL 超时），OLED 已在当前迭代刷新完毕。
-     * 注意 app_refresh_display_if_needed 只执行一次 ssd1306_UpdateScreen，
-     * 不触碰 SD 卡，本身是 O(1) I2C 操作。 */
+    /* 显示优先�? SD 日志写入�?
+     * �? SD 写入阻塞（FatFs/sync/HAL 超时），OLED 已在当前迭代刷新完毕�?
+     * 注意 app_refresh_display_if_needed 只执行一�? ssd1306_UpdateScreen�?
+     * 不触�? SD 卡，本身�? O(1) I2C 操作�? */
     app_refresh_display_if_needed(&app);
     app_send_report_if_due(&app);
     APP_Watchdog_Refresh();

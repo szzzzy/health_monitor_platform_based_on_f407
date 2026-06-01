@@ -27,6 +27,7 @@
 #include "app_oxy_status.h"
 #include "app_ppg_pulse.h"
 #include "app_ppg_signal.h"
+#include "app_ptt.h"
 #include "app_rr.h"
 #include "app_spo2_filter.h"
 #include "i2c.h"
@@ -48,6 +49,12 @@
 #define APP_CONTACT_SETTLE_SAMPLES        200U
 /* beat-based PI 超时：无新 beat 超过此窗口则标无效 */
 #define APP_PI_STALE_SAMPLES              (MAX30102_ALGO_SAMPLE_RATE_HZ * 5U)
+/* 传感器无新样本看门狗超时 (ms) */
+#define APP_SENSOR_STALE_TIMEOUT_MS       3000U
+#define APP_SENSOR_STALE_CONFIRM_INTERVAL_MS 1000U
+#define APP_SENSOR_STALE_CONFIRM_COUNT       3U
+/* 两次恢复尝试之间的最小间隔 (ms) */
+#define APP_SENSOR_RECOVERY_RETRY_MS      5000U
 
 /* FIFO 读取缓冲：SpO2 模式每样本 6 字节 (RED[3] + IR[3]) */
 static uint8_t fifo_buf[6];
@@ -64,6 +71,10 @@ static struct
 } sample_debug_state;
 /* BPM 评估抽头计数器：每 N 个样本才跑一次完整 BPM 计算 */
 static uint8_t bpm_update_decimator;
+/* A delayed main loop must get a chance to drain FIFO before bus recovery. */
+static uint32_t sensor_last_recovery_tick = 0UL;
+static uint32_t sensor_last_stale_probe_tick = 0UL;
+static uint8_t  sensor_stale_probe_count = 0U;
 
 static void app_reset_measurement_outputs(AppState_t *app);
 static void app_invalidate_advanced_outputs(AppState_t *app);
@@ -87,6 +98,8 @@ void app_measurement_reset_runtime(void)
   app_ppg_signal_reset_envelope();
   app_reset_advanced_metrics(NULL);
   app_display_reset_waveforms();
+  sensor_last_stale_probe_tick = 0UL;
+  sensor_stale_probe_count = 0U;
 }
 
 /*
@@ -110,9 +123,19 @@ uint8_t app_measurement_collect_baseline_sample(AppState_t *app)
   {
     if (read_status == HAL_BUSY)
     {
-      app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
       app->sensor_read_busy_count++;
-      app->sensor_error_streak = 0U;
+      if (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY)
+      {
+        app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
+        app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+        if (app->sensor_error_streak < 0xFFU)
+        {
+          app->sensor_error_streak++;
+        }
+        app_measurement_recover_sensor(app);
+        return 0U;
+      }
+      app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
       return 0U;
     }
 
@@ -134,6 +157,8 @@ uint8_t app_measurement_collect_baseline_sample(AppState_t *app)
   app->sensor_error_streak = 0U;
   app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
   app->sensor_last_sample_tick = HAL_GetTick();
+  sensor_last_stale_probe_tick = 0UL;
+  sensor_stale_probe_count = 0U;
   return 1U;
 }
 
@@ -248,15 +273,27 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
     app->sensor_error_streak = 0U;
     app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
     app->sensor_last_sample_tick = HAL_GetTick();
+    sensor_last_stale_probe_tick = 0UL;
+    sensor_stale_probe_count = 0U;
     return APP_MEASUREMENT_READ_OK;
   }
 
   if (read_status == HAL_BUSY)
   {
-    app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
     app->sensor_read_busy_count++;
-    app->sensor_error_streak = 0U;
-    app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
+    /* BUSY + I2C 故障 → 返回 ERROR，走阈值恢复路径 */
+    if (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY)
+    {
+      app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
+      app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+      if (app->sensor_error_streak < 0xFFU)
+      {
+        app->sensor_error_streak++;
+      }
+      return APP_MEASUREMENT_READ_ERROR;
+    }
+    /* BUSY + I2C READY → FIFO 暂时空或溢出清空后的等待，保留 WAIT */
+    app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
     return APP_MEASUREMENT_READ_WAIT;
   }
 
@@ -498,6 +535,7 @@ void app_measurement_process(AppState_t *app)
     if (app_ppg_pulse_update(app, ir_waveform_sample, spo2_state.total_samples, &pulse_info) != 0U)
     {
       app_ppg_pulse_process_metrics(app, &pulse_info, spo2_state.total_samples);
+      app_ptt_update_from_ppg_peak(app, pulse_info.latest_peak_sample, spo2_state.total_samples);
     }
   }
 
@@ -581,11 +619,75 @@ void app_measurement_update_periodic_flags(AppState_t *app)
   app->display_refresh_requested = 1U;
 }
 
+/* 上次恢复尝试的时间戳，用于限频。上电初始化为 0，避免首次被限频拦截。 */
 /*
- * 传感器恢复：连续 I2C 错误超阈值后重建 I2C 总线 + MAX30102 初始化。
+ * 统一限频恢复入口 — I2C 总线恢复 + MAX30102 重新初始化 + 算法输出重置。
  *
- * 恢复成功 → 清错误计数、重置测量输出、重新播种基线跟踪。
- * 恢复失败 → 保持错误状态，等下个周期重试。
+ * 限频：两次恢复尝试间隔 >= APP_SENSOR_RECOVERY_RETRY_MS。
+ * 成功 → 清空错误计数、重置算法输出、重新播种基线、触发 OLED 刷新。
+ * 失败 → 保持 error_streak 在阈值，由上层在下个周期重新触发。
+ *
+ * 同时被 ERROR 路径 (app_measurement_recover_sensor) 和
+ * stale 看门狗 (app_measurement_service_sensor_watchdog) 调用。
+ */
+static void app_measurement_do_recovery(AppState_t *app)
+{
+  uint32_t now;
+
+  if (app == NULL) return;
+
+  now = HAL_GetTick();
+
+  /* 限频 */
+  if ((sensor_last_recovery_tick != 0UL) &&
+      ((now - sensor_last_recovery_tick) < APP_SENSOR_RECOVERY_RETRY_MS))
+  {
+    return;
+  }
+
+  sensor_last_recovery_tick = now;
+
+  /* I2C 总线恢复 */
+  if (MX_I2C1_RecoverBus() != HAL_OK)
+  {
+    app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+    app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
+    return;
+  }
+
+  /* MAX30102 重新初始化 */
+  if (max30102_init() != HAL_OK)
+  {
+    app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+    app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
+    return;
+  }
+
+  /* 恢复成功 — 清理错误状态并重置算法输出 */
+  app->sensor_error_streak = 0U;
+  app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
+  app->sensor_recover_count++;
+  /* Give MAX30102 time to publish its first sample after reset. */
+  app->sensor_last_sample_tick = now;
+  sensor_last_stale_probe_tick = 0UL;
+  sensor_stale_probe_count = 0U;
+  app->finger_present = 0U;
+  app->finger_on_confirm_count = 0U;
+  app->finger_off_confirm_count = 0U;
+  app_ppg_signal_reset_envelope();
+  app_reset_measurement_outputs(app);
+  max30102_baseline_seed_tracking(&baseline_data,
+                                  app->baseline_ir,
+                                  APP_PPG_SIGNAL_REACQUIRE_NOISE_IR);
+  app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
+  app_ptt_reset(app);
+  app->display_refresh_requested = 1U;
+  app->report_due = 1U;
+}
+
+/*
+ * 传感器 ERROR 路径恢复入口。
+ * 连续错误达到阈值后由主循环调用，内部统一走限频恢复。
  */
 void app_measurement_recover_sensor(AppState_t *app)
 {
@@ -594,31 +696,61 @@ void app_measurement_recover_sensor(AppState_t *app)
     return;
   }
 
-  if (MX_I2C1_RecoverBus() != HAL_OK)
+  app_measurement_do_recovery(app);
+}
+
+/*
+ * MAX30102 无新样本看门狗。
+ * sensor_last_sample_tick 超 STALE_TIMEOUT_MS 或上电后长期无样本 → 触发限频恢复。
+ */
+void app_measurement_service_sensor_watchdog(AppState_t *app)
+{
+  uint32_t now;
+  uint8_t  sample_stale = 0U;
+
+  if (app == NULL) return;
+
+  now = HAL_GetTick();
+
+  if ((app->sensor_last_sample_tick != 0UL) &&
+      ((now - app->sensor_last_sample_tick) > APP_SENSOR_STALE_TIMEOUT_MS))
   {
-    app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
-    app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+    sample_stale = 1U;
+  }
+
+  if ((app->sensor_read_ok_count == 0UL) &&
+      (now > (APP_SENSOR_STALE_TIMEOUT_MS + 500U)))
+  {
+    sample_stale = 1U;
+  }
+
+  if (sample_stale == 0U)
+  {
+    sensor_last_stale_probe_tick = 0UL;
+    sensor_stale_probe_count = 0U;
     return;
   }
 
-  if (max30102_init() != HAL_OK)
+  /* OLED/SD work can delay the main loop. Confirm a persistent stall before
+   * clearing MAX30102 FIFO and rebuilding the shared I2C bus. */
+  if ((sensor_last_stale_probe_tick != 0UL) &&
+      ((now - sensor_last_stale_probe_tick) < APP_SENSOR_STALE_CONFIRM_INTERVAL_MS))
   {
-    app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
-    app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
     return;
   }
 
-  app->sensor_error_streak = 0U;
-  app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
-  app->sensor_recover_count++;
-  app_ppg_signal_reset_envelope();
-  app_reset_measurement_outputs(app);
-  max30102_baseline_seed_tracking(&baseline_data,
-                                  app->baseline_ir,
-                                  APP_PPG_SIGNAL_REACQUIRE_NOISE_IR);
-  app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
-  app->display_refresh_requested = 1U;
-  app->report_due = 1U;
+  sensor_last_stale_probe_tick = now;
+  if (sensor_stale_probe_count < 0xFFU)
+  {
+    sensor_stale_probe_count++;
+  }
+
+  if (sensor_stale_probe_count < APP_SENSOR_STALE_CONFIRM_COUNT)
+  {
+    return;
+  }
+
+  app_measurement_do_recovery(app);
 }
 
 /* 手指状态切换时重置全部测量输出：波形、SpO2 窗口、滤波器、motion、包络等。 */
@@ -644,6 +776,9 @@ static void app_reset_measurement_outputs(AppState_t *app)
   app->contact_settle_samples = 0U;
   app_oxy_status_reset(app);
   app_reset_advanced_metrics(app);
+
+  /* PTT 依赖 PPG 脉搏波峰与 ECG R 峰的时间差，手指状态切换后旧历史无效 */
+  app_ptt_reset(app);
 }
 
 /* 信号中断/motion 时仅标无效，不清 buffer，中断结束可立即恢复。 */

@@ -172,7 +172,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
 
   (void)snprintf(buffer,
                  buffer_size,
-                 "M,%u,%04u%02u%02u,%02u%02u%02u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%u,%u",
+                 "M,%u,%04u%02u%02u,%02u%02u%02u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%d,%u,%u,%lu,%lu,%lu,%lu,%lu",
                  (unsigned int)app->rtc_time_valid,
                  (unsigned int)year,
                  (unsigned int)month,
@@ -247,7 +247,21 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
                  (unsigned long)app->display_refresh_count,
                  (unsigned long)app->display_last_refresh_tick,
                  (unsigned int)app->display_brightness_index,
-                 (unsigned int)app->current_page);
+                 (unsigned int)app->current_page,
+                 /* ECG/PTT 追加字段 — 旧上位机忽略尾部即可 */
+                 (unsigned int)app->ecg_valid,
+                 (unsigned int)app->ecg_hr,
+                 (unsigned int)app->ecg_rr_ms,
+                 (unsigned int)app->ecg_lead_off,
+                 (unsigned long)app->ecg_r_peak_ms,
+                 (int)app->ecg_filtered,
+                 (unsigned int)app->ptt_valid,
+                 (unsigned int)app->ptt_ms,
+                 (unsigned long)app->ecg_sample_count,
+                 (unsigned long)app->ecg_adc_sat_count,
+                 (unsigned long)app->ecg_dma_overflow_count,
+                 (unsigned long)app->ecg_lead_off_count,
+                 (unsigned long)app->ecg_no_r_peak_timeout_count);
 
   return (uint16_t)strlen(buffer);
 }

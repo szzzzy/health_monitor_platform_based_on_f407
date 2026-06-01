@@ -713,12 +713,16 @@ HAL_StatusTypeDef max30102_read_fifo(uint8_t *fifo_data, uint16_t data_len)
 
   /* 短轮询等待 DMA 完成：6 字节 @ 400 kHz I2C ≈ 135 µs 传输时间。 */
   {
-    uint32_t timeout = HAL_GetTick() + 5U;
+    uint32_t start_tick = HAL_GetTick();
 
     while (i2c_dma_busy != 0U)
     {
-      if (HAL_GetTick() >= timeout)
+      if ((HAL_GetTick() - start_tick) >= 5U)
       {
+        /* DMA stuck: abort both streams, then let the application recovery
+         * path fully rebuild I2C1 and reinitialize the MAX30102. */
+        if (hi2c1.hdmatx != NULL) { (void)HAL_DMA_Abort(hi2c1.hdmatx); }
+        if (hi2c1.hdmarx != NULL) { (void)HAL_DMA_Abort(hi2c1.hdmarx); }
         i2c_dma_busy = 0U;
         return HAL_TIMEOUT;
       }

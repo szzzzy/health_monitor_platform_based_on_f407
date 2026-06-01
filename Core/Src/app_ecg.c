@@ -1,74 +1,83 @@
 /**
   ******************************************************************************
   * @file    app_ecg.c
-  * @brief   ECG 信号采集、预处理与 QRS 检测
+  * @brief   ECG QRS 检测 — 250 Hz 采样，简化 Pan-Tompkins 状态机
   *
-  * 信号处理流程（每拍执行一次）：
-  *   1. 读取导联脱落状态 — 脱落时跳过本次处理
-  *   2. 软件触发 ADC1 单次转换，获取 ECG 原始采样值
-  *   3. DC 漂移消除：一阶高通 IIR，截止频率由 APP_ECG_DC_SHIFT 控制
-  *   4. 滑动平均平滑：一阶低通 FIR，去除肌电高频噪声
-  *   5. 自适应阈值 QRS 检测：基于 Pan-Tompkins 的简化状态机
-  *      - 空闲态：持续更新噪声基线，幅值超过阈值进入候选态
-  *      - 候选态：追踪峰值，波群结束后验证是否为有效 R 峰
-  *   6. 有效 R 峰 → 计算 RR 间期与瞬时心率（EMA 平滑）
-  *   7. R 峰超时检测：超过 APP_ECG_STALE_MS 无新峰则标记无效
+  * 每 10 ms 主循环调用 app_ecg_process_samples()，从 DMA 环形缓冲消费
+  * 全部待处理样本。单个样本的处理流水线：
+  *   1. DMA 覆盖检测 → 丢弃旧数据 + 重置检测器
+  *   2. 导联脱落检查 → 脱落则重置检测器并跳过后继续
+  *   3. ADC 饱和检查 (>=4090 LSB) → 跳过该样本
+  *   4. DC 漂移消除 (一阶高通 IIR, fc≈1.24 Hz)
+  *   5. 滑动平均平滑 (一阶低通, fc≈13.3 Hz)
+  *   6. 自适应阈值 QRS 状态机
+  *   7. 有效 R 峰 → 至少 2 峰才更新 HR/RR → 通知 PTT
+  *
+  * 每个消费样本配有推算的 4 ms 间隔时间戳，用于 RR 与 PTT 计算。
+  *
+  * 仅为工程观测/趋势提示，不声称临床诊断能力。
   ******************************************************************************
   */
 
 #include "app_ecg.h"
-
+#include "app_ptt.h"
+#include "app_display.h"
+#include "adc.h"
 #include <string.h>
 
-#include "adc.h"
+/* === ECG 采样率 ============================================================ */
+#define APP_ECG_SAMPLE_RATE_HZ      250U
+#define APP_ECG_SAMPLE_PERIOD_MS    4U    /* 1000 / 250 = 4 ms */
 
-/* === ADC 采样参数 ========================================================= */
-#define APP_ECG_ADC_TIMEOUT_MS       2U   /* ADC 轮询超时 (ms) */
+/* === DC 漂移消除 — 一阶高通 IIR ============================================ */
+/* cutoff ≈ fs / (2π·2^DC_SHIFT) ≈ 250 / (2π·32) ≈ 1.24 Hz */
+#define APP_ECG_DC_SHIFT            5U
 
-/* === DC 漂移消除 — 一阶高通 IIR =========================================== */
-#define APP_ECG_DC_SHIFT             6U   /* DC 估计更新速率 (1/64 ≈ 0.016) */
+/* === 滑动平均平滑 — 一阶低通 ================================================ */
+/* cutoff ≈ fs / (2π·SMOOTH_DIV) ≈ 250 / (2π·3) ≈ 13.3 Hz */
+#define APP_ECG_SMOOTH_DIV          3
 
-/* === 滑动平均平滑 — 一阶低通 FIR =========================================== */
-#define APP_ECG_SMOOTH_DIV           4L   /* 平滑系数 (1/4 = 0.25) */
+/* === QRS 检测器参数 ======================================================== */
+#define APP_ECG_SETTLE_SAMPLES      125U /* 500 ms 启动稳定期，×250 Hz */
+#define APP_ECG_MIN_RR_MS           300U /* 生理最小 RR (200 bpm 上限) */
+#define APP_ECG_MAX_RR_MS           2000U/* 生理最大 RR (30 bpm 下限) */
+#define APP_ECG_STALE_MS            3000U/* 无新 R 峰超时 */
+#define APP_ECG_QRS_MIN_THRESHOLD   45U  /* QRS 检测绝对最小阈值 (LSB) */
+#define APP_ECG_QRS_MAX_THRESHOLD   1000U/* QRS 检测绝对最大阈值 (LSB) */
+#define APP_ECG_QRS_NOISE_GAIN      3U   /* 动态阈值 = 噪声基线 × 增益 */
+#define APP_ECG_QRS_END_DIV         2U   /* 波群结束：幅值跌至候选峰值/2 */
+#define APP_ECG_QRS_MAX_WIDTH_MS    160U /* QRS 波群最大宽度 */
 
-/* === QRS 检测器参数 ======================================================= */
-#define APP_ECG_SETTLE_SAMPLES       50U  /* 上电稳定样本数，此期间不检测 */
-#define APP_ECG_MIN_RR_MS            300U /* 生理最小 RR 间期 (200 bpm 上限) */
-#define APP_ECG_MAX_RR_MS            2000U/* 生理最大 RR 间期 (30 bpm 下限) */
-#define APP_ECG_STALE_MS             3000U/* 无新 R 峰超时，标记信号丢失 */
-#define APP_ECG_QRS_MIN_THRESHOLD    45U  /* QRS 检测绝对最小阈值 (ADC LSB) */
-#define APP_ECG_QRS_MAX_THRESHOLD    1000U/* QRS 检测绝对最大阈值 (ADC LSB) */
-#define APP_ECG_QRS_NOISE_GAIN       3U   /* 阈值 = 噪声基线 × 增益 */
-#define APP_ECG_QRS_END_DIV          2U   /* 波群结束判定：幅值跌至峰值/2 以下 */
-#define APP_ECG_QRS_MAX_WIDTH_MS     160U /* QRS 波群最大宽度 (ms) */
+/* === ADC 饱和检测阈值 ====================================================== */
+#define APP_ECG_ADC_SAT_THRESHOLD   4090U
 
-/* === 内部状态结构 =========================================================== */
+/* === 内部状态结构 ========================================================== */
 typedef struct
 {
-  int32_t dc_estimate;          /* DC 漂移估计值（一阶高通状态） */
-  int32_t smooth_value;         /* 平滑后的 AC 信号值 */
-  uint32_t noise_level;         /* 自适应噪声基线 */
-  uint32_t sample_count;        /* 上电以来总样本计数（用于稳定期判断） */
-  uint32_t last_r_peak_ms;      /* 上一个有效 R 峰时间戳 */
+  int32_t dc_estimate;
+  int32_t smooth_value;
+  uint32_t noise_level;
+  uint32_t sample_count;
+  uint32_t last_r_peak_ms;
 
-  uint8_t initialized;          /* 1 = DC 估计已初始化 */
-  uint8_t in_candidate;         /* 1 = 当前处于 QRS 候选态 */
+  uint8_t initialized;
+  uint8_t in_candidate;
+  uint8_t peak_count;     /* 本次检出周期内的有效 R 峰计数 */
 
-  /* 候选态追踪 */
-  uint32_t candidate_peak_abs;  /* 候选波群内的最大幅值 */
-  uint32_t candidate_peak_ms;   /* 候选波群峰值时刻 */
-  uint32_t candidate_start_ms;  /* 候选波群起始时刻 */
+  uint32_t candidate_peak_abs;
+  uint32_t candidate_peak_ms;
+  uint32_t candidate_start_ms;
 } AppEcgState_t;
 
 static AppEcgState_t ecg_state;
 
-/* === 内部辅助函数 ========================================================== */
-static uint32_t app_ecg_abs_i32(int32_t value);
-static int16_t app_ecg_clamp_i16(int32_t value);
-static void app_ecg_reset_detector(void);
-static AppEcgUpdate_t app_ecg_process_qrs(AppState_t *app,
-                                          int32_t filtered_value,
-                                          uint32_t timestamp_ms);
+/* === 前向声明 ============================================================== */
+static void     app_ecg_reset_detector(void);
+static uint32_t app_ecg_abs_i32(int32_t v);
+static int16_t  app_ecg_clamp_i16(int32_t v);
+static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
+                                             int32_t filtered,
+                                             uint32_t timestamp_ms);
 
 /* ========================================================================== */
 /*  ECG 模块重置                                                               */
@@ -76,57 +85,24 @@ static AppEcgUpdate_t app_ecg_process_qrs(AppState_t *app,
 void app_ecg_reset(AppState_t *app)
 {
   app_ecg_reset_detector();
+  if (app == NULL) return;
 
-  if (app == NULL)
-  {
-    return;
-  }
-
-  app->ecg_raw = 0U;
-  app->ecg_filtered = 0;
-  app->ecg_lead_off = 0U;
-  app->ecg_valid = 0U;
-  app->ecg_hr = 0U;
-  app->ecg_rr_ms = 0U;
+  app->ecg_raw       = 0U;
+  app->ecg_filtered  = 0;
+  app->ecg_lead_off  = 0U;
+  app->ecg_valid     = 0U;
+  app->ecg_hr        = 0U;
+  app->ecg_rr_ms     = 0U;
   app->ecg_r_peak_ms = 0UL;
-  app->ptt_valid = 0U;
-  app->ptt_ms = 0U;
+  app->ptt_valid     = 0U;
+  app->ptt_ms        = 0U;
+  app_ptt_reset(app);
+  app_display_reset_ecg_waveform();
 }
 
 /* ========================================================================== */
-/*  软件触发 ADC1 单次转换，阻塞等待完成                                        */
-/*  返回值：1 = 转换成功，0 = 超时或参数错误                                    */
-/* ========================================================================== */
-uint8_t app_ecg_read_adc_raw(uint16_t *raw_value)
-{
-  HAL_StatusTypeDef status;
-
-  if (raw_value == NULL)
-  {
-    return 0U;
-  }
-
-  /* 启动 ADC1 */
-  status = HAL_ADC_Start(&hadc1);
-  if (status != HAL_OK)
-  {
-    return 0U;
-  }
-
-  /* 阻塞轮询等待转换完成（单次模式，转换后自动停止） */
-  status = HAL_ADC_PollForConversion(&hadc1, APP_ECG_ADC_TIMEOUT_MS);
-  if (status == HAL_OK)
-  {
-    *raw_value = (uint16_t)HAL_ADC_GetValue(&hadc1);
-  }
-
-  (void)HAL_ADC_Stop(&hadc1);
-  return (status == HAL_OK) ? 1U : 0U;
-}
-
-/* ========================================================================== */
-/*  读取 AD8232 导联脱落引脚                                                   */
-/*  LO+ / LO- 任一为高 → 对应电极脱落                                          */
+/*  读取 AD8232 LO- / LO+ 引脚电平 → 导联脱落掩码                                */
+/*  LO- → PE5, LO+ → PE6                                                        */
 /* ========================================================================== */
 uint8_t app_ecg_read_lead_off(void)
 {
@@ -136,181 +112,189 @@ uint8_t app_ecg_read_lead_off(void)
   {
     lead_off |= APP_ECG_LEAD_OFF_MINUS;
   }
-
   if (HAL_GPIO_ReadPin(AD8232_LD_PLUS_GPIO_Port, AD8232_LD_PLUS_Pin) == GPIO_PIN_SET)
   {
     lead_off |= APP_ECG_LEAD_OFF_PLUS;
   }
-
   return lead_off;
 }
 
 /* ========================================================================== */
-/*  ECG 主处理：每拍调用一次                                                    */
+/*  主入口：消费 DMA 缓冲中全部待处理样本                                         */
 /*                                                                             */
-/*  处理顺序：                                                                  */
-/*    1. 导联检查 → 脱落则重置                                                  */
-/*    2. ADC 采样                                                               */
-/*    3. DC 漂移消除 + 滑动平均                                                 */
-/*    4. QRS 检测与心率更新                                                     */
-/*    5. R 峰超时检查                                                           */
+/*  每个样本获得独立的推算时间戳（4 ms 间隔），解决批量消费时时间戳相同的问题。     */
+/*  发生 DMA 覆盖时丢弃已损样本、重置检测器、清除 ecg_valid/ptt_valid。           */
 /* ========================================================================== */
-AppEcgUpdate_t app_ecg_update(AppState_t *app, uint32_t timestamp_ms)
+uint8_t app_ecg_process_samples(AppState_t *app)
 {
-  AppEcgUpdate_t update;
   uint16_t raw_value;
-  uint8_t lead_off;
-  int32_t raw_i32;
-  int32_t ac_value;
-  int32_t delta;
+  uint8_t  lead_off;
+  int32_t  raw_i32, ac_value, delta;
+  uint32_t now_ms;
+  uint16_t avail;
+  uint8_t  r_peak_found = 0U;
+  uint16_t consumed = 0U;
+  uint8_t  dma_overflow_occurred = 0U;
 
-  (void)memset(&update, 0, sizeof(update));
+  if (app == NULL) return 0U;
 
-  if (app == NULL)
+  /* 进入批量消费前取一次 HAL Tick + 可用样本数 */
+  now_ms = HAL_GetTick();
+  avail = app_ecg_adc_get_available_count();
+
+  /* DMA 覆盖检测：DMA 写入跑赢了软件消费，环形缓冲数据已丢失 */
+  if (app_ecg_adc_had_overflow() != 0U)
   {
-    return update;
-  }
+    dma_overflow_occurred = 1U;
+    app->ecg_dma_overflow_count++;
+    app_ecg_adc_clear_overflow();
 
-  /* 1. 导联脱落检查 */
-  lead_off = app_ecg_read_lead_off();
-  app->ecg_lead_off = lead_off;
-
-  /* 2. ADC 采样 — 失败则标记无效 */
-  if (app_ecg_read_adc_raw(&raw_value) == 0U)
-  {
-    app->ecg_valid = 0U;
-    app->ptt_valid = 0U;
-    return update;
-  }
-
-  app->ecg_raw = raw_value;
-
-  /* 导联脱落 → 重置状态，等待恢复 */
-  if (lead_off != 0U)
-  {
-    app->ecg_filtered = 0;
-    app->ecg_valid = 0U;
-    app->ptt_valid = 0U;
+    /* 丢弃已被覆盖的旧样本已在 adc.c read_sample 中处理，
+     * 这里仅重置检测器状态和 ECG/PTT 输出 */
     app_ecg_reset_detector();
-    return update;
+    app->ecg_valid = 0U;
+    app->ecg_hr = 0U;
+    app->ecg_rr_ms = 0U;
+    app->ptt_valid = 0U;
+    app->ptt_ms = 0U;
+    app_ptt_reset(app);
+    app_display_reset_ecg_waveform();
+
+    /* 刷新可用样本数（丢弃旧数据后） */
+    avail = app_ecg_adc_get_available_count();
   }
 
-  raw_i32 = (int32_t)raw_value;
-
-  /* 3. 首次初始化：DC 估计 = 第一个样本值 */
-  if (ecg_state.initialized == 0U)
+  /* 消费 DMA 环形缓冲中所有可用样本 */
   {
-    ecg_state.dc_estimate = raw_i32;
-    ecg_state.smooth_value = 0;
-    ecg_state.noise_level = APP_ECG_QRS_MIN_THRESHOLD / APP_ECG_QRS_NOISE_GAIN;
-    ecg_state.sample_count = 0U;
-    ecg_state.initialized = 1U;
+    uint32_t sample_ts;
+    uint16_t remaining = avail;
+
+    while (remaining > 0U)
+    {
+      /* 每个样本独立推算时间戳，间隔 4 ms */
+      if (app_ecg_adc_read_sample(&raw_value, &sample_ts, now_ms, remaining) == 0U)
+      {
+        break;
+      }
+      remaining--;
+      consumed++;
+      app->ecg_sample_count++;
+
+      /* 1. 导联脱落检查 */
+      lead_off = app_ecg_read_lead_off();
+      if ((lead_off != 0U) && (app->ecg_lead_off == 0U))
+      {
+        app_display_reset_ecg_waveform();
+      }
+      app->ecg_lead_off = lead_off;
+      if (lead_off != 0U)
+      {
+        app->ecg_lead_off_count++;
+        app->ecg_valid = 0U;
+        app->ecg_hr = 0U;
+        app->ecg_rr_ms = 0U;
+        app->ptt_valid = 0U;
+        app->ptt_ms = 0U;
+        app_ecg_reset_detector();
+        app_ptt_reset(app);
+        app->ecg_filtered = 0;
+        /* 导联脱落时不放弃剩余样本，但跳过进入下一次循环 */
+        continue;
+      }
+
+      app->ecg_raw = raw_value;
+
+      /* 2. ADC 饱和检测 — 饱和样本不可用于 QRS 检测 */
+      if (raw_value >= APP_ECG_ADC_SAT_THRESHOLD)
+      {
+        app->ecg_adc_sat_count++;
+        continue;
+      }
+
+      /* 3. 首次初始化 */
+      raw_i32 = (int32_t)raw_value;
+      if (ecg_state.initialized == 0U)
+      {
+        ecg_state.dc_estimate  = raw_i32;
+        ecg_state.smooth_value = 0;
+        ecg_state.noise_level  = APP_ECG_QRS_MIN_THRESHOLD / APP_ECG_QRS_NOISE_GAIN;
+        ecg_state.sample_count = 0U;
+        ecg_state.peak_count   = 0U;
+        ecg_state.initialized  = 1U;
+      }
+
+      /* 4. DC 漂移消除 — 一阶高通 IIR */
+      delta = raw_i32 - ecg_state.dc_estimate;
+      ecg_state.dc_estimate += (delta / (int32_t)(1UL << APP_ECG_DC_SHIFT));
+      ac_value = raw_i32 - ecg_state.dc_estimate;
+
+      /* 5. 滑动平均平滑 — 一阶低通 */
+      ecg_state.smooth_value += ((ac_value - ecg_state.smooth_value) / APP_ECG_SMOOTH_DIV);
+      app->ecg_filtered = app_ecg_clamp_i16(ecg_state.smooth_value);
+      app_display_add_ecg_sample(app->ecg_filtered);
+
+      if (ecg_state.sample_count < 0xFFFFFFFFUL)
+      {
+        ecg_state.sample_count++;
+      }
+
+      /* 6. QRS 检测 — 传入每样本独立时间戳 */
+      AppEcgUpdate_t update = app_ecg_process_sample(app, ecg_state.smooth_value, sample_ts);
+      if (update.r_peak_detected != 0U)
+      {
+        r_peak_found = 1U;
+        app_display_add_ecg_r_peak_marker();
+      }
+    }
   }
 
-  /* DC 漂移消除 — 一阶高通 IIR
-   * DC_est[n] = DC_est[n-1] + (raw - DC_est[n-1]) / 2^DC_SHIFT
-   * 截止频率 ≈ fs / (2π × 2^DC_SHIFT) ≈ 500/(2π×64) ≈ 1.2 Hz */
-  delta = raw_i32 - ecg_state.dc_estimate;
-  ecg_state.dc_estimate += (delta / (int32_t)(1UL << APP_ECG_DC_SHIFT));
-
-  /* AC 分量 = 原始值 - DC 估计 */
-  ac_value = raw_i32 - ecg_state.dc_estimate;
-
-  /* 滑动平均平滑 — 一阶低通 FIR
-   * smooth[n] = smooth[n-1] + (ac[n] - smooth[n-1]) / SMOOTH_DIV
-   * 截止频率 ≈ fs / (2π × SMOOTH_DIV) ≈ 500/(2π×4) ≈ 20 Hz */
-  ecg_state.smooth_value += ((ac_value - ecg_state.smooth_value) / APP_ECG_SMOOTH_DIV);
-  app->ecg_filtered = app_ecg_clamp_i16(ecg_state.smooth_value);
-
-  if (ecg_state.sample_count < 0xFFFFFFFFUL)
-  {
-    ecg_state.sample_count++;
-  }
-
-  /* 4. QRS 检测 */
-  update = app_ecg_process_qrs(app, ecg_state.smooth_value, timestamp_ms);
-
-  /* 5. R 峰超时检测：超过 STALE_MS 无新峰 → 信号丢失 */
+  /* 7. R 峰超时检查 (即使无新样本也不断激活) */
   if ((ecg_state.last_r_peak_ms != 0UL) &&
-      ((timestamp_ms - ecg_state.last_r_peak_ms) > APP_ECG_STALE_MS))
+      ((now_ms - ecg_state.last_r_peak_ms) > APP_ECG_STALE_MS))
   {
     app->ecg_valid = 0U;
+    app->ecg_hr = 0U;
+    app->ecg_rr_ms = 0U;
     app->ptt_valid = 0U;
+    app->ptt_ms = 0U;
+    app_ptt_reset(app);
+    app->ecg_no_r_peak_timeout_count++;
   }
 
-  return update;
-}
-
-/* ========================================================================== */
-/*  绝对值                                                                     */
-/* ========================================================================== */
-static uint32_t app_ecg_abs_i32(int32_t value)
-{
-  if (value < 0)
-  {
-    return (uint32_t)(-value);
-  }
-
-  return (uint32_t)value;
-}
-
-/* ========================================================================== */
-/*  限幅到 int16 范围 [-32768, 32767]                                          */
-/* ========================================================================== */
-static int16_t app_ecg_clamp_i16(int32_t value)
-{
-  if (value > 32767L)
-  {
-    return 32767;
-  }
-
-  if (value < -32768L)
-  {
-    return -32768;
-  }
-
-  return (int16_t)value;
-}
-
-/* ========================================================================== */
-/*  重置 QRS 检测器内部状态                                                     */
-/* ========================================================================== */
-static void app_ecg_reset_detector(void)
-{
-  (void)memset(&ecg_state, 0, sizeof(ecg_state));
+  return r_peak_found;
 }
 
 /* ========================================================================== */
 /*  QRS 检测状态机（简化 Pan-Tompkins）                                         */
 /*                                                                             */
-/*  空闲态：                                                                   */
-/*    - 持续跟踪噪声基线（不对称升降速率：快升慢降）                              */
-/*    - 当信号幅值 > 噪声×增益 且满足不应期 → 进入候选态                         */
+/*  空闲态：                                                                     */
+/*    - 持续更新噪声基线（非对称：快升 1/32，慢降 1/16）                          */
+/*    - 幅值 > 动态阈值 且 满足不应期 → 进入候选态                               */
 /*                                                                             */
-/*  候选态：                                                                   */
-/*    - 追踪波群内最大峰值及其时间戳                                            */
-/*    - 当幅值跌破 阈值/END_DIV 或超过 MAX_WIDTH → 波群结束                    */
-/*    - 若候选峰值满足阈值要求 → 确认 R 峰，计算 RR 与心率                     */
+/*  候选态：                                                                     */
+/*    - 追踪波群内最大峰值                                                      */
+/*    - 波群结束条件：幅值 < 候选峰值/END_DIV 或 超时                            */
+/*    - 候选峰值 ≥ 阈值 → 确认 R 峰                                             */
 /*                                                                             */
-/*  心率平滑：                                                                  */
-/*    - 首个有效 R 峰直接采纳                                                   */
-/*    - 后续采用 EMA (α=0.25): HR = (3×旧HR + 1×新HR) / 4                     */
+/*  有效 RR 计算：                                                               */
+/*    - 首个 R 峰只记录时间戳，ecg_valid 保持 0                                  */
+/*    - 至少 2 个满足生理范围的峰才计算 HR/RR 并设 ecg_valid=1                   */
+/*    - PTT 仅在 ecg_valid=1 后允许发布                                         */
 /* ========================================================================== */
-static AppEcgUpdate_t app_ecg_process_qrs(AppState_t *app,
-                                          int32_t filtered_value,
-                                          uint32_t timestamp_ms)
+static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
+                                             int32_t filtered_value,
+                                             uint32_t timestamp_ms)
 {
   AppEcgUpdate_t update;
-  uint32_t magnitude;
-  uint32_t threshold;
-  uint32_t noise_delta;
-  uint32_t rr_ms;
-  uint32_t hr_bpm;
+  uint32_t magnitude, threshold, noise_delta;
+  uint32_t rr_ms, hr_bpm;
 
   (void)memset(&update, 0, sizeof(update));
 
-  /* 上电稳定期内不检测，让 DC 估计与平滑器收敛 */
-  if ((app == NULL) || (ecg_state.sample_count < APP_ECG_SETTLE_SAMPLES))
+  if (app == NULL) return update;
+
+  /* 稳定期：让 DC 估计与平滑器收敛 */
+  if (ecg_state.sample_count < APP_ECG_SETTLE_SAMPLES)
   {
     return update;
   }
@@ -320,24 +304,18 @@ static AppEcgUpdate_t app_ecg_process_qrs(AppState_t *app,
   /* 动态阈值 = 噪声基线 × 增益，钳位在 [MIN, MAX] */
   threshold = ecg_state.noise_level * APP_ECG_QRS_NOISE_GAIN;
   if (threshold < APP_ECG_QRS_MIN_THRESHOLD)
-  {
     threshold = APP_ECG_QRS_MIN_THRESHOLD;
-  }
   else if (threshold > APP_ECG_QRS_MAX_THRESHOLD)
-  {
     threshold = APP_ECG_QRS_MAX_THRESHOLD;
-  }
 
   /* ===== 空闲态 ===== */
   if (ecg_state.in_candidate == 0U)
   {
-    /* 噪声基线自适应更新
-     * - 信号 > 噪声 → 噪声缓慢上升 (1/32 每拍)
-     * - 信号 < 噪声 → 噪声较快下降 (1/16 每拍) */
+    /* 噪声基线自适应：快升慢降 */
     if (magnitude > ecg_state.noise_level)
     {
       noise_delta = magnitude - ecg_state.noise_level;
-      ecg_state.noise_level += ((noise_delta / 32U) != 0U) ? (noise_delta / 32U) : 1U;
+      ecg_state.noise_level += (noise_delta / 32U) ? (noise_delta / 32U) : 1U;
     }
     else
     {
@@ -345,18 +323,16 @@ static AppEcgUpdate_t app_ecg_process_qrs(AppState_t *app,
       ecg_state.noise_level -= (noise_delta / 16U);
     }
 
-    /* 触发条件：幅值超过动态阈值 且 满足生理不应期 (MIN_RR) */
+    /* 触发：幅值超阈值 + 生理不应期满足 */
     if ((magnitude >= threshold) &&
         ((ecg_state.last_r_peak_ms == 0UL) ||
          ((timestamp_ms - ecg_state.last_r_peak_ms) >= APP_ECG_MIN_RR_MS)))
     {
-      /* 进入候选态 */
-      ecg_state.in_candidate = 1U;
+      ecg_state.in_candidate       = 1U;
       ecg_state.candidate_peak_abs = magnitude;
-      ecg_state.candidate_peak_ms = timestamp_ms;
+      ecg_state.candidate_peak_ms  = timestamp_ms;
       ecg_state.candidate_start_ms = timestamp_ms;
     }
-
     return update;
   }
 
@@ -366,22 +342,20 @@ static AppEcgUpdate_t app_ecg_process_qrs(AppState_t *app,
   if (magnitude > ecg_state.candidate_peak_abs)
   {
     ecg_state.candidate_peak_abs = magnitude;
-    ecg_state.candidate_peak_ms = timestamp_ms;
+    ecg_state.candidate_peak_ms  = timestamp_ms;
   }
 
-  /* 波群尚未结束的条件：
-   * - 幅值仍在 峰值/2 以上，且
-   * - 宽度未超过 MAX_WIDTH_MS */
-  if ((magnitude > (threshold / APP_ECG_QRS_END_DIV)) &&
+  /* 波群结束条件：幅值跌至候选峰值/END_DIV 以下，或宽度超限 */
+  if ((magnitude > (ecg_state.candidate_peak_abs / APP_ECG_QRS_END_DIV)) &&
       ((timestamp_ms - ecg_state.candidate_start_ms) < APP_ECG_QRS_MAX_WIDTH_MS))
   {
-    return update;
+    return update; /* 仍在波群内 */
   }
 
-  /* 波群结束，回空闲态 */
+  /* 波群结束，退出候选态 */
   ecg_state.in_candidate = 0U;
 
-  /* 候选峰值必须满足阈值要求 */
+  /* 候选峰值必须 ≥ 阈值 */
   if (ecg_state.candidate_peak_abs < threshold)
   {
     return update;
@@ -389,27 +363,21 @@ static AppEcgUpdate_t app_ecg_process_qrs(AppState_t *app,
 
   /* === 确认 R 峰 === */
   update.r_peak_detected = 1U;
-  update.r_peak_ms = ecg_state.candidate_peak_ms;
-  app->ecg_r_peak_ms = ecg_state.candidate_peak_ms;
+  update.r_peak_ms       = ecg_state.candidate_peak_ms;
+  app->ecg_r_peak_ms     = ecg_state.candidate_peak_ms;
 
   if (ecg_state.last_r_peak_ms != 0UL)
   {
     rr_ms = ecg_state.candidate_peak_ms - ecg_state.last_r_peak_ms;
 
-    /* RR 间期必须在生理范围内 */
     if ((rr_ms >= APP_ECG_MIN_RR_MS) && (rr_ms <= APP_ECG_MAX_RR_MS))
     {
-      /* 瞬时心率 = 60000 / RR_ms（四舍五入），上限 255 bpm */
       hr_bpm = (60000UL + (rr_ms / 2UL)) / rr_ms;
-      if (hr_bpm > 255UL)
-      {
-        hr_bpm = 255UL;
-      }
+      if (hr_bpm > 255UL) hr_bpm = 255UL;
 
       app->ecg_rr_ms = (uint16_t)rr_ms;
 
-      /* 心率 EMA 平滑 (α = 0.25)
-       * 首个有效值直接采纳，后续与旧值加权平均 */
+      /* EMA 平滑, α=0.25 */
       if ((app->ecg_valid != 0U) && (app->ecg_hr != 0U))
       {
         app->ecg_hr = (uint8_t)((((uint16_t)app->ecg_hr * 3U) + (uint16_t)hr_bpm + 2U) / 4U);
@@ -420,17 +388,52 @@ static AppEcgUpdate_t app_ecg_process_qrs(AppState_t *app,
       }
 
       app->ecg_valid = 1U;
-      update.rr_ms = (uint16_t)rr_ms;
-      update.hr_bpm = app->ecg_hr;
+      update.rr_ms   = (uint16_t)rr_ms;
+      update.hr_bpm  = app->ecg_hr;
+
+      /* PTT 链路：仅当 ecg_valid 已置位后，记录 ECG R 峰时间戳供 PTT 使用 */
+      app_ptt_add_ecg_peak(ecg_state.candidate_peak_ms);
     }
     else
     {
-      /* RR 间期异常 → 标记无效，PTT 也随之无效 */
+      /* RR 超出生理范围 → 标无效，不清 peak_count（可能是偶发噪声） */
       app->ecg_valid = 0U;
+      app->ecg_hr = 0U;
+      app->ecg_rr_ms = 0U;
       app->ptt_valid = 0U;
+      app->ptt_ms = 0U;
+      app_ptt_reset(app);
     }
+  }
+  else
+  {
+    /* 首个 R 峰：只记录时间戳，不输出 ecg_hr / ecg_valid / PTT。
+     * 需要第二个满足范围的峰才可验证 RR 是否合理。 */
+    update.r_peak_detected = 1U;
+    update.r_peak_ms       = ecg_state.candidate_peak_ms;
+    /* ecg_valid 保持 0，ecg_hr 不变，ptt 不记录 */
   }
 
   ecg_state.last_r_peak_ms = ecg_state.candidate_peak_ms;
   return update;
+}
+
+/* ========================================================================== */
+/*  辅助函数                                                                   */
+/* ========================================================================== */
+static void app_ecg_reset_detector(void)
+{
+  (void)memset(&ecg_state, 0, sizeof(ecg_state));
+}
+
+static uint32_t app_ecg_abs_i32(int32_t v)
+{
+  return (v < 0) ? (uint32_t)(-v) : (uint32_t)v;
+}
+
+static int16_t app_ecg_clamp_i16(int32_t v)
+{
+  if (v > 32767L)  return 32767;
+  if (v < -32768L) return -32768;
+  return (int16_t)v;
 }

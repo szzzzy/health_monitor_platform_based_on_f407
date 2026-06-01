@@ -29,10 +29,10 @@ uint8_t ssd1306_FrameBuffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8U];
  * 先发控制字节 0x00 表示后续为命令，再发命令本身。
  * 这里采用阻塞 I2C 发送，SSD1306 命令/数据包最长为 2 字节。
  */
-static void ssd1306_WriteCommand(uint8_t cmd)
+static HAL_StatusTypeDef ssd1306_WriteCommand(uint8_t cmd)
 {
   uint8_t packet[2] = {SSD1306_CONTROL_CMD, cmd};
-  (void)HAL_I2C_Master_Transmit(&hi2c1, SSD1306_I2C_ADDR, packet, sizeof(packet), SSD1306_TIMEOUT_MS);
+  return HAL_I2C_Master_Transmit(&hi2c1, SSD1306_I2C_ADDR, packet, sizeof(packet), SSD1306_TIMEOUT_MS);
 }
 
 /*
@@ -40,18 +40,18 @@ static void ssd1306_WriteCommand(uint8_t cmd)
  * 包格式：0x40 控制字节 + 128 字节数据。
  * 发送前会检查长度，超过 128 字节直接返回。
  */
-static void ssd1306_WriteData(const uint8_t *data, uint16_t size)
+static HAL_StatusTypeDef ssd1306_WriteData(const uint8_t *data, uint16_t size)
 {
   uint8_t packet[SSD1306_WIDTH + 1U];
 
   if (size > SSD1306_WIDTH)
   {
-    return;
+    return HAL_ERROR;
   }
 
   packet[0] = SSD1306_CONTROL_DATA;
   memcpy(&packet[1], data, size);
-  (void)HAL_I2C_Master_Transmit(&hi2c1, SSD1306_I2C_ADDR, packet, size + 1U, SSD1306_TIMEOUT_MS);
+  return HAL_I2C_Master_Transmit(&hi2c1, SSD1306_I2C_ADDR, packet, size + 1U, SSD1306_TIMEOUT_MS);
 }
 
 /*
@@ -196,7 +196,11 @@ void ssd1306_Init(void)
 
   for (i = 0U; i < (sizeof(init_cmds) / sizeof(init_cmds[0])); i++)
   {
-    ssd1306_WriteCommand(init_cmds[i]);
+    if (ssd1306_WriteCommand(init_cmds[i]) != HAL_OK)
+    {
+      /* I2C error during init — continue anyway, UpdateScreen will retry */
+      break;
+    }
   }
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
@@ -205,7 +209,7 @@ void ssd1306_Init(void)
 
 void ssd1306_SetContrast(uint8_t contrast)
 {
-  ssd1306_WriteCommand(0x81U);
+  if (ssd1306_WriteCommand(0x81U) != HAL_OK) { return; }
   ssd1306_WriteCommand(contrast);
 }
 
@@ -229,10 +233,10 @@ void ssd1306_UpdateScreen(void)
 
   for (page = 0U; page < SSD1306_PAGE_COUNT; page++)
   {
-    ssd1306_WriteCommand((uint8_t)(0xB0U + page));
-    ssd1306_WriteCommand(0x00U);
-    ssd1306_WriteCommand(0x10U);
-    ssd1306_WriteData(&ssd1306_FrameBuffer[SSD1306_WIDTH * page], SSD1306_WIDTH);
+    if (ssd1306_WriteCommand((uint8_t)(0xB0U + page)) != HAL_OK) { break; }
+    if (ssd1306_WriteCommand(0x00U) != HAL_OK) { break; }
+    if (ssd1306_WriteCommand(0x10U) != HAL_OK) { break; }
+    if (ssd1306_WriteData(&ssd1306_FrameBuffer[SSD1306_WIDTH * page], SSD1306_WIDTH) != HAL_OK) { break; }
   }
 }
 

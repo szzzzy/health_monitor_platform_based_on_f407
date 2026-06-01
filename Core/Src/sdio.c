@@ -50,20 +50,20 @@ void MX_SDIO_SD_Init(void)
   hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
   hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
   hsd.Init.ClockDiv = 0;
-  /*
-   * Do not probe the card during boot. The logging layer retries SD init later
-   * and reports failures through AppState, while OLED/MAX30102 can still start.
-   */
+  if (HAL_SD_Init(&hsd) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN SDIO_Init 2 */
 
   /* USER CODE END SDIO_Init 2 */
 
 }
 
-/* SDIO MSP is implemented in stm32f4xx_hal_msp.c so the card lines keep
- * their pull-up/IRQ configuration in one place. Keep CubeMX's generated copy
- * disabled to avoid duplicate HAL_SD_MspInit/HAL_SD_MspDeInit symbols. */
-#if 0
 void HAL_SD_MspInit(SD_HandleTypeDef* sdHandle)
 {
 
@@ -136,7 +136,6 @@ void HAL_SD_MspDeInit(SD_HandleTypeDef* sdHandle)
   /* USER CODE END SDIO_MspDeInit 1 */
   }
 }
-#endif
 
 /* USER CODE BEGIN 1 */
 
