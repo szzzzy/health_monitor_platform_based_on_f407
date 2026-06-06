@@ -55,6 +55,7 @@
 #define APP_SENSOR_STALE_CONFIRM_COUNT       3U
 /* 两次恢复尝试之间的最小间隔 (ms) */
 #define APP_SENSOR_RECOVERY_RETRY_MS      5000U
+#define APP_SENSOR_RECOVERY_INIT_ATTEMPTS 2U
 
 /* FIFO 读取缓冲：SpO2 模式每样本 6 字节 (RED[3] + IR[3]) */
 static uint8_t fifo_buf[6];
@@ -75,10 +76,12 @@ static uint8_t bpm_update_decimator;
 static uint32_t sensor_last_recovery_tick = 0UL;
 static uint32_t sensor_last_stale_probe_tick = 0UL;
 static uint8_t  sensor_stale_probe_count = 0U;
+static uint8_t  sensor_recovery_fail_count = 0U;
 
 static void app_reset_measurement_outputs(AppState_t *app);
 static void app_invalidate_advanced_outputs(AppState_t *app);
 static void app_reset_advanced_metrics(AppState_t *app);
+static HAL_StatusTypeDef app_measurement_reinit_sensor(void);
 
 /* 初始化测量子系统的 AppState 字段（手指阈值、包络等）。 */
 void app_measurement_init_state(AppState_t *app)
@@ -100,6 +103,7 @@ void app_measurement_reset_runtime(void)
   app_display_reset_waveforms();
   sensor_last_stale_probe_tick = 0UL;
   sensor_stale_probe_count = 0U;
+  sensor_recovery_fail_count = 0U;
 }
 
 /*
@@ -132,7 +136,6 @@ uint8_t app_measurement_collect_baseline_sample(AppState_t *app)
         {
           app->sensor_error_streak++;
         }
-        app_measurement_recover_sensor(app);
         return 0U;
       }
       app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
@@ -375,6 +378,10 @@ void app_measurement_update_finger_state(AppState_t *app)
     return;
   }
 
+  /* Track background IR during finger-off confirmation window so the baseline
+   * converges toward the true no-finger level before finger is confirmed off. */
+  app_ppg_signal_track_background_ir(app, &baseline_data);
+
   if (app->finger_off_confirm_count < 0xFFU)
   {
     app->finger_off_confirm_count++;
@@ -386,12 +393,10 @@ void app_measurement_update_finger_state(AppState_t *app)
     app->finger_off_confirm_count = 0U;
     app->finger_on_confirm_count = 0U;
 
-    /* 已连续确认无手指，此时当前 IR 就是新的背景。
-     * 直接重播种基线，避免旧的慢速 baseline 让下一次放手指时
-     * ir_delta 被压低，导致 finger_on 迟迟不能重新触发。 */
-    max30102_baseline_seed_tracking(&baseline_data,
-                                    app->ir_value,
-                                    APP_PPG_SIGNAL_REACQUIRE_NOISE_IR);
+    /* Background baseline has been tracked during the off-confirm window via
+     * app_ppg_signal_track_background_ir (called when raw_signal_present==0).
+     * Do not re-seed from a single IR sample here — it may still be elevated
+     * from the finger removal transient and would raise the finger-on threshold. */
     app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
     app_reset_measurement_outputs(app);
     app_ppg_signal_reset_envelope();
@@ -647,48 +652,64 @@ static void app_measurement_do_recovery(AppState_t *app)
 
   sensor_last_recovery_tick = now;
 
-  /* I2C 总线恢复 */
-  if (MX_I2C1_RecoverBus() != HAL_OK)
+  /* I2C bus recovery + MAX30102 re-init. */
+  if (app_measurement_reinit_sensor() != HAL_OK)
   {
     app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+    app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
     app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
+    if (sensor_recovery_fail_count < 0xFFU)
+    {
+      sensor_recovery_fail_count++;
+    }
+    /* Let IWDG handle truly fatal lock-ups; do not NVIC_SystemReset here. */
+    app->sensor_recovery_fail_count = sensor_recovery_fail_count;
     return;
   }
 
-  /* MAX30102 重新初始化 */
-  if (max30102_init() != HAL_OK)
-  {
-    app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
-    app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
-    return;
-  }
-
-  /* 恢复成功 — 清理错误状态并重置算法输出 */
+  /* 恢复成功 — 清理错误状态，保留 finger_present 和算法状态 */
+  now = HAL_GetTick();
+  sensor_recovery_fail_count = 0U;
+  app->sensor_recovery_fail_count = 0U;
   app->sensor_error_streak = 0U;
   app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
+  app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
   app->sensor_recover_count++;
   /* Give MAX30102 time to publish its first sample after reset. */
   app->sensor_last_sample_tick = now;
   sensor_last_stale_probe_tick = 0UL;
   sensor_stale_probe_count = 0U;
-  app->finger_present = 0U;
-  app->finger_on_confirm_count = 0U;
-  app->finger_off_confirm_count = 0U;
-  app_ppg_signal_reset_envelope();
-  app_reset_measurement_outputs(app);
-  max30102_baseline_seed_tracking(&baseline_data,
-                                  app->baseline_ir,
-                                  APP_PPG_SIGNAL_REACQUIRE_NOISE_IR);
-  app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
-  app_ptt_reset(app);
+  sample_debug_state.initialized = 0U;
+  /* Enter short reacquire: keep finger_present so we don't show PLACE FINGER,
+   * but set contact_settle to suppress algorithm output during re-stabilization. */
+  app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
   app->display_refresh_requested = 1U;
   app->report_due = 1U;
 }
 
-/*
- * 传感器 ERROR 路径恢复入口。
- * 连续错误达到阈值后由主循环调用，内部统一走限频恢复。
- */
+/* Runtime recovery helper: clear I2C, then retry MAX30102 init. */
+static HAL_StatusTypeDef app_measurement_reinit_sensor(void)
+{
+  HAL_StatusTypeDef init_status = HAL_ERROR;
+  uint8_t attempt;
+
+  for (attempt = 0U; attempt < APP_SENSOR_RECOVERY_INIT_ATTEMPTS; attempt++)
+  {
+    (void)MX_I2C1_RecoverBus();
+
+    init_status = max30102_init();
+    if (init_status == HAL_OK)
+    {
+      return HAL_OK;
+    }
+
+    HAL_Delay(20U);
+  }
+
+  return init_status;
+}
+
+/* Sensor ERROR-path recovery entry. */
 void app_measurement_recover_sensor(AppState_t *app)
 {
   if ((app == NULL) || (app->sensor_error_streak < APP_SENSOR_RECOVERY_ERROR_COUNT))
@@ -750,6 +771,7 @@ void app_measurement_service_sensor_watchdog(AppState_t *app)
     return;
   }
 
+  app->sensor_stale_count++;
   app_measurement_do_recovery(app);
 }
 

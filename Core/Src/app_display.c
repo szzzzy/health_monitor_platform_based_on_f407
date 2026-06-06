@@ -4,9 +4,9 @@
 
 #include "ssd1306.h"
 
-/* PE3 / PE4 当前作为页面切换按键输入，按下时为低电平。 */
-#define BRIGHTNESS_BUTTON_PORT     GPIOE
-#define BRIGHTNESS_BUTTON_PIN      GPIO_PIN_2
+/* PE2/PE3/PE4 当前作为页面切换和调试按键输入，按下时为低电平。 */
+#define DEBUG_TOGGLE_BUTTON_PORT     GPIOE
+#define DEBUG_TOGGLE_BUTTON_PIN      GPIO_PIN_2
 #define PAGE_PREV_BUTTON_PORT      GPIOE
 #define PAGE_PREV_BUTTON_PIN       GPIO_PIN_3
 #define PAGE_NEXT_BUTTON_PORT      GPIOE
@@ -14,11 +14,6 @@
 /* 轮询按键的简单消抖时间。 */
 #define PAGE_BUTTON_DEBOUNCE_MS    120U
 #define PAGE_BUTTON_DEBOUNCE_TICKS ((PAGE_BUTTON_DEBOUNCE_MS + APP_SAMPLE_PERIOD_MS - 1U) / APP_SAMPLE_PERIOD_MS)
-#define DISPLAY_BRIGHTNESS_LEVEL_COUNT 3U
-#define DISPLAY_BRIGHTNESS_DEFAULT_INDEX 1U
-#define DISPLAY_SENSOR_RECOVER_AGE_MS  3000U
-#define DISPLAY_SENSOR_ERROR_STREAK       8U
-
 /* 波形区域使用 OLED 下半部分，上半部分留给时间与数值文本。 */
 #define OLED_WAVEFORM_TOP_Y        32U
 #define OLED_WAVEFORM_HEIGHT       (SSD1306_HEIGHT - OLED_WAVEFORM_TOP_Y)
@@ -49,8 +44,6 @@ typedef struct
 static WaveformBuffer_t ir_waveform;
 static WaveformBuffer_t red_waveform;
 static WaveformBuffer_t ecg_waveform;
-static const uint8_t display_brightness_table[DISPLAY_BRIGHTNESS_LEVEL_COUNT] = {0x20U, 0x7FU, 0xFFU};
-static const char *const display_brightness_label_table[DISPLAY_BRIGHTNESS_LEVEL_COUNT] = {"LOW", "MID", "HIGH"};
 
 static uint8_t page_button_poll_pressed(PageButton_t *button);
 static void waveform_buffer_reset(WaveformBuffer_t *waveform);
@@ -71,23 +64,19 @@ static void app_display_pulse_page(const AppState_t *app);
 static void app_display_oxy_page(const AppState_t *app);
 static void app_display_vitals_page(const AppState_t *app);
 static void app_display_ecg_page(const AppState_t *app);
-static void app_display_debug_page(const AppState_t *app);
+static void app_display_debug_bus_page(const AppState_t *app);
+static void app_display_debug_signal_page(const AppState_t *app);
 static const char *app_get_quality_label(const AppState_t *app);
 static const char *app_get_balance_label(uint8_t balance_status);
 static const char *app_get_regular_label(const AppState_t *app);
 static const char *app_get_rtc_status_label(const AppState_t *app);
 static const char *app_get_weekday_string(uint8_t weekday);
-static const char *app_get_sensor_status_string(const AppState_t *app);
-static const char *app_get_brightness_label(uint8_t brightness_index);
-static const char *app_get_brightness_short_label(uint8_t brightness_index);
-static void app_display_cycle_brightness(AppState_t *app);
 static void app_format_rtc_lines(const AppState_t *app,
                                  char *time_line,
                                  size_t time_line_size,
                                  char *date_line,
                                  size_t date_line_size);
 
-/* 初始化显示状态，并设置默认页面和按键引脚。 */
 void app_display_init_state(AppState_t *app)
 {
   if (app == NULL)
@@ -97,9 +86,11 @@ void app_display_init_state(AppState_t *app)
 
   app->current_page = DISPLAY_PAGE_BPM;
   app->display_refresh_requested = 1U;
-  app->display_brightness_index = DISPLAY_BRIGHTNESS_DEFAULT_INDEX;
-  app->brightness_button.port = BRIGHTNESS_BUTTON_PORT;
-  app->brightness_button.pin = BRIGHTNESS_BUTTON_PIN;
+  app->debug_mode = 0U;
+  app->debug_sub_page = DBG_SUB_BUS;
+  app->saved_normal_page = DISPLAY_PAGE_BPM;
+  app->debug_toggle_button.port = DEBUG_TOGGLE_BUTTON_PORT;
+  app->debug_toggle_button.pin = DEBUG_TOGGLE_BUTTON_PIN;
   app->page_prev_button.port = PAGE_PREV_BUTTON_PORT;
   app->page_prev_button.pin = PAGE_PREV_BUTTON_PIN;
   app->page_next_button.port = PAGE_NEXT_BUTTON_PORT;
@@ -154,30 +145,69 @@ void app_display_handle_buttons(AppState_t *app)
     return;
   }
 
-  if (page_button_poll_pressed(&app->brightness_button) != 0U)
+  /* PE2: Debug 模式开关 */
+  if (page_button_poll_pressed(&app->debug_toggle_button) != 0U)
   {
-    app_display_cycle_brightness(app);
-    app->display_refresh_requested = 1U;
-  }
-
-  if (page_button_poll_pressed(&app->page_prev_button) != 0U)
-  {
-    if (app->current_page == DISPLAY_PAGE_BPM)
+    if (app->debug_mode == 0U)
     {
-      app->current_page = (DisplayPage_t)(DISPLAY_PAGE_COUNT - 1U);
+      /* 进入 Debug 模式，记住当前普通页面 */
+      app->saved_normal_page = app->current_page;
+      app->debug_mode = 1U;
+      app->debug_sub_page = DBG_SUB_BUS;
     }
     else
     {
-      app->current_page = (DisplayPage_t)(app->current_page - 1U);
+      /* 退出 Debug 模式，回到之前的普通页面 */
+      app->debug_mode = 0U;
+      app->current_page = app->saved_normal_page;
     }
-
     app->display_refresh_requested = 1U;
+    return;
   }
 
-  if (page_button_poll_pressed(&app->page_next_button) != 0U)
+  if (app->debug_mode != 0U)
   {
-    app->current_page = (DisplayPage_t)((app->current_page + 1U) % DISPLAY_PAGE_COUNT);
-    app->display_refresh_requested = 1U;
+    /* Debug 模式下 PE3/PE4 只在 Debug 子页之间切换 */
+    if (page_button_poll_pressed(&app->page_prev_button) != 0U)
+    {
+      if (app->debug_sub_page == DBG_SUB_BUS)
+      {
+        app->debug_sub_page = (DebugSubPage_t)(DBG_SUB_COUNT - 1U);
+      }
+      else
+      {
+        app->debug_sub_page = (DebugSubPage_t)(app->debug_sub_page - 1U);
+      }
+      app->display_refresh_requested = 1U;
+    }
+
+    if (page_button_poll_pressed(&app->page_next_button) != 0U)
+    {
+      app->debug_sub_page = (DebugSubPage_t)((app->debug_sub_page + 1U) % DBG_SUB_COUNT);
+      app->display_refresh_requested = 1U;
+    }
+  }
+  else
+  {
+    /* 常规模式下 PE3/PE4 只在普通页面之间切换（不含 DEBUG） */
+    if (page_button_poll_pressed(&app->page_prev_button) != 0U)
+    {
+      if (app->current_page == DISPLAY_PAGE_BPM)
+      {
+        app->current_page = (DisplayPage_t)(DISPLAY_PAGE_NORMAL_COUNT - 1U);
+      }
+      else
+      {
+        app->current_page = (DisplayPage_t)(app->current_page - 1U);
+      }
+      app->display_refresh_requested = 1U;
+    }
+
+    if (page_button_poll_pressed(&app->page_next_button) != 0U)
+    {
+      app->current_page = (DisplayPage_t)((app->current_page + 1U) % DISPLAY_PAGE_NORMAL_COUNT);
+      app->display_refresh_requested = 1U;
+    }
   }
 }
 
@@ -186,6 +216,23 @@ void app_display_measurement_page(const AppState_t *app)
 {
   if (app == NULL)
   {
+    return;
+  }
+
+  /* Debug 模式下绘制 Debug 子页面 */
+  if (app->debug_mode != 0U)
+  {
+    switch (app->debug_sub_page)
+    {
+      case DBG_SUB_SIGNAL:
+        app_display_debug_signal_page(app);
+        break;
+
+      case DBG_SUB_BUS:
+      default:
+        app_display_debug_bus_page(app);
+        break;
+    }
     return;
   }
 
@@ -201,10 +248,6 @@ void app_display_measurement_page(const AppState_t *app)
 
     case DISPLAY_PAGE_ECG:
       app_display_ecg_page(app);
-      break;
-
-    case DISPLAY_PAGE_DEBUG:
-      app_display_debug_page(app);
       break;
 
     case DISPLAY_PAGE_BPM:
@@ -586,100 +629,117 @@ static void app_display_ecg_page(const AppState_t *app)
 }
 
 /*
- * 调试页：黄色区 (y=0,8) 放原始值，蓝色区 (y>=16) 放 RTC 和运行统计。
+ * DEBUG BUS 页：8 行纯文本，显示总线/传感器诊断信息。
  */
-static void app_display_debug_page(const AppState_t *app)
+static void app_display_debug_bus_page(const AppState_t *app)
 {
-  char time_line[32];
-  char line_signal[32];
-  char line_signal_r[8];
-  char line_fifo[24];
-  char line_ok_busy[24];
-  char line_err_recover[24];
-  char line_quality[24];
-  char line_tail[32];
-  char line_sd[24];
+  char line[8][24];
   const char *sd_status;
-  uint32_t sd_written;
+  uint32_t age_s;
+  uint32_t ok;
+  uint32_t busy;
+  uint32_t err;
+  uint32_t rc;
+  uint32_t stale;
+  uint32_t i2c;
+  uint32_t ovf;
 
   if (app == NULL) { return; }
 
-  /* RTC 时间 + 样本年龄放在蓝色区 y=16 */
-  if (app->rtc_read_ok != 0U)
-  {
-    uint32_t sample_age_ms = (app->sensor_last_sample_tick != 0U) ?
-                             (HAL_GetTick() - app->sensor_last_sample_tick) : 0U;
-    (void)snprintf(time_line, sizeof(time_line),
-                   "%02u:%02u:%02u AGE:%lu",
-                   (unsigned int)app->rtc_datetime.hours,
-                   (unsigned int)app->rtc_datetime.minutes,
-                   (unsigned int)app->rtc_datetime.seconds,
-                   (unsigned long)sample_age_ms);
-  }
-  else { (void)snprintf(time_line, sizeof(time_line), "--:--:--"); }
+  age_s = (app->sensor_last_sample_tick != 0U) ?
+          ((HAL_GetTick() - app->sensor_last_sample_tick) / 1000UL) : 0UL;
+  if (age_s > 9999UL) { age_s = 9999UL; }
+  ok    = (app->sensor_read_ok_count      > 9999UL) ? 9999UL : app->sensor_read_ok_count;
+  busy  = (app->sensor_read_busy_count    > 9999UL) ? 9999UL : app->sensor_read_busy_count;
+  err   = (app->sensor_read_error_count   > 9999UL) ? 9999UL : app->sensor_read_error_count;
+  rc    = (app->sensor_recover_count      > 9999UL) ? 9999UL : app->sensor_recover_count;
+  stale = (app->sensor_stale_count        > 9999UL) ? 9999UL : app->sensor_stale_count;
+  i2c   = (app->sensor_last_i2c_error     > 9999UL) ? 9999UL : app->sensor_last_i2c_error;
+  ovf   = (uint32_t)app->sensor_fifo_overflow_count;
 
-  /* --- y=0 左侧：原始 R/I，右侧："D" 或 warm-up 倒计时 --- */
-  (void)snprintf(line_signal, sizeof(line_signal),
-                 "R:%lu I:%lu",
-                 (unsigned long)app->red_value,
-                 (unsigned long)app->ir_value);
-  if (app->contact_settle_samples > 0U)
-  {
-    (void)snprintf(line_signal_r, sizeof(line_signal_r), "W%u",
-                   (unsigned int)app->contact_settle_samples);
-  }
-  else
-  {
-    (void)snprintf(line_signal_r, sizeof(line_signal_r), "D");
-  }
-
-  (void)snprintf(line_fifo, sizeof(line_fifo),
-                 "W:%u R:%u A:%u",
+  (void)snprintf(line[0], sizeof(line[0]), "DBG BUS");
+  (void)snprintf(line[1], sizeof(line[1]), "AGE %lus", (unsigned long)age_s);
+  (void)snprintf(line[2], sizeof(line[2]), "READ OK %lu", (unsigned long)ok);
+  (void)snprintf(line[3], sizeof(line[3]), "BUSY %lu ERR %lu",
+                 (unsigned long)busy, (unsigned long)err);
+  (void)snprintf(line[4], sizeof(line[4]), "RECOVER %lu STALE %lu",
+                 (unsigned long)rc, (unsigned long)stale);
+  (void)snprintf(line[5], sizeof(line[5]), "I2C %lu OVF %lu",
+                 (unsigned long)i2c, (unsigned long)ovf);
+  (void)snprintf(line[6], sizeof(line[6]), "FIFO W%u R%u N%u",
                  (unsigned int)app->sensor_fifo_write_ptr,
                  (unsigned int)app->sensor_fifo_read_ptr,
                  (unsigned int)app->sensor_fifo_available_samples);
-  (void)snprintf(line_ok_busy, sizeof(line_ok_busy),
-                 "OK:%lu B:%lu ER:%lu",
-                 (unsigned long)app->sensor_read_ok_count,
-                 (unsigned long)app->sensor_read_busy_count,
-                 (unsigned long)app->sensor_read_error_count);
-  (void)snprintf(line_err_recover, sizeof(line_err_recover),
-                 "RC:%lu M:%u a%u",
-                 (unsigned long)app->sensor_recover_count,
-                 (unsigned int)app->motion_score,
-                 (unsigned int)(app->motion_artifact));
-  (void)snprintf(line_quality, sizeof(line_quality),
-                 "SQ:%u PI:%u.%u I:%u",
-                 (unsigned int)app->signal_quality,
-                 (unsigned int)(app->signal_ir_pi_x1000 / 10U),
-                 (unsigned int)(app->signal_ir_pi_x1000 % 10U),
-                 (unsigned int)app->accepted_ibi_count);
-  (void)snprintf(line_tail, sizeof(line_tail),
-                 "F:%u RAW:%u ON:%u OFF:%u",
-                 (unsigned int)app->finger_present,
-                 (unsigned int)app->raw_signal_present,
-                 (unsigned int)app->finger_on_confirm_count,
-                 (unsigned int)app->finger_off_confirm_count);
   sd_status = (app->sd_log_active != 0U) ? "OK" :
               ((app->sd_log_error != 0U) ? "ERR" : "IDLE");
-  sd_written = (app->sd_total_written > 9999UL) ? 9999UL : app->sd_total_written;
-  (void)snprintf(line_sd, sizeof(line_sd),
-                 "SD:%s W:%lu PTT:%u%s",
+  (void)snprintf(line[7], sizeof(line[7]), "SD %s PTT %u%s",
                  sd_status,
-                 (unsigned long)sd_written,
                  (unsigned int)app->ptt_ms,
                  (app->ptt_valid != 0U) ? "" : "?");
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line_signal);        /* 黄色：原始 RED/IR */
-  app_display_draw_right(0, line_signal_r);      /* 黄色右侧："D" */
-  ssd1306_DrawString(0, 8, line_fifo);           /* 黄色：FIFO */
-  ssd1306_DrawString(0, 16, time_line);          /* 蓝色 RTC + sample age */
-  ssd1306_DrawString(0, 24, line_ok_busy);       /* OK / BUSY / ERROR */
-  ssd1306_DrawString(0, 32, line_err_recover);   /* RC + motion */
-  ssd1306_DrawString(0, 40, line_quality);       /* SQ + PI + IBI 计数 */
-  ssd1306_DrawString(0, 48, line_tail);          /* finger debug */
-  ssd1306_DrawString(0, 56, line_sd);            /* SD 状态 */
+  ssd1306_DrawString(0, 0, line[0]);
+  ssd1306_DrawString(0, 8, line[1]);
+  ssd1306_DrawString(0, 16, line[2]);
+  ssd1306_DrawString(0, 24, line[3]);
+  ssd1306_DrawString(0, 32, line[4]);
+  ssd1306_DrawString(0, 40, line[5]);
+  ssd1306_DrawString(0, 48, line[6]);
+  ssd1306_DrawString(0, 56, line[7]);
+  ssd1306_UpdateScreen();
+}
+
+/*
+ * DEBUG SIGNAL 页：8 行纯文本，显示信号质量与手指状态。
+ */
+static void app_display_debug_signal_page(const AppState_t *app)
+{
+  char line[8][24];
+  uint32_t pi_x10;
+  uint32_t motion_score;
+  uint32_t spo2;
+  uint32_t base;
+
+  if (app == NULL) { return; }
+
+  pi_x10 = (app->signal_ir_pi_x1000 > 9999U) ? 9999UL : (uint32_t)app->signal_ir_pi_x1000;
+  motion_score = (app->motion_score > 99U) ? 99UL : (uint32_t)app->motion_score;
+  spo2 = (uint32_t)app->spo2_value;
+  if (spo2 > 100U) { spo2 = 100UL; }
+  base = (app->baseline_ir > 999999UL) ? 999999UL : app->baseline_ir;
+
+  (void)snprintf(line[0], sizeof(line[0]), "DBG SIGNAL");
+  (void)snprintf(line[1], sizeof(line[1]), "RED %lu",
+                 (unsigned long)app->red_value);
+  (void)snprintf(line[2], sizeof(line[2]), "IR %lu",
+                 (unsigned long)app->ir_value);
+  (void)snprintf(line[3], sizeof(line[3]), "SQ %u PI %u.%u",
+                 (unsigned int)app->signal_quality,
+                 (unsigned int)(pi_x10 / 10UL),
+                 (unsigned int)(pi_x10 % 10UL));
+  (void)snprintf(line[4], sizeof(line[4]), "MOTION %u SCORE %lu",
+                 (unsigned int)(app->motion_artifact),
+                 (unsigned long)motion_score);
+  (void)snprintf(line[5], sizeof(line[5]), "F:%u R:%u ON:%u OFF:%u",
+                 (unsigned int)app->finger_present,
+                 (unsigned int)app->raw_signal_present,
+                 (unsigned int)app->finger_on_confirm_count,
+                 (unsigned int)app->finger_off_confirm_count);
+  (void)snprintf(line[6], sizeof(line[6]), "BASE %lu",
+                 (unsigned long)base);
+  (void)snprintf(line[7], sizeof(line[7]), "HR %u SPO2 %lu",
+                 (unsigned int)app->bpm_value,
+                 (unsigned long)spo2);
+
+  ssd1306_Clear(SSD1306_COLOR_BLACK);
+  ssd1306_DrawString(0, 0, line[0]);
+  ssd1306_DrawString(0, 8, line[1]);
+  ssd1306_DrawString(0, 16, line[2]);
+  ssd1306_DrawString(0, 24, line[3]);
+  ssd1306_DrawString(0, 32, line[4]);
+  ssd1306_DrawString(0, 40, line[5]);
+  ssd1306_DrawString(0, 48, line[6]);
+  ssd1306_DrawString(0, 56, line[7]);
   ssd1306_UpdateScreen();
 }
 
@@ -687,25 +747,11 @@ static void app_display_debug_page(const AppState_t *app)
  * 手指状态 → OLED 提示字符串。
  * 返回 NULL 表示处于正常测量状态，上层应绘制原有内容。
  * 否则返回的字符串应被醒目地绘制在页面中央。
- * WAIT / SENSOR RECOVER 状态需要 buf 提供格式化空间 (>=15 bytes)。
+ * WAIT 状态需要 buf 提供格式化空间 (>=15 bytes)。
  */
 static const char *app_get_finger_status(const AppState_t *app, char *buf, size_t buf_size)
 {
-  uint32_t sample_age_ms;
-
   if (app == NULL) { return NULL; }
-
-  /* Sensor liveness takes priority over the last latched contact state. */
-  if (app->sensor_last_sample_tick != 0U)
-  {
-    sample_age_ms = HAL_GetTick() - app->sensor_last_sample_tick;
-    if ((sample_age_ms > DISPLAY_SENSOR_RECOVER_AGE_MS) &&
-        (app->sensor_error_streak >= DISPLAY_SENSOR_ERROR_STREAK))
-    {
-      (void)snprintf(buf, buf_size, "SENSOR RECOVER");
-      return buf;
-    }
-  }
 
   if (app->finger_present == 0U)
   {
@@ -726,35 +772,6 @@ static const char *app_get_finger_status(const AppState_t *app, char *buf, size_
   }
 
   return NULL;
-}
-
-static const char *app_get_sensor_status_string(const AppState_t *app)
-{
-  uint32_t now;
-
-  if (app == NULL)
-  {
-    return "NA";
-  }
-
-  now = HAL_GetTick();
-  if ((app->sensor_read_ok_count != 0U) &&
-      ((now - app->sensor_last_sample_tick) <= 300U))
-  {
-    return "LIVE";
-  }
-
-  switch (app->sensor_last_read_status)
-  {
-    case 1U:
-      return "OK";
-
-    case 2U:
-      return "ERR";
-
-    default:
-      return "WAIT";
-  }
 }
 
 /* SQ → OLED 短标签：>=60 OK，>=30 LOW，否则 "--"。 */
@@ -881,48 +898,6 @@ void app_display_status_page(const AppState_t *app, const char *status_line_1, c
   ssd1306_DrawString(0, 40, (status_line_2 != NULL) ? status_line_2 : "");
   ssd1306_DrawString(0, 48, uart_line);
   ssd1306_UpdateScreen();
-}
-
-static const char *app_get_brightness_label(uint8_t brightness_index)
-{
-  if (brightness_index >= DISPLAY_BRIGHTNESS_LEVEL_COUNT)
-  {
-    return display_brightness_label_table[DISPLAY_BRIGHTNESS_DEFAULT_INDEX];
-  }
-
-  return display_brightness_label_table[brightness_index];
-}
-
-static const char *app_get_brightness_short_label(uint8_t brightness_index)
-{
-  switch (brightness_index)
-  {
-    case 0U:
-      return "L";
-
-    case 1U:
-      return "M";
-
-    case 2U:
-      return "H";
-
-    default:
-      return "M";
-  }
-}
-
-static void app_display_cycle_brightness(AppState_t *app)
-{
-  uint8_t brightness_index;
-
-  if (app == NULL)
-  {
-    return;
-  }
-
-  brightness_index = (uint8_t)((app->display_brightness_index + 1U) % DISPLAY_BRIGHTNESS_LEVEL_COUNT);
-  app->display_brightness_index = brightness_index;
-  ssd1306_SetContrast(display_brightness_table[brightness_index]);
 }
 
 /*

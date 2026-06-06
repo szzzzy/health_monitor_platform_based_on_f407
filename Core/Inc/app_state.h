@@ -27,8 +27,17 @@ typedef enum
   DISPLAY_PAGE_VITALS,
   DISPLAY_PAGE_ECG,
   DISPLAY_PAGE_DEBUG,
-  DISPLAY_PAGE_COUNT
+  DISPLAY_PAGE_COUNT,
+  DISPLAY_PAGE_NORMAL_COUNT = DISPLAY_PAGE_ECG + 1U
 } DisplayPage_t;
+
+/* Debug 子页面类型。 */
+typedef enum
+{
+  DBG_SUB_BUS = 0U,
+  DBG_SUB_SIGNAL,
+  DBG_SUB_COUNT
+} DebugSubPage_t;
 
 /*
  * 轮询式按键状态：
@@ -69,6 +78,8 @@ typedef struct
   uint32_t sensor_sample_change_count;
   uint32_t sensor_sample_same_count;
   uint32_t sensor_last_i2c_error;
+  uint32_t sensor_stale_count;
+  uint32_t sensor_recovery_fail_count;
   uint32_t display_refresh_count;
   uint32_t display_last_refresh_tick;
   uint8_t sensor_fifo_write_ptr;
@@ -159,7 +170,9 @@ typedef struct
   uint16_t contact_settle_samples; /* 手指刚放上后的接触稳定倒计数（100Hz 节拍） */
   uint8_t report_due;
   uint8_t display_refresh_requested;
-  uint8_t display_brightness_index;
+  uint8_t debug_mode;
+  DebugSubPage_t debug_sub_page;
+  DisplayPage_t saved_normal_page;
   /* 最近一次完整串口接收/发送的报文是否有效。 */
   bool uart_rx_message_valid;
   bool uart_tx_message_valid;
@@ -167,7 +180,7 @@ typedef struct
   uint8_t rtc_time_valid;
   uint8_t rtc_read_ok;
   APP_RTC_DateTime_t rtc_datetime;
-  PageButton_t brightness_button;
+  PageButton_t debug_toggle_button;
   PageButton_t page_prev_button;
   PageButton_t page_next_button;
   /* SD 卡数据记录状态 */

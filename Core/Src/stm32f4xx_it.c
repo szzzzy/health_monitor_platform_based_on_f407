@@ -60,6 +60,7 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
+extern DMA_HandleTypeDef hdma_adc1;
 extern TIM_HandleTypeDef htim6;
 /* USER CODE BEGIN EV */
 extern volatile uint8_t tim6_tick_flag;
@@ -217,6 +218,20 @@ void TIM6_DAC_IRQHandler(void)
   /* USER CODE END TIM6_DAC_IRQn 1 */
 }
 
+/**
+  * @brief This function handles DMA2 stream0 global interrupt.
+  */
+void DMA2_Stream0_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA2_Stream0_IRQn 0 */
+
+  /* USER CODE END DMA2_Stream0_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_adc1);
+  /* USER CODE BEGIN DMA2_Stream0_IRQn 1 */
+
+  /* USER CODE END DMA2_Stream0_IRQn 1 */
+}
+
 /* USER CODE BEGIN 1 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -261,10 +276,10 @@ void I2C1_ER_IRQHandler(void)
   HAL_I2C_ER_IRQHandler(&hi2c1);
 }
 
-/* MAX30102 PPG_RDY 中断（PE5 下降沿）�?
- * �? PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发�?
- * 系统会�?�过 TIM6 节拍兜底轮询�? */
-/* HAL GPIO EXTI 统一回调，按引脚分发�? */
+/* MAX30102 PPG_RDY 中断（PE5 下降沿）
+ * 因 PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发。
+ * 系统会通过 TIM6 节拍兜底轮询。 */
+/* HAL GPIO EXTI 统一回调，按引脚分发 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 #if (MAX30102_USE_INT_PIN != 0U)

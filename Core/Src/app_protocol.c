@@ -142,7 +142,7 @@ void app_protocol_send_sensor_report(AppState_t *app)
  *   sensor_last_sample_tick,sensor_sample_change_count,sensor_sample_same_count,sensor_last_i2c_error,
  *   rtc_read_ok,uart_rx_message_valid,uart_tx_message_valid,
  *   sd_card_ready,sd_log_active,sd_log_error,sd_total_written,
- *   display_refresh_count,display_last_refresh_tick,display_brightness_index,current_page
+ *   display_refresh_count,display_last_refresh_tick,debug_mode,current_page
  *
  * 旧上位机可忽略尾部字段继续解析前缀；新上位机应优先使用尾部 SQ/PI/R/BAL
  * 和传感器/SD/RTC 诊断字段来解释指标可信度。 */
@@ -246,7 +246,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
                  (unsigned long)app->sd_total_written,
                  (unsigned long)app->display_refresh_count,
                  (unsigned long)app->display_last_refresh_tick,
-                 (unsigned int)app->display_brightness_index,
+                 (unsigned int)app->debug_mode,
                  (unsigned int)app->current_page,
                  /* ECG/PTT 追加字段 — 旧上位机忽略尾部即可 */
                  (unsigned int)app->ecg_valid,

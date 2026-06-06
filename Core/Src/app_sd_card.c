@@ -57,6 +57,12 @@ static AppSdCardStatus_t APP_SD_Card_WaitReady(uint32_t timeout_ms)
 /*  公共 API                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/*
+ * 软件层初始化：仅设置句柄字段，不访问 SDIO 外设。
+ *
+ * 由 APP_SdFile_StartSession() 在挂载前调用，确保 hsd.Instance 有效，
+ * 以便 SDIO_IRQHandler 通过 APP_SD_Card_GetHandle() 获取合法句柄。
+ * 真正的硬件初始化在 APP_SD_Card_Init() 中完成（懒启动）。 */
 void APP_SD_Card_InitHardware(void)
 {
     (void)memset(&hsd, 0, sizeof(hsd));
@@ -65,6 +71,14 @@ void APP_SD_Card_InitHardware(void)
     block_count = 0;
 }
 
+/*
+ * 真正的 SD 卡硬件初始化（懒启动路径）。
+ *
+ * 此函数由 disk_initialize() → f_mount() 链路调用，仅在首次写日志时触发。
+ * 不在 MX_SDIO_SD_Init() 中调用，确保无卡/坏卡不阻塞启动流程。
+ *
+ * 流程：400kHz 低速识别 → 读取卡信息 → 切换到 12MHz 4-bit 宽总线。
+ * 4-bit 切换失败时降级为 1-bit，两者都失败则 Deinit 并返回错误。 */
 AppSdCardStatus_t APP_SD_Card_Init(void)
 {
     HAL_StatusTypeDef hal_ret;

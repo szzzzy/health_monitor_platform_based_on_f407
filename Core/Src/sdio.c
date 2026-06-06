@@ -50,14 +50,13 @@ void MX_SDIO_SD_Init(void)
   hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
   hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
   hsd.Init.ClockDiv = 0;
-  if (HAL_SD_Init(&hsd) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  if (HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  /*
+   * Do NOT call HAL_SD_Init() or HAL_SD_ConfigWideBusOperation() here.
+   * The application owns SD card bring-up through APP_SD_Card_Init()
+   * (lazy init on first log write), so boot can proceed even when no
+   * card is present or the card is bad.  This function is a harmless
+   * handle placeholder — it only assigns the struct fields.
+   */
   /* USER CODE BEGIN SDIO_Init 2 */
 
   /* USER CODE END SDIO_Init 2 */

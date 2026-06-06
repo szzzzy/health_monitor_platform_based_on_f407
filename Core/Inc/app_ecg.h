@@ -3,7 +3,7 @@
   * @file    app_ecg.h
   * @brief   ECG QRS 检测 — 250 Hz 定时器触发采样，逐样本消费
   *
-  * AD8232 → PC0/ADC1_IN10 → TIM3 250 Hz → DMA 环形缓冲 → 本模块逐样本消费。
+  * AD8232 → PC0/ADC1_IN10 → TIM2 250 Hz → DMA 环形缓冲 → 本模块逐样本消费。
   * 简化 Pan-Tompkins：DC 漂移消除 + 低通平滑 + 自适应阈值 QRS 状态机。
   * 检测到 R 峰后通过 AppEcgUpdate_t 上报，同时通知 PTT 模块。
   * 此为工程观测/趋势提示，不声称临床诊断能力。

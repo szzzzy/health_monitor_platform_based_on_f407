@@ -1,8 +1,8 @@
 /**
   ******************************************************************************
-  * @file    adc.h
+  * @file    dma.h
   * @brief   This file contains all the function prototypes for
-  *          the adc.c file
+  *          the dma.c file
   ******************************************************************************
   * @attention
   *
@@ -17,8 +17,8 @@
   ******************************************************************************
   */
 /* Define to prevent recursive inclusion -------------------------------------*/
-#ifndef __ADC_H__
-#define __ADC_H__
+#ifndef __DMA_H__
+#define __DMA_H__
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,29 +27,19 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
+/* DMA memory to memory transfer handles -------------------------------------*/
+
 /* USER CODE BEGIN Includes */
 
 /* USER CODE END Includes */
 
-extern ADC_HandleTypeDef hadc1;
-
 /* USER CODE BEGIN Private defines */
-#define APP_ECG_ADC_BUF_SIZE 256U
 
 /* USER CODE END Private defines */
 
-void MX_ADC1_Init(void);
+void MX_DMA_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-void app_ecg_adc_start(void);
-uint16_t app_ecg_adc_get_write_index(void);
-uint16_t app_ecg_adc_get_available_count(void);
-uint8_t app_ecg_adc_read_sample(uint16_t *raw_value,
-                                uint32_t *timestamp_ms,
-                                uint32_t now_ms,
-                                uint16_t avail_remaining);
-uint8_t app_ecg_adc_had_overflow(void);
-void app_ecg_adc_clear_overflow(void);
 
 /* USER CODE END Prototypes */
 
@@ -57,6 +47,6 @@ void app_ecg_adc_clear_overflow(void);
 }
 #endif
 
-#endif /* __ADC_H__ */
+#endif /* __DMA_H__ */
 
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
