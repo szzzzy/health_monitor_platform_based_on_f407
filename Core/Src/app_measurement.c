@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "app_bpm_filter.h"
+#include "app_data_log.h"
 #include "app_display.h"
 #include "app_hrv.h"
 #include "app_motion.h"
@@ -50,6 +51,7 @@
 /* beat-based PI 超时：无新 beat 超过此窗口则标无效 */
 #define APP_PI_STALE_SAMPLES              (MAX30102_ALGO_SAMPLE_RATE_HZ * 5U)
 /* 传感器无新样本看门狗超时 (ms) */
+#define APP_SENSOR_STALE_WARN_MS          1000U  /* OLED 显示 SENSOR WAIT 的阈值 */
 #define APP_SENSOR_STALE_TIMEOUT_MS       3000U
 #define APP_SENSOR_STALE_CONFIRM_INTERVAL_MS 1000U
 #define APP_SENSOR_STALE_CONFIRM_COUNT       3U
@@ -160,6 +162,8 @@ uint8_t app_measurement_collect_baseline_sample(AppState_t *app)
   app->sensor_error_streak = 0U;
   app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
   app->sensor_last_sample_tick = HAL_GetTick();
+  app->sensor_last_ok_tick = app->sensor_last_sample_tick;
+  app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
   sensor_last_stale_probe_tick = 0UL;
   sensor_stale_probe_count = 0U;
   return 1U;
@@ -236,6 +240,11 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
     return APP_MEASUREMENT_READ_ERROR;
   }
 
+  if (app->sensor_read_attempt_count < 0xFFFFFFFFUL)
+  {
+    app->sensor_read_attempt_count++;
+  }
+
   read_status = max30102_read_fifo(fifo_buf, 6U);
   fifo_debug = max30102_get_fifo_debug();
   if (fifo_debug != NULL)
@@ -276,8 +285,23 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
     app->sensor_error_streak = 0U;
     app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
     app->sensor_last_sample_tick = HAL_GetTick();
+    app->sensor_last_ok_tick = app->sensor_last_sample_tick;
     sensor_last_stale_probe_tick = 0UL;
     sensor_stale_probe_count = 0U;
+    app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
+
+    /* 实时路径 PushSample：仅 16 字节 memcpy，零格式化/零 SD I/O */
+    {
+      uint8_t log_flags = 0U;
+      if (app->finger_present != 0U)      log_flags |= 0x01U;
+      if (app->contact_settle_samples > 0U) log_flags |= 0x02U;
+      if (app->sensor_fifo_overflow_count > 0U) log_flags |= 0x04U;
+      APP_DataLog_PushSample(app->sensor_last_sample_tick,
+                             app->red_value, app->ir_value,
+                             (int16_t)app->ecg_filtered,
+                             log_flags);
+    }
+
     return APP_MEASUREMENT_READ_OK;
   }
 
@@ -303,6 +327,7 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
   app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
   app->sensor_read_error_count++;
   app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+  app->sensor_health = (uint8_t)SENSOR_HEALTH_I2C_ERR;
   if (app->sensor_error_streak < 0xFFU)
   {
     app->sensor_error_streak++;
@@ -393,11 +418,18 @@ void app_measurement_update_finger_state(AppState_t *app)
     app->finger_off_confirm_count = 0U;
     app->finger_on_confirm_count = 0U;
 
+    /* 手指离开 → flush SD 缓冲 + f_sync */
+    APP_DataLog_OnMeasurementStop();
+
     /* Background baseline has been tracked during the off-confirm window via
      * app_ppg_signal_track_background_ir (called when raw_signal_present==0).
      * Do not re-seed from a single IR sample here — it may still be elevated
      * from the finger removal transient and would raise the finger-on threshold. */
     app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
+    max30102_baseline_seed_tracking(&baseline_data,
+                                    app->baseline_ir,
+                                    APP_PPG_SIGNAL_REACQUIRE_NOISE_IR);
+    app_ppg_signal_init_state(app);
     app_reset_measurement_outputs(app);
     app_ppg_signal_reset_envelope();
     app->report_due = 1U;
@@ -652,17 +684,20 @@ static void app_measurement_do_recovery(AppState_t *app)
 
   sensor_last_recovery_tick = now;
 
+  app->sensor_health = (uint8_t)SENSOR_HEALTH_RECOVERING;
+  app->display_refresh_requested = 1U;
+
   /* I2C bus recovery + MAX30102 re-init. */
   if (app_measurement_reinit_sensor() != HAL_OK)
   {
     app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
     app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
     app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
+    app->sensor_health = (uint8_t)SENSOR_HEALTH_INIT_FAIL;
     if (sensor_recovery_fail_count < 0xFFU)
     {
       sensor_recovery_fail_count++;
     }
-    /* Let IWDG handle truly fatal lock-ups; do not NVIC_SystemReset here. */
     app->sensor_recovery_fail_count = sensor_recovery_fail_count;
     return;
   }
@@ -674,6 +709,7 @@ static void app_measurement_do_recovery(AppState_t *app)
   app->sensor_error_streak = 0U;
   app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
   app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
+  app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
   app->sensor_recover_count++;
   /* Give MAX30102 time to publish its first sample after reset. */
   app->sensor_last_sample_tick = now;
@@ -722,7 +758,10 @@ void app_measurement_recover_sensor(AppState_t *app)
 
 /*
  * MAX30102 无新样本看门狗。
- * sensor_last_sample_tick 超 STALE_TIMEOUT_MS 或上电后长期无样本 → 触发限频恢复。
+ *
+ * - >1s 无样本：置 SENSOR_HEALTH_STALE，OLED 可显示 WAIT 状态
+ * - >3s 无样本：确认持久停顿后触发限频恢复
+ * - recovery 失败：置 SENSOR_HEALTH_INIT_FAIL
  */
 void app_measurement_service_sensor_watchdog(AppState_t *app)
 {
@@ -731,7 +770,17 @@ void app_measurement_service_sensor_watchdog(AppState_t *app)
 
   if (app == NULL) return;
 
+  /* 恢复期间不重复触发，等待恢复流程自行更新 health */
+  if (app->sensor_health == (uint8_t)SENSOR_HEALTH_RECOVERING) return;
+
   now = HAL_GetTick();
+
+  /* >1s 无新样本 → 快速标记 STALE，OLED 可见 */
+  if ((app->sensor_last_sample_tick != 0UL) &&
+      ((now - app->sensor_last_sample_tick) > APP_SENSOR_STALE_WARN_MS))
+  {
+    app->sensor_health = (uint8_t)SENSOR_HEALTH_STALE;
+  }
 
   if ((app->sensor_last_sample_tick != 0UL) &&
       ((now - app->sensor_last_sample_tick) > APP_SENSOR_STALE_TIMEOUT_MS))

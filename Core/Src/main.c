@@ -53,7 +53,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define APP_MAIN_LOOP_DELAY_MS   5U
-#define APP_SENSOR_DRAIN_BUDGET  8U
+#define APP_SENSOR_DRAIN_BUDGET  24U
 #define APP_SENSOR_BOOT_RETRY_MS 1000U
 
 /* USER CODE END PD */
@@ -75,16 +75,16 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 /* 初始化共享状态，并让各模块完成自己的默认配置 */
 static void app_state_init(AppState_t *app);
-/* 若当前轮次需要上报，则发送一帧测量报文并同步 SD 日志状态 */
+/* 若当前轮次需要上报，则发送一帧测量报文 */
 static void app_send_report_if_due(AppState_t *app);
 /* 若当前轮次需要刷新显示，则更新 OLED 画面 */
 static void app_refresh_display_if_needed(AppState_t *app);
-static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status);
+static void app_update_sd_log_status(AppState_t *app);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/* 应用层统�??初始化入口，main 中只保留调度�?? */
+/* 应用层统一初始化入口，main 中只保留调度 */
 static void app_state_init(AppState_t *app)
 {
   if (app == NULL)
@@ -101,8 +101,6 @@ static void app_state_init(AppState_t *app)
 /* 把"是否上报"的时序控制收口到一个函数里，避免主循环继续膨胀 */
 static void app_send_report_if_due(AppState_t *app)
 {
-  AppDataLogStatus_t log_status;
-
   if ((app == NULL) || (app->report_due == 0U))
   {
     return;
@@ -111,15 +109,9 @@ static void app_send_report_if_due(AppState_t *app)
   app_protocol_send_sensor_report(app);
   app->report_due = 0U;
 
-  /* SD 卡日志：传感器恢�?/重捕获阶段跳过写卡，避免 FatFs 阻塞
-   * 进一步拖慢主循环，加�? FIFO 溢出�? */
-  if (app->contact_settle_samples > 0U)
-  {
-    return;
-  }
-
-  log_status = APP_DataLog_WriteRecord(app);
-  app_update_sd_log_status(app, log_status);
+  /* SD PushSample 已在 app_measurement_read_sensor_sample 中完成
+   *（每次成功 FIFO 读取后调用 APP_DataLog_PushSample）。
+   * 此处不再做任何 SD 相关操作。 */
 }
 
 /* OLED 刷新单独封装，让主循环更像调度器而不是细节堆场 */
@@ -137,17 +129,21 @@ static void app_refresh_display_if_needed(AppState_t *app)
   app->display_refresh_requested = 0U;
 }
 
-static void app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status)
+static void app_update_sd_log_status(AppState_t *app)
 {
-  if (app == NULL)
-  {
-    return;
-  }
+  DataLogStatus_t st;
 
-  app->sd_log_active = APP_DataLog_IsReady() ? 1U : 0U;
-  app->sd_card_ready = app->sd_log_active;
-  app->sd_log_error = (status == APP_DATA_LOG_OK) ? 0U : (uint8_t)status;
-  app->sd_total_written = APP_DataLog_GetTotalWritten();
+  if (app == NULL) return;
+
+  APP_DataLog_GetStatus(&st);
+  app->sd_buffered  = st.buffered;
+  app->sd_dropped   = st.dropped;
+  app->sd_written   = st.written;
+  app->sd_paused    = st.paused;
+  app->sd_error     = st.sd_error;
+  app->sd_state     = st.state;
+  app->sd_last_write_ms = st.last_write_ms;
+  app->sd_total_written = (uint32_t)st.written; /* 兼容旧字段 */
 }
 
 /* USER CODE END 0 */
@@ -199,12 +195,12 @@ int main(void)
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
   HAL_TIM_Base_Start_IT(&htim6);
-  /* 启动显示、读�?? RTC，并先给出开机状态页�?? */
+  /* 启动显示、读取 RTC，并先给出开机状态页 */
   ssd1306_Init();
   app_protocol_update_rtc_snapshot(&app);
   app_display_status_page(&app, "MAX30102 INIT", "SYSTEM BOOT");
 
-  /* 传感器初始化失败时，保留串口命令与错误状态显示，便于现场排查�?? */
+  /* 传感器初始化失败时，保留串口命令与错误状态显示，便于现场排查 */
   sensor_init_retry_count = 0UL;
   sensor_init_status = max30102_init();
   while (sensor_init_status != HAL_OK)
@@ -247,11 +243,11 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* SD 卡日志：延迟到首次 APP_DataLog_WriteRecord() 时懒启动，
+  /* SD 卡日志：延迟到首次 APP_DataLog_Service() 时懒启动，
    * 避免坏卡/无卡在启动阶段阻塞主功能（MAX30102/OLED/RTC/按键/串口）。
    * 此处仅初始化内部静态变量，不执行硬件访问。 */
   APP_DataLog_Init();
-  app_update_sd_log_status(&app, APP_DATA_LOG_OK);
+  app_update_sd_log_status(&app);
   APP_Watchdog_Refresh();
 
   /* 上电先采集一段”无手指”背景，建立 IR 基线 */
@@ -385,12 +381,11 @@ int main(void)
       }
     }
 
-    /* 显示优先�?? SD 日志写入�??
-     * �?? SD 写入阻塞（FatFs/sync/HAL 超时），OLED 已在当前迭代刷新完毕�??
-     * 注意 app_refresh_display_if_needed 只执行一�?? ssd1306_UpdateScreen�??
-     * 不触�?? SD 卡，本身�?? O(1) I2C 操作�?? */
+    /* 显示优先 → 上报 → SD 后台写入（带预算，每轮至多 3ms / 512B） */
     app_refresh_display_if_needed(&app);
     app_send_report_if_due(&app);
+    APP_DataLog_ServiceBudget(3U, 512U);
+    app_update_sd_log_status(&app);
     APP_Watchdog_Refresh();
 
     /* Wait for next 10ms tick from TIM6 (WFI saves power while idle). */

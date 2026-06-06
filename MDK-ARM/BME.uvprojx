@@ -405,6 +405,31 @@
               <FilePath>../Core/Src/max30102.c</FilePath>
             </File>
             <File>
+              <FileName>max30102_driver.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/max30102_driver.c</FilePath>
+            </File>
+            <File>
+              <FileName>max30102_baseline.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/max30102_baseline.c</FilePath>
+            </File>
+            <File>
+              <FileName>max30102_spo2.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/max30102_spo2.c</FilePath>
+            </File>
+            <File>
+              <FileName>max30102_bpm.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/max30102_bpm.c</FilePath>
+            </File>
+            <File>
+              <FileName>max30102_algo_utils.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/max30102_algo_utils.c</FilePath>
+            </File>
+            <File>
               <FileName>app_display.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/app_display.c</FilePath>

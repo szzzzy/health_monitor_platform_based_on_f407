@@ -19,8 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define RETRY_INTERVAL_MS       60000U
-#define SYNC_INTERVAL_FLUSHES      8U   /* 每 8 次 flush (~16 KB) 才 f_sync 一次 */
+#define SYNC_INTERVAL_FLUSHES     255U   /* 测量中几乎不做 f_sync；停止时 StopSession 强制 sync */
 
 static FATFS   fatfs;
 static FIL     log_file;
@@ -33,7 +32,6 @@ static uint16_t wr_buf_pos = 0U;
 
 static uint32_t total_flushes = 0U;
 static uint32_t total_errors  = 0U;
-static uint32_t last_retry_tick = 0U;
 static uint8_t  flushes_since_sync = 0;
 
 /* ---- 辅助 ---- */
@@ -71,7 +69,6 @@ static void close_session_after_error(void)
     wr_buf_pos = 0U;
     flushes_since_sync = 0;
     total_errors++;
-    last_retry_tick = HAL_GetTick();
 }
 
 static bool rtc_is_valid(const APP_RTC_DateTime_t *dt)
@@ -197,7 +194,6 @@ void APP_SdFile_Init(void)
     wr_buf_pos        = 0U;
     total_flushes     = 0U;
     total_errors      = 0U;
-    last_retry_tick   = 0U;
     flushes_since_sync = 0;
 }
 
@@ -211,6 +207,14 @@ void APP_SdFile_Init(void)
  * 所有失败路径统一调用 close_session_after_error() 做级联清理：
  * 丢弃半打开文件、卸载卷、Deinit 卡、同步 STA_NOINIT、设置退避时间戳。
  */
+/*
+ * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 CSV → 定位到文件末尾。
+ *
+ * 由 APP_DataLog_Service() 状态机驱动调用，重试时序由状态机的
+ * ERROR_BACKOFF 控制，此处不再做额外的退避限频。
+ *
+ * 所有失败路径统一调用 close_session_after_error() 做级联清理。
+ */
 AppSdFileStatus_t APP_SdFile_StartSession(void)
 {
     FRESULT fr;
@@ -218,15 +222,6 @@ AppSdFileStatus_t APP_SdFile_StartSession(void)
     char   date_prefix[16];
     char   file_path[32];
     uint8_t seq;
-    uint32_t now;
-
-    now = HAL_GetTick();
-
-    /* 退避限频：last_retry_tick != 0 表示曾经尝试过，需等满间隔 */
-    if ((last_retry_tick != 0U) && ((now - last_retry_tick) < RETRY_INTERVAL_MS))
-    {
-        return APP_SD_FILE_NO_CARD;
-    }
 
     if (session_active) APP_SdFile_StopSession();
 
@@ -313,10 +308,11 @@ bool APP_SdFile_IsReady(void)
 AppSdFileStatus_t APP_SdFile_Write(const char *str)
 {
     size_t len;
+    const char *p;
 
     if (str == NULL) return APP_SD_FILE_CLOSED;
 
-    /* 无会话直接拒写，由上层 APP_DataLog_WriteRecord 负责懒启动会话 */
+    /* 无会话直接拒写，由上层 APP_DataLog_Service 负责懒启动会话 */
     if (!session_active) return APP_SD_FILE_CLOSED;
 
     /* 日期翻日：正常关闭当前会话并启动新会话 */
@@ -331,20 +327,59 @@ AppSdFileStatus_t APP_SdFile_Write(const char *str)
     len = strlen(str);
     if (len == 0U) return APP_SD_FILE_OK;
 
-    /* 缓冲区满则先落盘 */
-    if ((wr_buf_pos + (uint16_t)len) >= APP_SD_FILE_BUF_SIZE)
+    p = str;
+    while (len > 0U)
     {
-        AppSdFileStatus_t ret = flush_internal(false);
-        if (ret != APP_SD_FILE_OK)
+        size_t room;
+        size_t chunk;
+
+        if (wr_buf_pos >= APP_SD_FILE_BUF_SIZE)
         {
-            (void)APP_SdFile_StopSession();
-            return ret;
+            AppSdFileStatus_t ret = flush_internal(false);
+            if (ret != APP_SD_FILE_OK) return ret;
+        }
+
+        room = APP_SD_FILE_BUF_SIZE - wr_buf_pos;
+        chunk = (len < room) ? len : room;
+
+        (void)memcpy(wr_buf + wr_buf_pos, p, chunk);
+        wr_buf_pos += (uint16_t)chunk;
+        p += chunk;
+        len -= chunk;
+
+        if (wr_buf_pos >= APP_SD_FILE_BUF_SIZE)
+        {
+            AppSdFileStatus_t ret = flush_internal(false);
+            if (ret != APP_SD_FILE_OK) return ret;
         }
     }
 
-    (void)memcpy(wr_buf + wr_buf_pos, str, len);
-    wr_buf_pos += (uint16_t)len;
+    return APP_SD_FILE_OK;
+}
 
+/*
+ * 二进制数据显式长度写入 — 直接 f_write，不经过 str/缓冲。
+ * 每次调用一次 f_write，512B @ 12MHz SDIO ≈ 0.3ms，远在预算内。
+ * 失败时内部已做 close_session_after_error 级联清理。
+ */
+AppSdFileStatus_t APP_SdFile_WriteBytes(const void *data, uint16_t len)
+{
+    FRESULT fr;
+    UINT    bw;
+
+    if (!session_active || (data == NULL) || (len == 0U)) return APP_SD_FILE_CLOSED;
+
+    fr = f_write(&log_file, data, (UINT)len, &bw);
+    if ((fr != FR_OK) || (bw != (UINT)len))
+    {
+        close_session_after_error();
+        return APP_SD_FILE_WRITE_ERROR;
+    }
+
+    /* 不 f_sync — 由 StopSession 内部统一 sync。
+     * f_sync 可能触发多次 disk_write（文件缓冲 + FAT + 目录），
+     * 累计 >100ms，足以在测量期造成 MAX30102 FIFO overflow。 */
+    total_flushes++;
     return APP_SD_FILE_OK;
 }
 

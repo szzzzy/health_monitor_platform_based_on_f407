@@ -15,7 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define APP_SD_FILE_BUF_SIZE  2048U
+#define APP_SD_FILE_BUF_SIZE  1024U   /* 1KB — 每 2 chunk 物理写入一次，防止突发 */
 
 typedef enum {
     APP_SD_FILE_OK          = 0,
@@ -30,6 +30,7 @@ AppSdFileStatus_t APP_SdFile_StartSession(void);
 void              APP_SdFile_StopSession(void);
 bool              APP_SdFile_IsReady(void);
 AppSdFileStatus_t APP_SdFile_Write(const char *str);
+AppSdFileStatus_t APP_SdFile_WriteBytes(const void *data, uint16_t len);
 AppSdFileStatus_t APP_SdFile_Flush(void);
 uint32_t          APP_SdFile_GetTotalWritten(void);
 uint32_t          APP_SdFile_GetErrorCount(void);

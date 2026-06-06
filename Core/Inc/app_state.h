@@ -34,8 +34,12 @@ typedef enum
 /* Debug 子页面类型。 */
 typedef enum
 {
-  DBG_SUB_BUS = 0U,
-  DBG_SUB_SIGNAL,
+  DBG_SUB_D1_MAX = 0U,
+  DBG_SUB_D2_FIFO,
+  DBG_SUB_D3_PPG_RAW,
+  DBG_SUB_D4_PPG_Q,
+  DBG_SUB_D5_ALGO,
+  DBG_SUB_D6_SYS,
   DBG_SUB_COUNT
 } DebugSubPage_t;
 
@@ -70,6 +74,7 @@ typedef struct
   uint32_t red_signal_span;
   uint32_t signal_ir_ac_rms;
   uint32_t signal_red_ac_rms;
+  uint32_t sensor_read_attempt_count;
   uint32_t sensor_read_ok_count;
   uint32_t sensor_read_busy_count;
   uint32_t sensor_read_error_count;
@@ -108,6 +113,8 @@ typedef struct
   uint32_t last_beat_sample;   /* 上一次接受 beat 的全局样本编号，用于 stale 判定 */
   uint8_t sensor_last_read_status;
   uint8_t sensor_error_streak;
+  uint8_t sensor_health;           /* 0=OK, 1=STALE, 2=RECOVERING, 3=I2C_ERR, 4=INIT_FAIL, 5=FIFO_CLEAR_FAIL */
+  uint32_t sensor_last_ok_tick;    /* 最后一次成功读到新样本的 tick */
   uint8_t finger_present;
   uint8_t bpm_valid;
   uint8_t bpm_value;
@@ -184,10 +191,14 @@ typedef struct
   PageButton_t page_prev_button;
   PageButton_t page_next_button;
   /* SD 卡数据记录状态 */
-  uint8_t  sd_card_ready;
-  uint8_t  sd_log_active;
-  uint8_t  sd_log_error;
-  uint32_t sd_total_written;
+  uint16_t sd_buffered;       /* 环形缓冲中待写入样本数 */
+  uint16_t sd_dropped;        /* 累计丢弃样本数 */
+  uint16_t sd_written;        /* 本次 session 已持久化样本数 */
+  uint8_t  sd_paused;         /* 1 = SD 写入暂停（慢/满/错误） */
+  uint8_t  sd_error;          /* 最后一次 SD 错误码 */
+  uint8_t  sd_state;          /* 内部状态: 0=IDLE 1=TRY 2=ACTIVE 3=BACKOFF */
+  uint32_t sd_last_write_ms;  /* 最近一次 SD 写入耗时 (ms) */
+  uint32_t sd_total_written;  /* 累计持久化样本总数 */
   /* ECG 状态：原始 ADC 值、滤波后 AC 值、导联脱落标志 */
   uint16_t ecg_raw;
   int16_t  ecg_filtered;

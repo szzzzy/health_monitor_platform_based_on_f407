@@ -62,6 +62,17 @@ void app_measurement_process(AppState_t *app);
 void app_measurement_update_periodic_flags(AppState_t *app);
 void app_measurement_recover_sensor(AppState_t *app);
 
+/* 传感器健康状态：供 OLED / UART 上报显示当前 MAX30102 链路状态 */
+typedef enum
+{
+  SENSOR_HEALTH_OK = 0U,
+  SENSOR_HEALTH_STALE,
+  SENSOR_HEALTH_RECOVERING,
+  SENSOR_HEALTH_I2C_ERR,
+  SENSOR_HEALTH_INIT_FAIL,
+  SENSOR_HEALTH_FIFO_CLEAR_FAIL
+} AppSensorHealth_t;
+
 /* MAX30102 无新样本看门狗 — 当 sensor_last_sample_tick 长时间未更新时，
  * 强制执行 I2C 总线恢复 + max30102_init()。
  * 在主循环每轮和 baseline 采集循环中均需调用。 */

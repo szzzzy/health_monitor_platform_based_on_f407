@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app_data_log.h"
 #include "usart.h"
 
 /* 串口上报与接收缓冲长度，足够覆盖当前文本协议。 */
@@ -240,9 +241,9 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
                  (unsigned int)app->rtc_read_ok,
                  (unsigned int)app->uart_rx_message_valid,
                  (unsigned int)app->uart_tx_message_valid,
-                 (unsigned int)app->sd_card_ready,
-                 (unsigned int)app->sd_log_active,
-                 (unsigned int)app->sd_log_error,
+                 (unsigned int)(APP_DataLog_IsActive() ? 1U : 0U),
+                 (unsigned int)app->sd_state,
+                 (unsigned int)app->sd_error,
                  (unsigned long)app->sd_total_written,
                  (unsigned long)app->display_refresh_count,
                  (unsigned long)app->display_last_refresh_tick,

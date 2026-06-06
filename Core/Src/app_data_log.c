@@ -1,308 +1,339 @@
 /**
   ******************************************************************************
   * @file    app_data_log.c
-  * @brief   数据记录 — CSV 格式化 + 委托 app_sd_file 写入 SD 卡
+  * @brief   SD 二进制日志引擎 — 环形缓冲 + 分片写入
   *
-  * CSV 格式：timestamp_utc,sample_id,type,value,unit,status
-  * 同一次采样的所有变量共享同一时间戳和 sample_id。
+  * 实时路径：PushSample() 仅 16 字节 memcpy
+  * 后台路径：ServiceBudget() 格式化 chunk → APP_SdFile_WriteBytes()
+  * 停止路径：OnMeasurementStop() → 分片排空 → f_sync
+  *
+  * 文件格式：
+  *   [DataLogFileHeader_t 32B] [DataLogRawSample_t × N] ...
+  * 文件命名：LOG_XXXXX.BIN（递增序号）
+  *
+  * 反压门控：ring_count > 25% → 不启动/不恢复 SD 会话
+  *          ring_count > 50% → 暂停写入 + BACKOFF
+  *          保证 MAX30102 FIFO 优先于 SD 日志
   ******************************************************************************
   */
 
 #include "app_data_log.h"
 #include "app_sd_file.h"
-#include "rtc.h"
-#include <stdio.h>
+#include "main.h"
+#include <string.h>
 
-#define RECORDS_PER_CYCLE   26U
+/* 环形缓冲：2048 × 16B = 32KB */
+static DataLogRawSample_t ring[DATA_LOG_RING_SAMPLES];
+static uint16_t ring_head  = 0U;
+static uint16_t ring_tail  = 0U;
+static uint16_t ring_count = 0U;
 
-static uint32_t sample_id = 0U;
-static char     csv_header_written = 0;
-static const char CSV_HEADER[] = "timestamp_utc,sample_id,type,value,unit,status\n";
+/* 状态机 */
+typedef enum {
+  SD_STATE_IDLE = 0,
+  SD_STATE_TRY_START,
+  SD_STATE_ACTIVE,
+  SD_STATE_BACKOFF
+} SdState_t;
 
-/* ---- 辅助 ---- */
+static SdState_t  sd_state     = SD_STATE_IDLE;
+static uint32_t   backoff_until = 0U;
+static uint32_t   total_dropped = 0U;
+static uint32_t   total_written = 0U;
+static uint8_t    write_seq     = 0U;
+static uint8_t    file_seq      = 0U;
+static uint8_t    sd_paused     = 0U;
+static uint8_t    sd_last_error = 0U;
+static uint32_t   last_write_ms = 0U;
+static uint32_t   last_backlog  = 0U;
+static uint16_t   session_written = 0U;
 
-static bool rtc_ok(const APP_RTC_DateTime_t *dt)
+#define BACKOFF_MS       60000U
+#define WRITE_CHUNK_BYTES ((uint32_t)DATA_LOG_CHUNK_SAMPLES * sizeof(DataLogRawSample_t))
+
+/* 反压阈值：ring 超过此比例则拒绝启动/恢复 SD 写入 */
+#define BACKLOG_START_GUARD  (DATA_LOG_RING_SAMPLES / 4U)   /* 25% = 512 样本 */
+#define BACKLOG_PAUSE_GUARD  (DATA_LOG_RING_SAMPLES / 2U)   /* 50% = 1024 样本 */
+#define STOP_DRAIN_MAX_CHUNKS 4U  /* 手指离开时最多排空 4 chunk (2KB)，保证重捕获体验 */
+
+/* 格式化缓冲区：文件头(32B) + chunk(512B) = 544B，无需更大 */
+static uint8_t fmt_buf[sizeof(DataLogFileHeader_t) + WRITE_CHUNK_BYTES];
+
+/* ---- 内部辅助 ---- */
+
+static uint16_t ring_pop(DataLogRawSample_t *dst, uint16_t count)
 {
-    return (dt->year >= 2000U) && (dt->month >= 1U) && (dt->month <= 12U)
-        && (dt->date >= 1U) && (dt->date <= 31U);
+  uint16_t copied = 0U;
+  while ((copied < count) && (ring_count > 0U))
+  {
+    (void)memcpy(&dst[copied], &ring[ring_tail], sizeof(DataLogRawSample_t));
+    ring_tail = (ring_tail + 1U) % DATA_LOG_RING_SAMPLES;
+    ring_count--;
+    copied++;
+  }
+  return copied;
 }
 
-static void fmt_ts(const APP_RTC_DateTime_t *dt, char *out, size_t sz)
+/* 检查反压：ring 积压过多 → 不入队，让 FIFO 优先 */
+static uint8_t backlog_ok_for_sd(void)
 {
-    if (rtc_ok(dt))
-    {
-        (void)snprintf(out, sz, "%04u-%02u-%02uT%02u:%02u:%02uZ",
-                       (unsigned int)dt->year,  (unsigned int)dt->month,
-                       (unsigned int)dt->date,  (unsigned int)dt->hours,
-                       (unsigned int)dt->minutes, (unsigned int)dt->seconds);
-    }
-    else
-    {
-        (void)snprintf(out, sz, "0000-00-00T00:00:00Z");
-    }
+  if (ring_count >= BACKLOG_PAUSE_GUARD)
+  {
+    sd_paused = 1U;
+    return 0U;
+  }
+  if (ring_count >= BACKLOG_START_GUARD)
+  {
+    return 0U;
+  }
+  return 1U;
+}
+
+/* 启动/重新启动 SD 二进制日志会话。受 backlog_ok_for_sd 门控。 */
+static uint8_t sd_try_start(void)
+{
+  AppSdFileStatus_t ret;
+  DataLogFileHeader_t header;
+
+  if (!backlog_ok_for_sd()) return 0U;
+
+  ret = APP_SdFile_StartSession();
+  if (ret != APP_SD_FILE_OK)
+  {
+    sd_last_error = (uint8_t)ret;
+    sd_state = SD_STATE_BACKOFF;
+    backoff_until = HAL_GetTick() + BACKOFF_MS;
+    return 0U;
+  }
+
+  header.magic[0] = 'B'; header.magic[1] = 'M';
+  header.magic[2] = 'L'; header.magic[3] = 'G';
+  header.version  = 1U;
+  header.sample_rate_hz = 100U;
+  header.start_tick = HAL_GetTick();
+  (void)memset(header.reserved, 0, sizeof(header.reserved));
+
+  ret = APP_SdFile_WriteBytes(&header, (uint16_t)sizeof(header));
+  if (ret != APP_SD_FILE_OK)
+  {
+    sd_last_error = (uint8_t)ret;
+    sd_paused = 1U;
+    sd_state = SD_STATE_BACKOFF;
+    backoff_until = HAL_GetTick() + BACKOFF_MS;
+    return 0U;
+  }
+
+  sd_state = SD_STATE_ACTIVE;
+  sd_paused = 0U;
+  session_written = 0U;
+  return 1U;
 }
 
 /*
- * 构建一行 CSV 文本并写入 SD 缓冲区。
- *
- * 返回值改为 AppSdFileStatus_t：
- *   原来忽略 APP_SdFile_Write 的返回值（(void)），如果 SD 卡写入失败
- *   （例如卡已满、中途拔出），后续的 emit 调用会带着失效的 session
- *   继续格式化字符串并尝试写入，白白浪费 CPU 时间。
- *   现在将返回值向上传播，调用方可以在第一次失败时就中止整条记录，
- *   避免 8 次无效的格式化 + 写入操作。
+ * 从环形缓冲 pop 一个 chunk，直接 f_write 写入 SD。
+ * 每次 512B @ 12MHz SDIO ≈ 0.3ms，远在预算内。
+ * 返回写入的样本数。
  */
-static AppSdFileStatus_t emit(const char *ts, uint32_t sid, const char *status,
-                              const char *type, const char *val, const char *unit)
+static uint16_t sd_write_one_chunk(uint32_t budget_ms)
 {
-    char line[APP_DATA_LOG_LINE_MAX];
-    (void)snprintf(line, sizeof(line), "%s,%lu,%s,%s,%s,%s\n",
-                   ts, (unsigned long)sid, type, val, unit, status);
-    return APP_SdFile_Write(line);
+  uint32_t t0;
+  AppSdFileStatus_t ret;
+  uint16_t popped;
+
+  if (ring_count < DATA_LOG_CHUNK_SAMPLES) return 0U;
+
+  t0 = HAL_GetTick();
+  popped = ring_pop((DataLogRawSample_t *)fmt_buf, DATA_LOG_CHUNK_SAMPLES);
+  if (popped == 0U) return 0U;
+
+  ret = APP_SdFile_WriteBytes(fmt_buf, WRITE_CHUNK_BYTES);
+  last_write_ms = HAL_GetTick() - t0;
+
+  /*
+   * 写入超预算或失败 → 暂停 SD，进入 backoff。
+   * WriteBytes 内部失败时已做 close_session_after_error 级联清理。
+   */
+  if ((ret != APP_SD_FILE_OK) || (last_write_ms > budget_ms))
+  {
+    if (ret != APP_SD_FILE_OK) { sd_last_error = (uint8_t)ret; }
+    sd_paused = 1U;
+    if (last_write_ms > budget_ms || ret != APP_SD_FILE_OK)
+    {
+      total_dropped += popped;
+      popped = 0U;
+    }
+    sd_state = SD_STATE_BACKOFF;
+    backoff_until = HAL_GetTick() + BACKOFF_MS;
+    return 0U;
+  }
+
+  sd_paused = 0U;
+  session_written += popped;
+  total_written += popped;
+  return popped;
 }
 
 /* ---- 公共 API ---- */
 
 void APP_DataLog_Init(void)
 {
-    APP_SdFile_Init();
-    sample_id = 0U;
-    csv_header_written = 0;
+  APP_SdFile_Init();
+  (void)memset(ring, 0, sizeof(ring));
+  ring_head   = 0U;
+  ring_tail   = 0U;
+  ring_count  = 0U;
+  total_dropped = 0U;
+  total_written = 0U;
+  write_seq     = 0U;
+  file_seq      = 0U;
+  sd_state     = SD_STATE_IDLE;
+  backoff_until = 0U;
+  sd_paused     = 0U;
+  sd_last_error = 0U;
+  last_write_ms = 0U;
+  last_backlog  = 0U;
+  session_written = 0U;
 }
 
-/*
- * 启动 SD 日志会话并写入 CSV 表头。
- *
- * 每次新会话都写入表头，因为可能遇到以下场景：
- *   - 日期翻日 → 新文件需要表头
- *   - 错误恢复 → 上一会话异常终止，文件末尾可能不完整
- * 重复表头行不影响 CSV 解析器（标准允许注释/头行出现在任意位置），
- * 且每个表头仅 56 字节，代价可忽略。
- */
-AppDataLogStatus_t APP_DataLog_StartSession(void)
+void APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
+                             int16_t ecg, uint8_t flags)
 {
-    AppSdFileStatus_t ret = APP_SdFile_StartSession();
-    if (ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)ret;
+  DataLogRawSample_t *dst;
 
-    ret = APP_SdFile_Write(CSV_HEADER);
-    if (ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)ret;
-    csv_header_written = 1;
-    return APP_DATA_LOG_OK;
+  /* 环形缓冲满 → 覆盖最旧记录 */
+  if (ring_count >= DATA_LOG_RING_SAMPLES)
+  {
+    ring_tail = (ring_tail + 1U) % DATA_LOG_RING_SAMPLES;
+    ring_count--;
+    total_dropped++;
+  }
+
+  dst = &ring[ring_head];
+  dst->tick  = tick;
+  dst->red   = red;
+  dst->ir    = ir;
+  dst->ecg   = ecg;
+  dst->flags = flags;
+  dst->seq   = write_seq++;
+
+  ring_head = (ring_head + 1U) % DATA_LOG_RING_SAMPLES;
+  ring_count++;
 }
 
-/*
- * 写一条完整的 CSV 记录（当前 26 字段：基础 8 项 + RR/IBI/HRV + motion/Poincare + 频域 HRV 扩展）。
- *
- * 每条记录包含：RED, IR, Baseline_IR, Finger, HR, SpO2, SignalQuality, PI_IR,
- *   RR_Valid, RR, IBI_Valid, IBI, HRV_Valid, Mean_IBI, SDNN, RMSSD,
- *   MotionArtifact, MotionScore, SD1, SD2, SD1_SD2, RhythmIrregular,
- *   HRV_Freq_Valid, LF_Power, HF_Power, LF_HF
- * 共调用 emit 26 次（每次写一行）。
- *
- * 写入失败时的提前返回：
- *   任何一次 emit 返回非 OK 状态，立即终止后续字段的写入并向上传播错误。
- *   caller（main.c 的 app_send_report_if_due）会通过 app_update_sd_log_status
- *   将错误状态同步到 AppState，OLED 显示侧据此展示 SD 卡异常。
- */
-/*
- * 写一条完整的 CSV 记录（当前 26 字段）。
- *
- * 懒启动策略：
- *   若 SD 日志会话尚未就绪，先尝试 APP_DataLog_StartSession() 挂载 SD、
- *   创建/打开 CSV 并写入表头。失败时 StartSession 内部会记录退避时间戳
- *  （RETRY_INTERVAL_MS），后续写入在退避期内快速返回，不阻塞主循环。
- *   成功时 APP_SdFile_Write 会正常缓冲数据。
- */
-AppDataLogStatus_t APP_DataLog_WriteRecord(const AppState_t *app)
+uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms, uint16_t max_bytes)
 {
-    char ts[24], st[8], vb[24];
-    uint32_t sid;
-    AppSdFileStatus_t write_ret;
+  uint16_t chunk_bytes;
+  uint16_t written;
 
-    if (app == NULL) return APP_DATA_LOG_CLOSED;
+  (void)max_bytes;
+  last_backlog = ring_count;
 
-    /* 懒启动：延迟到首次写入时才挂载 SD，避免坏卡/无卡阻塞启动流程。
-     * APP_DataLog_StartSession() 内部已含 60s 退避 + CSV 表头写入。 */
-    if (!APP_DataLog_IsReady())
+  switch (sd_state)
+  {
+  case SD_STATE_IDLE:
+    if ((ring_count >= DATA_LOG_CHUNK_SAMPLES) && backlog_ok_for_sd())
     {
-        AppDataLogStatus_t ret = APP_DataLog_StartSession();
-        if (ret != APP_DATA_LOG_OK) return ret;
+      sd_state = SD_STATE_TRY_START;
+      /* fall through */
     }
+    else { return 0U; }
+    /* fall through */
 
-    fmt_ts(&app->rtc_datetime, ts, sizeof(ts));
+  case SD_STATE_TRY_START:
+    if (!sd_try_start()) return 0U;
+    /* fall through */
 
-    if (app->rtc_time_valid != 0U)
-        (void)snprintf(st, sizeof(st), "OK");
-    else
-        (void)snprintf(st, sizeof(st), "NO_RTC");
+  case SD_STATE_ACTIVE:
+    /* 反压门控：backlog 过高时暂停写入（不进 BACKOFF，等 backlog 下降后自动恢复） */
+    if (!backlog_ok_for_sd())
+    {
+      return 0U;
+    }
+    chunk_bytes = (uint16_t)WRITE_CHUNK_BYTES;
+    written = sd_write_one_chunk(budget_ms);
+    if (written == 0U)
+    {
+      if (sd_state == SD_STATE_BACKOFF) return 0U;
+      if (!APP_SdFile_IsReady()) { sd_state = SD_STATE_IDLE; }
+      return 0U;
+    }
+    return chunk_bytes;
 
-    sid = sample_id++;
+  case SD_STATE_BACKOFF:
+    if (HAL_GetTick() >= backoff_until)
+    {
+      sd_state = SD_STATE_IDLE;
+      sd_paused = 0U;
+    }
+    return 0U;
 
-    (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->red_value);
-    write_ret = emit(ts, sid, st, "RED", vb, "count");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->ir_value);
-    write_ret = emit(ts, sid, st, "IR", vb, "count");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->baseline_ir);
-    write_ret = emit(ts, sid, st, "Baseline_IR", vb, "count");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->finger_present);
-    write_ret = emit(ts, sid, st, "Finger", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->bpm_value);
-    write_ret = emit(ts, sid, st, "HR", vb, "bpm");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->spo2_value);
-    write_ret = emit(ts, sid, st, "SpO2", vb, "%");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->signal_quality);
-    write_ret = emit(ts, sid, st, "SignalQuality", vb, "0-100");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->signal_ir_pi_x1000);
-    write_ret = emit(ts, sid, st, "PI_IR", vb, "x1000");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->rr_valid);
-    write_ret = emit(ts, sid, st, "RR_Valid", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->rr_bpm);
-    write_ret = emit(ts, sid, st, "RR", vb, "bpm");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ibi_valid);
-    write_ret = emit(ts, sid, st, "IBI_Valid", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->latest_ibi_ms);
-    write_ret = emit(ts, sid, st, "IBI", vb, "ms");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_valid);
-    write_ret = emit(ts, sid, st, "HRV_Valid", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_mean_ibi_ms);
-    write_ret = emit(ts, sid, st, "Mean_IBI", vb, "ms");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_sdnn_ms);
-    write_ret = emit(ts, sid, st, "SDNN", vb, "ms");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_rmssd_ms);
-    write_ret = emit(ts, sid, st, "RMSSD", vb, "ms");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->motion_artifact);
-    write_ret = emit(ts, sid, st, "MotionArtifact", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->motion_score);
-    write_ret = emit(ts, sid, st, "MotionScore", vb, "0-100");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_sd1_ms);
-    write_ret = emit(ts, sid, st, "SD1", vb, "ms");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_sd2_ms);
-    write_ret = emit(ts, sid, st, "SD2", vb, "ms");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_sd1_sd2_x100);
-    write_ret = emit(ts, sid, st, "SD1_SD2", vb, "x100");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->rhythm_irregular);
-    write_ret = emit(ts, sid, st, "RhythmIrregular", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_freq_valid);
-    write_ret = emit(ts, sid, st, "HRV_Freq_Valid", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->hrv_lf_power_x100);
-    write_ret = emit(ts, sid, st, "LF_Power", vb, "ms2x100");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%lu", (unsigned long)app->hrv_hf_power_x100);
-    write_ret = emit(ts, sid, st, "HF_Power", vb, "ms2x100");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->hrv_lf_hf_x100);
-    write_ret = emit(ts, sid, st, "LF_HF", vb, "x100");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ecg_valid);
-    write_ret = emit(ts, sid, st, "ECG_Valid", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ecg_hr);
-    write_ret = emit(ts, sid, st, "ECG_HR", vb, "bpm");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ecg_rr_ms);
-    write_ret = emit(ts, sid, st, "ECG_RR", vb, "ms");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ecg_lead_off);
-    write_ret = emit(ts, sid, st, "ECG_LeadOff", vb, "flags");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%d", (int)app->ecg_filtered);
-    write_ret = emit(ts, sid, st, "ECG_Filtered", vb, "LSB");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ptt_valid);
-    write_ret = emit(ts, sid, st, "PTT_Valid", vb, "bool");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    (void)snprintf(vb, sizeof(vb), "%u", (unsigned int)app->ptt_ms);
-    write_ret = emit(ts, sid, st, "PTT", vb, "ms");
-    if (write_ret != APP_SD_FILE_OK) return (AppDataLogStatus_t)write_ret;
-
-    return APP_DATA_LOG_OK;
-}
-
-AppDataLogStatus_t APP_DataLog_Flush(void)
-{
-    AppSdFileStatus_t ret = APP_SdFile_Flush();
-    return (AppDataLogStatus_t)ret;
-}
-
-uint32_t APP_DataLog_GetSampleId(void)
-{
-    return sample_id;
+  default:
+    sd_state = SD_STATE_IDLE;
+    return 0U;
+  }
 }
 
 /*
- * 查询当前 SD 日志会话是否可用，供 AppState 同步状态到显示层。
- *
- * 在 sd_card_ready 和 sd_log_active 标志中反映卡和文件系统的实时状态，
- * OLED 侧据此显示 "SD OK" / "SD ERR" 等状态提示。
+ * 手指离开时：分片排空至多 STOP_DRAIN_MAX_CHUNKS × 512B = 2KB，
+ * 剩余样本直接丢弃（2KB ≈ 0.6ms @ 12MHz SDIO，不影响重捕获）。
+ * 最后 APP_SdFile_StopSession 做 flush+f_sync+关闭文件。
  */
-bool APP_DataLog_IsReady(void)
+void APP_DataLog_OnMeasurementStop(void)
 {
-    return APP_SdFile_IsReady();
+  uint8_t drain_chunks = 0U;
+
+  while ((ring_count >= DATA_LOG_CHUNK_SAMPLES) && (drain_chunks < STOP_DRAIN_MAX_CHUNKS))
+  {
+    if (sd_state == SD_STATE_IDLE || sd_state == SD_STATE_BACKOFF)
+    {
+      if (!sd_try_start()) break;
+    }
+    if (sd_write_one_chunk(10U) == 0U) break;
+    drain_chunks++;
+  }
+
+  /* 排空最后不足一个 chunk 的样本（至多 31 样本 = 496B） */
+  if ((ring_count > 0U) && (sd_state == SD_STATE_ACTIVE) && (drain_chunks < STOP_DRAIN_MAX_CHUNKS))
+  {
+    uint16_t remaining = ring_pop((DataLogRawSample_t *)fmt_buf, ring_count);
+    if (remaining > 0U)
+    {
+      (void)APP_SdFile_WriteBytes(fmt_buf, (uint16_t)(remaining * sizeof(DataLogRawSample_t)));
+      total_written += remaining;
+      session_written += remaining;
+    }
+  }
+
+  /* 丢弃剩余未排空的样本（drain_chunks 已达上限或 SD 不可用） */
+  if (ring_count > 0U)
+  {
+    total_dropped += ring_count;
+    ring_tail = ring_head;
+    ring_count = 0U;
+  }
+
+  /* 停止会话 → f_sync → 关闭文件 */
+  APP_SdFile_StopSession();
+  sd_state = SD_STATE_IDLE;
+  sd_paused = 0U;
+  file_seq = (file_seq + 1U) % 100U;
+  session_written = 0U;
 }
 
-/* 返回自本次上电以来的累计落盘次数（每次 flush 计一次） */
-uint32_t APP_DataLog_GetTotalWritten(void)
+void APP_DataLog_GetStatus(DataLogStatus_t *status)
 {
-    return APP_SdFile_GetTotalWritten();
+  if (status == NULL) return;
+  status->buffered      = ring_count;
+  status->dropped       = (uint16_t)(total_dropped > 0xFFFFU ? 0xFFFFU : total_dropped);
+  status->written       = session_written;
+  status->paused        = sd_paused;
+  status->sd_error      = sd_last_error;
+  status->state         = (uint8_t)sd_state;
+  status->last_write_ms = last_write_ms;
+  status->last_backlog  = last_backlog;
 }
 
-/* 返回自本次上电以来的累计写错误次数（写失败 + f_sync 失败 + lseek 失败） */
-uint32_t APP_DataLog_GetErrorCount(void)
+uint8_t APP_DataLog_IsActive(void)
 {
-    return APP_SdFile_GetErrorCount();
+  return (sd_state == SD_STATE_ACTIVE) ? 1U : 0U;
 }
