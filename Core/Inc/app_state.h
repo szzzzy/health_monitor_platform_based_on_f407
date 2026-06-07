@@ -40,6 +40,7 @@ typedef enum
   DBG_SUB_D4_PPG_Q,
   DBG_SUB_D5_ALGO,
   DBG_SUB_D6_SYS,
+  DBG_SUB_D7_SD,
   DBG_SUB_COUNT
 } DebugSubPage_t;
 
@@ -89,8 +90,19 @@ typedef struct
   uint32_t display_last_refresh_tick;
   uint8_t sensor_fifo_write_ptr;
   uint8_t sensor_fifo_read_ptr;
-  uint8_t sensor_fifo_overflow_count;
+  uint16_t sensor_fifo_overflow_count;
   uint8_t sensor_fifo_available_samples;
+  uint16_t fifo_high_watermark;      /* 批量 drain 的峰值样本数，用于 backlog 门控 */
+  uint16_t max_sample_gap_ms;        /* 连续样本间最大时间间隔 (ms) */
+  uint16_t display_skipped_count;    /* 累计跳过的 OLED 刷新次数 */
+  uint8_t  flush_pending;            /* 1 = DeferredStop 待执行 */
+  uint32_t fifo_overflow_total;      /* FIFO overflow 累计次数 */
+  uint32_t oled_reinit_count;        /* OLED 重新初始化次数 */
+  uint32_t i2c_recover_count;        /* I2C 总线恢复次数（启动+运行时） */
+  uint16_t ui_forced_count;          /* OLED 强制刷新次数（跳过超时后） */
+  uint32_t last_ui_skip_tick;        /* 最近一次 OLED 跳过的时间戳 */
+  uint32_t max_task_heartbeat;       /* MAXtask 心跳（每轮递增） */
+  uint32_t ui_task_heartbeat;        /* UiTask 心跳（每轮递增） */
   uint8_t raw_signal_present;
   uint8_t signal_quality;
   /*

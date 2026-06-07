@@ -22,7 +22,7 @@
 #include "main.h"
 #include <string.h>
 
-/* 环形缓冲：2048 × 16B = 32KB */
+/* Ring buffer: 2048 x 16B = 32KB. */
 static DataLogRawSample_t ring[DATA_LOG_RING_SAMPLES];
 static uint16_t ring_head  = 0U;
 static uint16_t ring_tail  = 0U;
@@ -48,22 +48,70 @@ static uint32_t   last_write_ms = 0U;
 static uint32_t   last_backlog  = 0U;
 static uint16_t   session_written = 0U;
 
+/* 测量活跃门控 */
+static uint8_t    measurement_active = 0U;
+
+/* 延迟 flush 状态机 */
+static uint8_t    flush_pending = 0U;
+typedef enum {
+  FLUSH_STATE_IDLE = 0,
+  FLUSH_STATE_DRAINING,
+  FLUSH_STATE_SYNC,
+  FLUSH_STATE_DONE
+} FlushDeferredState_t;
+static FlushDeferredState_t flush_deferred_state = FLUSH_STATE_IDLE;
+#define FLUSH_DRAIN_MAX_CHUNKS 8U
+
 #define BACKOFF_MS       60000U
 #define WRITE_CHUNK_BYTES ((uint32_t)DATA_LOG_CHUNK_SAMPLES * sizeof(DataLogRawSample_t))
 
 /* 反压阈值：ring 超过此比例则拒绝启动/恢复 SD 写入 */
 #define BACKLOG_START_GUARD  (DATA_LOG_RING_SAMPLES / 4U)   /* 25% = 512 样本 */
 #define BACKLOG_PAUSE_GUARD  (DATA_LOG_RING_SAMPLES / 2U)   /* 50% = 1024 样本 */
-#define STOP_DRAIN_MAX_CHUNKS 4U  /* 手指离开时最多排空 4 chunk (2KB)，保证重捕获体验 */
-
 /* 格式化缓冲区：文件头(32B) + chunk(512B) = 544B，无需更大 */
 static uint8_t fmt_buf[sizeof(DataLogFileHeader_t) + WRITE_CHUNK_BYTES];
 
 /* ---- 内部辅助 ---- */
 
+static uint32_t ring_enter_critical(void)
+{
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  return primask;
+}
+
+static void ring_exit_critical(uint32_t primask)
+{
+  if ((primask & 1U) == 0U)
+  {
+    __enable_irq();
+  }
+}
+
+static uint16_t ring_get_count(void)
+{
+  uint16_t count;
+  uint32_t primask = ring_enter_critical();
+  count = ring_count;
+  ring_exit_critical(primask);
+  return count;
+}
+
+static uint16_t ring_clear_pending(void)
+{
+  uint16_t dropped;
+  uint32_t primask = ring_enter_critical();
+  dropped = ring_count;
+  ring_tail = ring_head;
+  ring_count = 0U;
+  ring_exit_critical(primask);
+  return dropped;
+}
 static uint16_t ring_pop(DataLogRawSample_t *dst, uint16_t count)
 {
   uint16_t copied = 0U;
+  uint32_t primask = ring_enter_critical();
+
   while ((copied < count) && (ring_count > 0U))
   {
     (void)memcpy(&dst[copied], &ring[ring_tail], sizeof(DataLogRawSample_t));
@@ -71,18 +119,22 @@ static uint16_t ring_pop(DataLogRawSample_t *dst, uint16_t count)
     ring_count--;
     copied++;
   }
+
+  ring_exit_critical(primask);
   return copied;
 }
 
 /* 检查反压：ring 积压过多 → 不入队，让 FIFO 优先 */
 static uint8_t backlog_ok_for_sd(void)
 {
-  if (ring_count >= BACKLOG_PAUSE_GUARD)
+  uint16_t count = ring_get_count();
+
+  if (count >= BACKLOG_PAUSE_GUARD)
   {
     sd_paused = 1U;
     return 0U;
   }
-  if (ring_count >= BACKLOG_START_GUARD)
+  if (count >= BACKLOG_START_GUARD)
   {
     return 0U;
   }
@@ -90,12 +142,22 @@ static uint8_t backlog_ok_for_sd(void)
 }
 
 /* 启动/重新启动 SD 二进制日志会话。受 backlog_ok_for_sd 门控。 */
-static uint8_t sd_try_start(void)
+static uint8_t sd_try_start(uint8_t enforce_backlog_guard)
 {
   AppSdFileStatus_t ret;
   DataLogFileHeader_t header;
 
-  if (!backlog_ok_for_sd()) return 0U;
+  if (sd_state == SD_STATE_BACKOFF)
+  {
+    if (HAL_GetTick() < backoff_until)
+    {
+      return 0U;
+    }
+    sd_state = SD_STATE_IDLE;
+    sd_paused = 0U;
+  }
+
+  if ((enforce_backlog_guard != 0U) && (!backlog_ok_for_sd())) return 0U;
 
   ret = APP_SdFile_StartSession();
   if (ret != APP_SD_FILE_OK)
@@ -140,7 +202,7 @@ static uint16_t sd_write_one_chunk(uint32_t budget_ms)
   AppSdFileStatus_t ret;
   uint16_t popped;
 
-  if (ring_count < DATA_LOG_CHUNK_SAMPLES) return 0U;
+  if (ring_get_count() < DATA_LOG_CHUNK_SAMPLES) return 0U;
 
   t0 = HAL_GetTick();
   popped = ring_pop((DataLogRawSample_t *)fmt_buf, DATA_LOG_CHUNK_SAMPLES);
@@ -153,23 +215,28 @@ static uint16_t sd_write_one_chunk(uint32_t budget_ms)
    * 写入超预算或失败 → 暂停 SD，进入 backoff。
    * WriteBytes 内部失败时已做 close_session_after_error 级联清理。
    */
-  if ((ret != APP_SD_FILE_OK) || (last_write_ms > budget_ms))
+  if (ret != APP_SD_FILE_OK)
   {
-    if (ret != APP_SD_FILE_OK) { sd_last_error = (uint8_t)ret; }
+    sd_last_error = (uint8_t)ret;
     sd_paused = 1U;
-    if (last_write_ms > budget_ms || ret != APP_SD_FILE_OK)
-    {
-      total_dropped += popped;
-      popped = 0U;
-    }
+    total_dropped += popped;
+    sd_state = SD_STATE_BACKOFF;
+    backoff_until = HAL_GetTick() + BACKOFF_MS;
+    return 0U;
+  }
+
+  session_written += popped;
+  total_written += popped;
+
+  if (last_write_ms > budget_ms)
+  {
+    sd_paused = 1U;
     sd_state = SD_STATE_BACKOFF;
     backoff_until = HAL_GetTick() + BACKOFF_MS;
     return 0U;
   }
 
   sd_paused = 0U;
-  session_written += popped;
-  total_written += popped;
   return popped;
 }
 
@@ -193,14 +260,18 @@ void APP_DataLog_Init(void)
   last_write_ms = 0U;
   last_backlog  = 0U;
   session_written = 0U;
+  measurement_active = 0U;
+  flush_pending = 0U;
+  flush_deferred_state = FLUSH_STATE_IDLE;
 }
 
 void APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
                              int16_t ecg, uint8_t flags)
 {
   DataLogRawSample_t *dst;
+  uint32_t primask = ring_enter_critical();
 
-  /* 环形缓冲满 → 覆盖最旧记录 */
+  /* Ring full: overwrite the oldest sample. */
   if (ring_count >= DATA_LOG_RING_SAMPLES)
   {
     ring_tail = (ring_tail + 1U) % DATA_LOG_RING_SAMPLES;
@@ -218,20 +289,23 @@ void APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
 
   ring_head = (ring_head + 1U) % DATA_LOG_RING_SAMPLES;
   ring_count++;
+  ring_exit_critical(primask);
 }
-
 uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms, uint16_t max_bytes)
 {
   uint16_t chunk_bytes;
   uint16_t written;
 
   (void)max_bytes;
-  last_backlog = ring_count;
+  last_backlog = ring_get_count();
+
+  /* 测量活跃时禁止一切物理 SD I/O，包括 f_write */
+  if (measurement_active != 0U) { return 0U; }
 
   switch (sd_state)
   {
   case SD_STATE_IDLE:
-    if ((ring_count >= DATA_LOG_CHUNK_SAMPLES) && backlog_ok_for_sd())
+    if ((ring_get_count() >= DATA_LOG_CHUNK_SAMPLES) && backlog_ok_for_sd())
     {
       sd_state = SD_STATE_TRY_START;
       /* fall through */
@@ -240,7 +314,7 @@ uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms, uint16_t max_bytes)
     /* fall through */
 
   case SD_STATE_TRY_START:
-    if (!sd_try_start()) return 0U;
+    if (!sd_try_start(1U)) return 0U;
     /* fall through */
 
   case SD_STATE_ACTIVE:
@@ -274,56 +348,23 @@ uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms, uint16_t max_bytes)
 }
 
 /*
- * 手指离开时：分片排空至多 STOP_DRAIN_MAX_CHUNKS × 512B = 2KB，
- * 剩余样本直接丢弃（2KB ≈ 0.6ms @ 12MHz SDIO，不影响重捕获）。
- * 最后 APP_SdFile_StopSession 做 flush+f_sync+关闭文件。
+ * 手指离开时：仅设置延迟 flush 标志 (O(1))。
+ * 实际 drain + f_sync + f_close 由 APP_DataLog_ServiceDeferredStop() 在安全窗口分片执行。
  */
 void APP_DataLog_OnMeasurementStop(void)
 {
-  uint8_t drain_chunks = 0U;
-
-  while ((ring_count >= DATA_LOG_CHUNK_SAMPLES) && (drain_chunks < STOP_DRAIN_MAX_CHUNKS))
-  {
-    if (sd_state == SD_STATE_IDLE || sd_state == SD_STATE_BACKOFF)
-    {
-      if (!sd_try_start()) break;
-    }
-    if (sd_write_one_chunk(10U) == 0U) break;
-    drain_chunks++;
-  }
-
-  /* 排空最后不足一个 chunk 的样本（至多 31 样本 = 496B） */
-  if ((ring_count > 0U) && (sd_state == SD_STATE_ACTIVE) && (drain_chunks < STOP_DRAIN_MAX_CHUNKS))
-  {
-    uint16_t remaining = ring_pop((DataLogRawSample_t *)fmt_buf, ring_count);
-    if (remaining > 0U)
-    {
-      (void)APP_SdFile_WriteBytes(fmt_buf, (uint16_t)(remaining * sizeof(DataLogRawSample_t)));
-      total_written += remaining;
-      session_written += remaining;
-    }
-  }
-
-  /* 丢弃剩余未排空的样本（drain_chunks 已达上限或 SD 不可用） */
-  if (ring_count > 0U)
-  {
-    total_dropped += ring_count;
-    ring_tail = ring_head;
-    ring_count = 0U;
-  }
-
-  /* 停止会话 → f_sync → 关闭文件 */
-  APP_SdFile_StopSession();
-  sd_state = SD_STATE_IDLE;
-  sd_paused = 0U;
-  file_seq = (file_seq + 1U) % 100U;
-  session_written = 0U;
+  flush_pending = 1U;
+  flush_deferred_state = FLUSH_STATE_IDLE;
 }
 
 void APP_DataLog_GetStatus(DataLogStatus_t *status)
 {
+  uint16_t buffered;
+
   if (status == NULL) return;
-  status->buffered      = ring_count;
+
+  buffered = ring_get_count();
+  status->buffered      = buffered;
   status->dropped       = (uint16_t)(total_dropped > 0xFFFFU ? 0xFFFFU : total_dropped);
   status->written       = session_written;
   status->paused        = sd_paused;
@@ -332,8 +373,109 @@ void APP_DataLog_GetStatus(DataLogStatus_t *status)
   status->last_write_ms = last_write_ms;
   status->last_backlog  = last_backlog;
 }
-
 uint8_t APP_DataLog_IsActive(void)
 {
   return (sd_state == SD_STATE_ACTIVE) ? 1U : 0U;
+}
+
+void APP_DataLog_SetMeasurementActive(uint8_t active)
+{
+  measurement_active = active;
+}
+
+/*
+ * 分片延迟 flush 状态机。
+ * 每轮只做一个动作（1 chunk f_write 或 1 次 f_sync+f_close），
+ * 避免在安全窗口一次性阻塞过久。
+ *
+ * 状态转移: IDLE → DRAINING → SYNC → DONE → IDLE
+ * 仅在 finger_present==0 的安全窗口由 main.c 调用。
+ */
+uint8_t APP_DataLog_ServiceDeferredStop(void)
+{
+  if (flush_pending == 0U) { return 0U; }
+
+  switch (flush_deferred_state)
+  {
+  case FLUSH_STATE_IDLE:
+    /* 检查是否有 session 可用；如无，丢弃 ring 后直接完成 */
+    if (sd_state != SD_STATE_ACTIVE)
+    {
+      /* 尝试启动 session 以便写剩余数据 */
+      if (!sd_try_start(0U))
+      {
+        /* 启动失败时保留 ring，等待 BACKOFF 到期后继续尝试。 */
+        return 0U;
+      }
+    }
+    flush_deferred_state = FLUSH_STATE_DRAINING;
+    /* fall through */
+
+  case FLUSH_STATE_DRAINING:
+    if (sd_state != SD_STATE_ACTIVE)
+    {
+      flush_deferred_state = FLUSH_STATE_IDLE;
+      return 0U;
+    }
+
+    if (ring_get_count() >= DATA_LOG_CHUNK_SAMPLES)
+    {
+      (void)sd_write_one_chunk(10U);
+      return 0U; /* 还有数据，下轮继续 drain */
+    }
+    /* ring 不足一个 chunk → 排空剩余零散样本 */
+    if (ring_get_count() > 0U)
+    {
+      uint16_t remaining = ring_pop((DataLogRawSample_t *)fmt_buf, ring_get_count());
+      if (remaining > 0U)
+      {
+        AppSdFileStatus_t ret = APP_SdFile_WriteBytes(fmt_buf,
+            (uint16_t)(remaining * sizeof(DataLogRawSample_t)));
+        if (ret == APP_SD_FILE_OK)
+        {
+          total_written += remaining;
+          session_written += remaining;
+        }
+        else
+        {
+          sd_last_error = (uint8_t)ret;
+          total_dropped += remaining;
+          sd_state = SD_STATE_BACKOFF;
+          sd_paused = 1U;
+          backoff_until = HAL_GetTick() + BACKOFF_MS;
+          flush_deferred_state = FLUSH_STATE_IDLE;
+          return 0U;
+        }
+      }
+    }
+    flush_deferred_state = FLUSH_STATE_SYNC;
+    /* fall through */
+
+  case FLUSH_STATE_SYNC:
+    APP_SdFile_StopSession();
+    {
+      uint16_t leftover = ring_clear_pending();
+      total_dropped += leftover;
+    }
+    sd_state = SD_STATE_IDLE;
+    sd_paused = 0U;
+    flush_deferred_state = FLUSH_STATE_DONE;
+    /* fall through */
+
+  case FLUSH_STATE_DONE:
+    flush_pending = 0U;
+    flush_deferred_state = FLUSH_STATE_IDLE;
+    file_seq = (file_seq + 1U) % 100U;
+    session_written = 0U;
+    return 1U;
+
+  default:
+    flush_deferred_state = FLUSH_STATE_IDLE;
+    return 0U;
+  }
+}
+
+uint8_t APP_DataLog_IsFlushPending(void)
+{
+  return flush_pending;
 }

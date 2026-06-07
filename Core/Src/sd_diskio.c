@@ -6,7 +6,7 @@
   * 实现 FatFs 要求的 5 个 disk_* 函数 + get_fattime()。
   * 所有 SD 卡访问通过 app_sd_card 抽象层，不直接操作 HAL。
   *
-  * 调用链：main.c → APP_DataLog_Service() → APP_SdFile_Write()
+ * 调用链：main.c → APP_DataLog_ServiceBudget() → APP_SdFile_WriteBytes()
   *         → f_write() → disk_write() → APP_SD_Card_Write() → HAL_SD_WriteBlocks()
   *
   * 错误隔离：disk_read/disk_write 失败时自动设置 STA_NOINIT，

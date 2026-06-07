@@ -5,7 +5,7 @@
   *
   * 职责：
   *   - 挂载 / 卸载 FAT 卷
-  *   - 按日创建 / 追加 CSV 文件（YYYYMMDD_NN.CSV）
+ *   - 按日创建 / 追加二进制日志文件（YYYYMMDD_NN.BIN）
   *   - 2KB 缓冲批量写入 + f_sync
   *   - 写失败自动关闭会话，每 60s 重试
   ******************************************************************************
@@ -19,20 +19,14 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SYNC_INTERVAL_FLUSHES     255U   /* 测量中几乎不做 f_sync；停止时 StopSession 强制 sync */
-
 static FATFS   fatfs;
 static FIL     log_file;
 static bool    volume_mounted  = false;
 static bool    session_active  = false;
 static uint16_t current_file_date;
 
-static char     wr_buf[APP_SD_FILE_BUF_SIZE];
-static uint16_t wr_buf_pos = 0U;
-
 static uint32_t total_flushes = 0U;
 static uint32_t total_errors  = 0U;
-static uint8_t  flushes_since_sync = 0;
 
 /* ---- 辅助 ---- */
 
@@ -66,8 +60,6 @@ static void close_session_after_error(void)
 
     APP_SD_Card_Deinit();
     sd_diskio_invalidate();
-    wr_buf_pos = 0U;
-    flushes_since_sync = 0;
     total_errors++;
 }
 
@@ -109,7 +101,7 @@ static uint8_t find_next_sequence(const char *date_prefix)
     uint8_t next_seq = 0U;
     char    pattern[16];
 
-    (void)snprintf(pattern, sizeof(pattern), "%s_*.CSV", date_prefix);
+    (void)snprintf(pattern, sizeof(pattern), "%s_*.BIN", date_prefix);
     if (f_findfirst(&dir, &fno, "", pattern) != FR_OK) return 0U;
 
     while (fno.fname[0] != '\0')
@@ -134,55 +126,6 @@ static uint8_t find_next_sequence(const char *date_prefix)
     return next_seq;
 }
 
-/*
- * 将缓冲区内容写入 SD 卡。
- *
- * force_sync = true  → 强制 f_sync（StopSession / 日期切换）
- * force_sync = false → 仅在累计 SYNC_INTERVAL_FLUSHES 次后才 f_sync，
- *                      减少 FAT/目录元数据回写次数，降低主循环阻塞风险。
- */
-static AppSdFileStatus_t flush_internal(bool force_sync)
-{
-    FRESULT fr;
-    UINT    bw;
-
-    if (!session_active || (wr_buf_pos == 0U)) return APP_SD_FILE_OK;
-
-    fr = f_write(&log_file, wr_buf, wr_buf_pos, &bw);
-    if ((fr != FR_OK) || (bw != wr_buf_pos))
-    {
-        close_session_after_error();
-        return APP_SD_FILE_WRITE_ERROR;
-    }
-
-    wr_buf_pos = 0U;
-    flushes_since_sync++;
-
-    if (force_sync || (flushes_since_sync >= SYNC_INTERVAL_FLUSHES))
-    {
-        fr = f_sync(&log_file);
-        if (fr != FR_OK)
-        {
-            close_session_after_error();
-            return APP_SD_FILE_WRITE_ERROR;
-        }
-        flushes_since_sync = 0;
-    }
-
-    total_flushes++;
-    return APP_SD_FILE_OK;
-}
-
-static bool check_date_rollover(void)
-{
-    APP_RTC_DateTime_t dt;
-    char prefix[16];
-
-    (void)APP_RTC_GetDateTime(&dt);
-    make_date_prefix(&dt, prefix, sizeof(prefix));
-    return (pack_date(prefix) != current_file_date);
-}
-
 /* ---- 公共 API ---- */
 
 void APP_SdFile_Init(void)
@@ -191,14 +134,12 @@ void APP_SdFile_Init(void)
     (void)memset(&log_file, 0, sizeof(log_file));
     volume_mounted  = false;
     session_active  = false;
-    wr_buf_pos        = 0U;
     total_flushes     = 0U;
     total_errors      = 0U;
-    flushes_since_sync = 0;
 }
 
 /*
- * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 CSV → 定位到文件末尾。
+ * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 BIN → 定位到文件末尾。
  *
  * 限频重试：若上次尝试失败，须等待 RETRY_INTERVAL_MS 后才允许重试，
  * 避免在坏卡/无卡场景下每个 report 周期（200ms）都阻塞在 init/mount。
@@ -208,7 +149,7 @@ void APP_SdFile_Init(void)
  * 丢弃半打开文件、卸载卷、Deinit 卡、同步 STA_NOINIT、设置退避时间戳。
  */
 /*
- * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 CSV → 定位到文件末尾。
+ * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 BIN → 定位到文件末尾。
  *
  * 由 APP_DataLog_Service() 状态机驱动调用，重试时序由状态机的
  * ERROR_BACKOFF 控制，此处不再做额外的退避限频。
@@ -241,7 +182,7 @@ AppSdFileStatus_t APP_SdFile_StartSession(void)
     current_file_date = pack_date(date_prefix);
     seq = find_next_sequence(date_prefix);
 
-    (void)snprintf(file_path, sizeof(file_path), "%s_%02u.CSV",
+    (void)snprintf(file_path, sizeof(file_path), "%s_%02u.BIN",
                    date_prefix, (unsigned int)seq);
 
     fr = f_open(&log_file, file_path, FA_OPEN_APPEND | FA_WRITE);
@@ -267,28 +208,20 @@ AppSdFileStatus_t APP_SdFile_StartSession(void)
     }
 
     session_active    = true;
-    wr_buf_pos        = 0U;
-    flushes_since_sync = 0;
     return APP_SD_FILE_OK;
 }
 
 /*
- * 停止文件会话：先刷缓冲、再关文件、卸载卷、反初始化卡。
- *
- * 注意：flush_internal() 在遇到写入错误时会调用 close_session_after_error()
- * 自行做完整级联清理，并将 session_active 设为 false。
- * 因此后续的 f_close / f_mount / APP_SD_Card_Deinit 都需要检查
- * session_active / volume_mounted 标志，防止重复关闭/卸载。 */
+ * 停止文件会话：f_sync + f_close + 卸载卷 + 反初始化卡。
+ * 仅在 finger_present==0 的安全窗口调用。
+ */
 void APP_SdFile_StopSession(void)
 {
     if (session_active)
     {
-        (void)flush_internal(true);   /* StopSession 强制 f_sync，保证数据不丢 */
-        if (session_active)
-        {
-            (void)f_close(&log_file);
-            session_active = false;
-        }
+        (void)f_sync(&log_file);
+        (void)f_close(&log_file);
+        session_active = false;
     }
     if (volume_mounted)
     {
@@ -296,65 +229,12 @@ void APP_SdFile_StopSession(void)
         volume_mounted = false;
     }
     APP_SD_Card_Deinit();
-    sd_diskio_invalidate();       /* 同步 FatFs STA_NOINIT */
-    wr_buf_pos = 0U;
+    sd_diskio_invalidate();
 }
 
 bool APP_SdFile_IsReady(void)
 {
     return session_active;
-}
-
-AppSdFileStatus_t APP_SdFile_Write(const char *str)
-{
-    size_t len;
-    const char *p;
-
-    if (str == NULL) return APP_SD_FILE_CLOSED;
-
-    /* 无会话直接拒写，由上层 APP_DataLog_Service 负责懒启动会话 */
-    if (!session_active) return APP_SD_FILE_CLOSED;
-
-    /* 日期翻日：正常关闭当前会话并启动新会话 */
-    if (check_date_rollover())
-    {
-        APP_SdFile_StopSession();
-        /* 此处不调用 StartSession — 由上层 WriteRecord 的懒启动逻辑在
-         * 下一轮重试，避免日期切换路径被坏卡阻塞 */
-        return APP_SD_FILE_CLOSED;
-    }
-
-    len = strlen(str);
-    if (len == 0U) return APP_SD_FILE_OK;
-
-    p = str;
-    while (len > 0U)
-    {
-        size_t room;
-        size_t chunk;
-
-        if (wr_buf_pos >= APP_SD_FILE_BUF_SIZE)
-        {
-            AppSdFileStatus_t ret = flush_internal(false);
-            if (ret != APP_SD_FILE_OK) return ret;
-        }
-
-        room = APP_SD_FILE_BUF_SIZE - wr_buf_pos;
-        chunk = (len < room) ? len : room;
-
-        (void)memcpy(wr_buf + wr_buf_pos, p, chunk);
-        wr_buf_pos += (uint16_t)chunk;
-        p += chunk;
-        len -= chunk;
-
-        if (wr_buf_pos >= APP_SD_FILE_BUF_SIZE)
-        {
-            AppSdFileStatus_t ret = flush_internal(false);
-            if (ret != APP_SD_FILE_OK) return ret;
-        }
-    }
-
-    return APP_SD_FILE_OK;
 }
 
 /*
@@ -385,10 +265,15 @@ AppSdFileStatus_t APP_SdFile_WriteBytes(const void *data, uint16_t len)
 
 AppSdFileStatus_t APP_SdFile_Flush(void)
 {
+    FRESULT fr;
     if (!session_active) return APP_SD_FILE_CLOSED;
-    AppSdFileStatus_t ret = flush_internal(false);
-    if (ret != APP_SD_FILE_OK) (void)APP_SdFile_StopSession();
-    return ret;
+    fr = f_sync(&log_file);
+    if (fr != FR_OK)
+    {
+        close_session_after_error();
+        return APP_SD_FILE_WRITE_ERROR;
+    }
+    return APP_SD_FILE_OK;
 }
 
 uint32_t APP_SdFile_GetTotalWritten(void) { return total_flushes; }

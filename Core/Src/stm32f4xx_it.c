@@ -62,6 +62,8 @@
 /* External variables --------------------------------------------------------*/
 extern DMA_HandleTypeDef hdma_adc1;
 extern TIM_HandleTypeDef htim6;
+extern TIM_HandleTypeDef htim7;
+
 /* USER CODE BEGIN EV */
 extern volatile uint8_t tim6_tick_flag;
 /* USER CODE END EV */
@@ -145,19 +147,6 @@ void UsageFault_Handler(void)
 }
 
 /**
-  * @brief This function handles System service call via SWI instruction.
-  */
-void SVC_Handler(void)
-{
-  /* USER CODE BEGIN SVCall_IRQn 0 */
-
-  /* USER CODE END SVCall_IRQn 0 */
-  /* USER CODE BEGIN SVCall_IRQn 1 */
-
-  /* USER CODE END SVCall_IRQn 1 */
-}
-
-/**
   * @brief This function handles Debug monitor.
   */
 void DebugMon_Handler(void)
@@ -168,33 +157,6 @@ void DebugMon_Handler(void)
   /* USER CODE BEGIN DebugMonitor_IRQn 1 */
 
   /* USER CODE END DebugMonitor_IRQn 1 */
-}
-
-/**
-  * @brief This function handles Pendable request for system service.
-  */
-void PendSV_Handler(void)
-{
-  /* USER CODE BEGIN PendSV_IRQn 0 */
-
-  /* USER CODE END PendSV_IRQn 0 */
-  /* USER CODE BEGIN PendSV_IRQn 1 */
-
-  /* USER CODE END PendSV_IRQn 1 */
-}
-
-/**
-  * @brief This function handles System tick timer.
-  */
-void SysTick_Handler(void)
-{
-  /* USER CODE BEGIN SysTick_IRQn 0 */
-
-  /* USER CODE END SysTick_IRQn 0 */
-  HAL_IncTick();
-  /* USER CODE BEGIN SysTick_IRQn 1 */
-
-  /* USER CODE END SysTick_IRQn 1 */
 }
 
 /******************************************************************************/
@@ -219,6 +181,20 @@ void TIM6_DAC_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles TIM7 global interrupt.
+  */
+void TIM7_IRQHandler(void)
+{
+  /* USER CODE BEGIN TIM7_IRQn 0 */
+
+  /* USER CODE END TIM7_IRQn 0 */
+  HAL_TIM_IRQHandler(&htim7);
+  /* USER CODE BEGIN TIM7_IRQn 1 */
+
+  /* USER CODE END TIM7_IRQn 1 */
+}
+
+/**
   * @brief This function handles DMA2 stream0 global interrupt.
   */
 void DMA2_Stream0_IRQHandler(void)
@@ -233,14 +209,6 @@ void DMA2_Stream0_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-  if ((htim != NULL) && (htim->Instance == TIM6))
-  {
-    tim6_tick_flag = 1U;
-  }
-}
-
 void DMA1_Stream5_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(huart2.hdmarx);
@@ -277,8 +245,8 @@ void I2C1_ER_IRQHandler(void)
 }
 
 /* MAX30102 PPG_RDY 中断（PE5 下降沿）
- * 因 PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发。
- * 系统会通过 TIM6 节拍兜底轮询。 */
+ * �? PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发�?
+ * 系统会�?�过 TIM6 节拍兜底轮询�? */
 /* HAL GPIO EXTI 统一回调，按引脚分发 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {

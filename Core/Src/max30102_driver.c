@@ -420,3 +420,95 @@ void max30102_parse_spo2_sample(const uint8_t *fifo_data, uint32_t *red, uint32_
         ((uint32_t)fifo_data[5]);
   *ir &= 0x03FFFFU;
 }
+
+/* ---- 批量 FIFO drain ---- */
+
+static uint8_t fifo_batch_raw[MAX30102_FIFO_DEPTH * MAX30102_FIFO_BYTES_PER_SAMPLE_SPO2];
+
+uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
+                                  uint8_t max_count, uint8_t *p_ovf)
+{
+  HAL_StatusTypeDef status;
+  uint8_t wr_ptr, rd_ptr, ovf;
+  uint8_t available, to_read;
+  uint8_t i;
+
+  if ((red == NULL) || (ir == NULL) || (p_ovf == NULL) || (max_count == 0U))
+  {
+    return 0U;
+  }
+
+  *p_ovf = 0U;
+
+  /* Step 1: read FIFO pointers */
+  status = max30102_read_reg(MAX30102_REG_OVF_COUNTER, &ovf);
+  if (status != HAL_OK) { return 0U; }
+
+  status = max30102_read_reg(MAX30102_REG_FIFO_WR_PTR, &wr_ptr);
+  if (status != HAL_OK) { return 0U; }
+
+  status = max30102_read_reg(MAX30102_REG_FIFO_RD_PTR, &rd_ptr);
+  if (status != HAL_OK) { return 0U; }
+
+  ovf &= MAX30102_FIFO_PTR_MASK;
+  wr_ptr &= MAX30102_FIFO_PTR_MASK;
+  rd_ptr &= MAX30102_FIFO_PTR_MASK;
+
+  max30102_fifo_debug.overflow_count = ovf;
+  max30102_fifo_debug.write_ptr = wr_ptr;
+  max30102_fifo_debug.read_ptr = rd_ptr;
+
+  /* Step 2: handle overflow — clear FIFO, return 0 with *p_ovf set */
+  if (ovf > 0U)
+  {
+    *p_ovf = ovf;
+    (void)max30102_clear_fifo();
+    max30102_fifo_debug.available_samples = 0U;
+#if (MAX30102_USE_INT_PIN != 0U)
+    (void)max30102_clear_interrupt_status();
+#endif
+    max30102_data_ready_flag = 1U;
+    max30102_poll_fallback_ticks = 0U;
+    return 0U;
+  }
+
+  /* Step 3: compute available samples */
+  available = (uint8_t)((wr_ptr - rd_ptr) & (MAX30102_FIFO_DEPTH - 1U));
+  max30102_fifo_debug.available_samples = available;
+
+  if (available == 0U) { return 0U; }
+
+  to_read = (available < max_count) ? available : max_count;
+
+  /* Step 4: burst-read FIFO data — one I2C transaction for all samples */
+  status = HAL_I2C_Mem_Read(&hi2c1,
+                             MAX30102_I2C_ADDR,
+                             MAX30102_REG_FIFO_DATA,
+                             I2C_MEMADD_SIZE_8BIT,
+                             fifo_batch_raw,
+                             (uint16_t)(to_read * MAX30102_FIFO_BYTES_PER_SAMPLE_SPO2),
+                             MAX30102_FIFO_READ_TIMEOUT_MS);
+  if (status != HAL_OK)
+  {
+    max30102_fifo_debug.available_samples = available;
+    return 0U;
+  }
+
+#if (MAX30102_USE_INT_PIN != 0U)
+  (void)max30102_clear_interrupt_status();
+#endif
+
+  /* Step 5: parse each sample */
+  for (i = 0U; i < to_read; i++)
+  {
+    max30102_parse_spo2_sample(
+        &fifo_batch_raw[i * MAX30102_FIFO_BYTES_PER_SAMPLE_SPO2],
+        &red[i], &ir[i]);
+  }
+
+  /* Step 6: update available to reflect consumed samples */
+  max30102_fifo_debug.available_samples =
+      (uint8_t)((wr_ptr - (rd_ptr + to_read)) & (MAX30102_FIFO_DEPTH - 1U));
+
+  return to_read;
+}

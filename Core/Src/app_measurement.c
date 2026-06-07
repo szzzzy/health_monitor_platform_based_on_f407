@@ -50,8 +50,6 @@
 #define APP_CONTACT_SETTLE_SAMPLES        200U
 /* beat-based PI 超时：无新 beat 超过此窗口则标无效 */
 #define APP_PI_STALE_SAMPLES              (MAX30102_ALGO_SAMPLE_RATE_HZ * 5U)
-/* 传感器无新样本看门狗超时 (ms) */
-#define APP_SENSOR_STALE_WARN_MS          1000U  /* OLED 显示 SENSOR WAIT 的阈值 */
 #define APP_SENSOR_STALE_TIMEOUT_MS       3000U
 #define APP_SENSOR_STALE_CONFIRM_INTERVAL_MS 1000U
 #define APP_SENSOR_STALE_CONFIRM_COUNT       3U
@@ -217,6 +215,64 @@ uint8_t app_measurement_baseline_is_stable(void)
 }
 
 /*
+ * 共享后处理：对已解析的单个样本执行 change tracking、基线更新、
+ * PushSample 入队和传感器健康标记。由单样本路径和批量路径共用。
+ */
+static void app_measurement_process_parsed_sample(AppState_t *app,
+                                                   uint32_t red_val,
+                                                   uint32_t ir_val,
+                                                   uint32_t sample_tick)
+{
+  if (sample_debug_state.initialized != 0U)
+  {
+    if ((sample_debug_state.red_value != red_val) ||
+        (sample_debug_state.ir_value != ir_val))
+    {
+      app->sensor_sample_change_count++;
+    }
+    else
+    {
+      app->sensor_sample_same_count++;
+    }
+  }
+  else
+  {
+    app->sensor_sample_change_count++;
+    sample_debug_state.initialized = 1U;
+  }
+
+  sample_debug_state.red_value = red_val;
+  sample_debug_state.ir_value = ir_val;
+  app->red_value = red_val;
+  app->ir_value  = ir_val;
+  app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
+  app_ppg_signal_update_activity(app);
+  app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_OK;
+  app->sensor_read_ok_count++;
+  app->sensor_error_streak = 0U;
+  app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
+  app->sensor_last_sample_tick = sample_tick;
+  app->sensor_last_ok_tick = sample_tick;
+  sensor_last_stale_probe_tick = 0UL;
+  sensor_stale_probe_count = 0U;
+  app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
+
+  /* 实时路径只记录测量相关样本；无手指背景不入日志，避免插卡后
+   * idle 状态自动触发 FatFs mount/open。 */
+  if ((app->finger_present != 0U) || (app->contact_settle_samples > 0U))
+  {
+    uint8_t log_flags = 0U;
+    if (app->finger_present != 0U) { log_flags |= 0x01U; }
+    if (app->contact_settle_samples > 0U) { log_flags |= 0x02U; }
+    if (app->sensor_fifo_overflow_count > 0U) { log_flags |= 0x04U; }
+    APP_DataLog_PushSample(sample_tick,
+                           red_val, ir_val,
+                           (int16_t)app->ecg_filtered,
+                           log_flags);
+  }
+}
+
+/*
  * 主循环传感器读取入口 — 从 MAX30102 FIFO 读取一个 SpO2 样本。
  *
  * 流程：
@@ -257,51 +313,9 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
 
   if (read_status == HAL_OK)
   {
-    max30102_parse_spo2_sample(fifo_buf, &app->red_value, &app->ir_value);
-    if (sample_debug_state.initialized != 0U)
-    {
-      if ((sample_debug_state.red_value != app->red_value) ||
-          (sample_debug_state.ir_value != app->ir_value))
-      {
-        app->sensor_sample_change_count++;
-      }
-      else
-      {
-        app->sensor_sample_same_count++;
-      }
-    }
-    else
-    {
-      app->sensor_sample_change_count++;
-      sample_debug_state.initialized = 1U;
-    }
-
-    sample_debug_state.red_value = app->red_value;
-    sample_debug_state.ir_value = app->ir_value;
-    app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
-    app_ppg_signal_update_activity(app);
-    app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_OK;
-    app->sensor_read_ok_count++;
-    app->sensor_error_streak = 0U;
-    app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
-    app->sensor_last_sample_tick = HAL_GetTick();
-    app->sensor_last_ok_tick = app->sensor_last_sample_tick;
-    sensor_last_stale_probe_tick = 0UL;
-    sensor_stale_probe_count = 0U;
-    app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
-
-    /* 实时路径 PushSample：仅 16 字节 memcpy，零格式化/零 SD I/O */
-    {
-      uint8_t log_flags = 0U;
-      if (app->finger_present != 0U)      log_flags |= 0x01U;
-      if (app->contact_settle_samples > 0U) log_flags |= 0x02U;
-      if (app->sensor_fifo_overflow_count > 0U) log_flags |= 0x04U;
-      APP_DataLog_PushSample(app->sensor_last_sample_tick,
-                             app->red_value, app->ir_value,
-                             (int16_t)app->ecg_filtered,
-                             log_flags);
-    }
-
+    uint32_t red_val, ir_val;
+    max30102_parse_spo2_sample(fifo_buf, &red_val, &ir_val);
+    app_measurement_process_parsed_sample(app, red_val, ir_val, HAL_GetTick());
     return APP_MEASUREMENT_READ_OK;
   }
 
@@ -418,7 +432,7 @@ void app_measurement_update_finger_state(AppState_t *app)
     app->finger_off_confirm_count = 0U;
     app->finger_on_confirm_count = 0U;
 
-    /* 手指离开 → flush SD 缓冲 + f_sync */
+    /* 手指离开 → 设延迟 flush 标志（内部 O(1)），由后台在安全窗口分片执行 */
     APP_DataLog_OnMeasurementStop();
 
     /* Background baseline has been tracked during the off-confirm window via
@@ -654,6 +668,138 @@ void app_measurement_update_periodic_flags(AppState_t *app)
   app->refresh_div = 0U;
   app->report_due = 1U;
   app->display_refresh_requested = 1U;
+}
+
+/*
+ * 批量 FIFO drain — 替代原 main.c 中 while(budget--) 单样本循环。
+ * 一次 I2C burst 读所有可用样本，逐个送入测量管道。
+ *
+ * 返回处理的样本数。调用方（main.c）用返回值决定是否跳过 OLED/SD。
+ */
+uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
+{
+  uint32_t red_batch[24];
+  uint32_t ir_batch[24];
+  uint8_t  ovf, count, i;
+  uint32_t now;
+
+  if (app == NULL) { return 0U; }
+
+  /* 批量读 MAX30102 FIFO */
+  count = max30102_read_fifo_batch(red_batch, ir_batch, 24U, &ovf);
+
+  /* 同步 driver 层 FIFO debug 字段到 AppState */
+  {
+    const MAX30102_FifoDebug_t *fdbg = max30102_get_fifo_debug();
+    if (fdbg != NULL)
+    {
+      app->sensor_fifo_overflow_count = fdbg->overflow_count;
+      app->sensor_fifo_write_ptr = fdbg->write_ptr;
+      app->sensor_fifo_read_ptr = fdbg->read_ptr;
+      app->sensor_fifo_available_samples = fdbg->available_samples;
+    }
+  }
+
+  /* 记录尝试 */
+  app->sensor_read_attempt_count++;
+
+  /* 处理 overflow */
+  if (ovf > 0U)
+  {
+    app->fifo_overflow_total += ovf;
+    if (app->fifo_overflow_total > 999999UL)
+    {
+      app->fifo_overflow_total = 999999UL;
+    }
+
+    /* 立即重置连续性历史，不等到 settle 结束 */
+    app_hrv_reset(app);
+    app_rr_reset(app);
+    app_ppg_pulse_reset();
+    app_ptt_reset(app);
+
+    /* 进入接触稳定期，抑制算法输出 */
+    app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
+    app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
+
+    return 0U;
+  }
+
+  if (count == 0U)
+  {
+    /* 非 overflow 返回 0 → 可能是 FIFO 空或 I2C 错误 */
+    if ((HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) ||
+        (HAL_I2C_GetError(&hi2c1) != HAL_I2C_ERROR_NONE))
+    {
+      app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
+      app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+      if (app->sensor_error_streak < 0xFFU)
+      {
+        app->sensor_error_streak++;
+      }
+    }
+    return 0U;
+  }
+
+  /* 更新高水位 */
+  if (count > app->fifo_high_watermark)
+  {
+    app->fifo_high_watermark = (uint16_t)count;
+  }
+
+  /* 从最后一个样本开始回溯时间戳，逐个处理 */
+  now = HAL_GetTick();
+
+  for (i = 0U; i < count; i++)
+  {
+    uint32_t sample_tick;
+
+    /* 最后一个样本 = now，前面的按 10ms 向前回溯 */
+    sample_tick = now - ((uint32_t)(count - 1U - i) * APP_SAMPLE_PERIOD_MS);
+
+    /* 跟踪样本间隔，包含上一批最后样本到本批第一个样本的 gap。 */
+    if ((app->sensor_last_sample_tick != 0UL) &&
+        (sample_tick > app->sensor_last_sample_tick))
+    {
+      uint32_t gap = sample_tick - app->sensor_last_sample_tick;
+      uint16_t gap16 = (gap > 0xFFFFUL) ? 0xFFFFU : (uint16_t)gap;
+      if (gap16 > app->max_sample_gap_ms)
+      {
+        app->max_sample_gap_ms = gap16;
+      }
+    }
+
+    /* 共享后处理 + 入队 */
+    app_measurement_process_parsed_sample(app,
+                                           red_batch[i],
+                                           ir_batch[i],
+                                           sample_tick);
+
+    /* 单样本处理管道 */
+    app_measurement_update_adaptive_thresholds(app);
+    app_measurement_update_finger_state(app);
+    app_measurement_process(app);
+    app_measurement_update_periodic_flags(app);
+  }
+
+  return count;
+}
+
+/*
+ * OLED 刷新门控：仅在 FIFO backlog 很高时短暂让路。
+ * sensor_health/contact_settle 不再阻止刷新——状态页、debug 页、按钮切页
+ * 仍需要 OLED 正常工作。连续跳过超过 1000ms 由 UiTask 强制刷新。
+ */
+uint8_t app_measurement_should_skip_display(const AppState_t *app)
+{
+  if (app == NULL) { return 1U; }
+
+  if (app->fifo_high_watermark >= 8U)
+  {
+    return 1U;
+  }
+
+  return 0U;
 }
 
 /* 上次恢复尝试的时间戳，用于限频。上电初始化为 0，避免首次被限频拦截。 */

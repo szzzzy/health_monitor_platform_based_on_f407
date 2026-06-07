@@ -82,4 +82,19 @@ void     APP_DataLog_GetStatus(DataLogStatus_t *status);
 /* 遗留兼容：供 app_state 快速查询是否活跃。 */
 uint8_t  APP_DataLog_IsActive(void);
 
+/*
+ * 测量活跃门控：active=1 时 ServiceBudget 直接返回 0，
+ * 禁止一切物理 SD I/O（包括 f_write）。由 main.c 每轮更新。
+ */
+void     APP_DataLog_SetMeasurementActive(uint8_t active);
+
+/*
+ * 分片执行延迟 flush：每轮至多 1 chunk drain 或 1 次 f_sync/f_close。
+ * 返回 1 = flush 已完成，0 = 仍在进行中或无 pending。
+ */
+uint8_t  APP_DataLog_ServiceDeferredStop(void);
+
+/* 查询是否有延迟 flush 待执行。 */
+uint8_t  APP_DataLog_IsFlushPending(void);
+
 #endif

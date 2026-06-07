@@ -4,8 +4,8 @@
   * @brief   SD 卡文件会话管理（挂载、打开、缓冲写、异常恢复）
   *
   * 与 app_data_log 的分工：
-  *   app_sd_file — 所有 FAT 文件系统操作
-  *   app_data_log — CSV 记录格式化，调用 app_sd_file 完成写入
+ *   app_sd_file — 所有 FAT 文件系统操作
+ *   app_data_log — 二进制记录分片，调用 app_sd_file 完成写入
   ******************************************************************************
   */
 
@@ -29,7 +29,6 @@ void              APP_SdFile_Init(void);
 AppSdFileStatus_t APP_SdFile_StartSession(void);
 void              APP_SdFile_StopSession(void);
 bool              APP_SdFile_IsReady(void);
-AppSdFileStatus_t APP_SdFile_Write(const char *str);
 AppSdFileStatus_t APP_SdFile_WriteBytes(const void *data, uint16_t len);
 AppSdFileStatus_t APP_SdFile_Flush(void);
 uint32_t          APP_SdFile_GetTotalWritten(void);

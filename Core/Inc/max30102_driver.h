@@ -98,6 +98,8 @@ HAL_StatusTypeDef max30102_init(void);
 HAL_StatusTypeDef max30102_write_reg(uint8_t reg_addr, uint8_t data);
 HAL_StatusTypeDef max30102_read_reg(uint8_t reg_addr, uint8_t *data);
 HAL_StatusTypeDef max30102_read_fifo(uint8_t *fifo_data, uint16_t data_len);
+uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
+                                  uint8_t max_count, uint8_t *p_ovf);
 const MAX30102_FifoDebug_t *max30102_get_fifo_debug(void);
 void max30102_mark_data_ready_from_isr(void);
 uint8_t max30102_should_service_fifo(void);

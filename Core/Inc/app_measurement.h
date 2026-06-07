@@ -62,6 +62,9 @@ void app_measurement_process(AppState_t *app);
 void app_measurement_update_periodic_flags(AppState_t *app);
 void app_measurement_recover_sensor(AppState_t *app);
 
+/* 传感器无新样本看门狗超时 (ms)，供 main.c 安全窗口引用 */
+#define APP_SENSOR_STALE_WARN_MS          1000U
+
 /* 传感器健康状态：供 OLED / UART 上报显示当前 MAX30102 链路状态 */
 typedef enum
 {
@@ -77,6 +80,13 @@ typedef enum
  * 强制执行 I2C 总线恢复 + max30102_init()。
  * 在主循环每轮和 baseline 采集循环中均需调用。 */
 void app_measurement_service_sensor_watchdog(AppState_t *app);
+
+/* 批量 FIFO drain：一次 I2C burst 读所有可用样本并送入测量管道。
+ * 返回处理的样本数 (0 = 无数据/overflow/I2C 错误)。 */
+uint8_t app_measurement_drain_fifo_batch(AppState_t *app);
+
+/* OLED 刷新门控：返回 1 时应跳过 OLED 刷新（不清 display_refresh_requested）。 */
+uint8_t app_measurement_should_skip_display(const AppState_t *app);
 
 #ifdef __cplusplus
 }

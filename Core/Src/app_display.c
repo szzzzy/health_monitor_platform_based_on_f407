@@ -71,6 +71,7 @@ static void app_display_debug_d3_ppg_raw(const AppState_t *app);
 static void app_display_debug_d4_ppg_q(const AppState_t *app);
 static void app_display_debug_d5_algo(const AppState_t *app);
 static void app_display_debug_d6_sys(const AppState_t *app);
+static void app_display_debug_d7_sd(const AppState_t *app);
 static const char *app_get_quality_label(const AppState_t *app);
 static const char *app_get_balance_label(uint8_t balance_status);
 static const char *app_get_regular_label(const AppState_t *app);
@@ -234,6 +235,7 @@ void app_display_measurement_page(const AppState_t *app)
       case DBG_SUB_D4_PPG_Q:    app_display_debug_d4_ppg_q(app);    break;
       case DBG_SUB_D5_ALGO:     app_display_debug_d5_algo(app);     break;
       case DBG_SUB_D6_SYS:      app_display_debug_d6_sys(app);      break;
+      case DBG_SUB_D7_SD:       app_display_debug_d7_sd(app);       break;
       case DBG_SUB_D1_MAX:
       default:                  app_display_debug_d1_max(app);      break;
     }
@@ -911,13 +913,71 @@ static void app_display_debug_d6_sys(const AppState_t *app)
                  (unsigned int)app->sd_dropped,
                  (unsigned long)(app->sd_last_write_ms > 999UL ?
                                  999UL : app->sd_last_write_ms));
-  (void)snprintf(line[5], sizeof(line[5]), "ERR %u",
-                 (unsigned int)app->sd_error);
+  (void)snprintf(line[5], sizeof(line[5]), "ERR %u SKIP %u",
+                 (unsigned int)app->sd_error, (unsigned int)app->display_skipped_count);
   (void)snprintf(line[6], sizeof(line[6]), "DISP %lu",
                  (unsigned long)(app->display_refresh_count > 999999UL ?
                                  999999UL : app->display_refresh_count));
-  (void)snprintf(line[7], sizeof(line[7]), "PAGE %u DBG %u",
-                 (unsigned int)app->current_page, (unsigned int)app->debug_mode);
+  (void)snprintf(line[7], sizeof(line[7]), "P%u D%u HWM%u",
+                 (unsigned int)app->current_page, (unsigned int)app->debug_mode,
+                 (unsigned int)app->fifo_high_watermark);
+
+  ssd1306_Clear(SSD1306_COLOR_BLACK);
+  ssd1306_DrawString(0, 0, line[0]);
+  ssd1306_DrawString(0, 8, line[1]);
+  ssd1306_DrawString(0, 16, line[2]);
+  ssd1306_DrawString(0, 24, line[3]);
+  ssd1306_DrawString(0, 32, line[4]);
+  ssd1306_DrawString(0, 40, line[5]);
+  ssd1306_DrawString(0, 48, line[6]);
+  ssd1306_DrawString(0, 56, line[7]);
+  ssd1306_UpdateScreen();
+}
+
+/* =========================================================================
+ * D7 SD — SD 卡日志状态（新增页，替代原 D6 中放不下的字段）
+ * ========================================================================= */
+static void app_display_debug_d7_sd(const AppState_t *app)
+{
+  char line[8][24];
+  const char *sd_state_str;
+
+  if (app == NULL) { return; }
+
+  switch (app->sd_state)
+  {
+  case 2U: sd_state_str = "ACTIVE"; break;
+  case 3U: sd_state_str = "BOFF";   break;
+  case 1U: sd_state_str = "TRY";    break;
+  default: sd_state_str = "IDLE";   break;
+  }
+
+  (void)snprintf(line[0], sizeof(line[0]), "D7 SD %s%s",
+                 sd_state_str,
+                 (app->sd_paused != 0U) ? " PAUSE" : "");
+  (void)snprintf(line[1], sizeof(line[1]), "DSKIP %u FRC %u",
+                 (unsigned int)app->display_skipped_count,
+                 (unsigned int)app->ui_forced_count);
+  (void)snprintf(line[2], sizeof(line[2]), "I2CREC %lu OLEDR %lu",
+                 (unsigned long)(app->i2c_recover_count > 9999UL ?
+                                 9999UL : app->i2c_recover_count),
+                 (unsigned long)(app->oled_reinit_count > 9999UL ?
+                                 9999UL : app->oled_reinit_count));
+  (void)snprintf(line[3], sizeof(line[3]), "MHB %lu UHB %lu",
+                 (unsigned long)(app->max_task_heartbeat > 999999UL ?
+                                 999999UL : app->max_task_heartbeat),
+                 (unsigned long)(app->ui_task_heartbeat > 999999UL ?
+                                 999999UL : app->ui_task_heartbeat));
+  (void)snprintf(line[4], sizeof(line[4]), "BUF %u DR %u",
+                 (unsigned int)app->sd_buffered,
+                 (unsigned int)app->sd_dropped);
+  (void)snprintf(line[5], sizeof(line[5]), "OVF %lu GAP %u",
+                 (unsigned long)(app->fifo_overflow_total > 999999UL ?
+                                 999999UL : app->fifo_overflow_total),
+                 (unsigned int)app->max_sample_gap_ms);
+  (void)snprintf(line[6], sizeof(line[6]), "HWM %u",
+                 (unsigned int)app->fifo_high_watermark);
+  (void)snprintf(line[7], sizeof(line[7]), "");
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
   ssd1306_DrawString(0, 0, line[0]);
