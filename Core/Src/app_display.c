@@ -4,6 +4,7 @@
 
 #include "app_diag.h"
 #include "app_measurement.h"
+#include "app_sd_card.h"
 #include "ssd1306.h"
 
 /* PE2/PE3/PE4 当前作为页面切换和调试按键输入，按下时为低电平。 */
@@ -979,6 +980,8 @@ static void app_display_debug_d7_sd(const AppState_t *app)
 {
   char line[8][24];
   const char *sd_state_str;
+  const char *bus_mode_str;
+  uint32_t sd_hal_error;
 
   if (app == NULL) { return; }
 
@@ -990,32 +993,44 @@ static void app_display_debug_d7_sd(const AppState_t *app)
   default: sd_state_str = "IDLE";   break;
   }
 
-  (void)snprintf(line[0], sizeof(line[0]), "D7 SD %s%s",
+  switch (APP_SD_Card_GetMode())
+  {
+  case 1U: bus_mode_str = "4B"; break;
+  case 2U: bus_mode_str = "FB"; break;
+  default: bus_mode_str = "1B"; break;
+  }
+
+  sd_hal_error = APP_SD_Card_GetLastError();
+
+  (void)snprintf(line[0], sizeof(line[0]), "D7 SD %s BUS %s",
                  sd_state_str,
-                 (app->sd_paused != 0U) ? " PAUSE" : "");
-  (void)snprintf(line[1], sizeof(line[1]), "DSKIP %u FRC %u",
+                 bus_mode_str);
+  (void)snprintf(line[1], sizeof(line[1]), "HERR %08lX FE %u%s",
+                 (unsigned long)sd_hal_error,
+                 (unsigned int)app->sd_error,
+                 (app->sd_paused != 0U) ? " P" : "");
+  (void)snprintf(line[2], sizeof(line[2]), "DSKIP %u FRC %u",
                  (unsigned int)app->display_skipped_count,
                  (unsigned int)app->ui_forced_count);
-  (void)snprintf(line[2], sizeof(line[2]), "I2CREC %lu OLEDR %lu",
+  (void)snprintf(line[3], sizeof(line[3]), "I2CREC %lu OLEDR %lu",
                  (unsigned long)(app->i2c_recover_count > 9999UL ?
                                  9999UL : app->i2c_recover_count),
                  (unsigned long)(app->oled_reinit_count > 9999UL ?
                                  9999UL : app->oled_reinit_count));
-  (void)snprintf(line[3], sizeof(line[3]), "MHB %lu UHB %lu",
+  (void)snprintf(line[4], sizeof(line[4]), "MHB %lu UHB %lu",
                  (unsigned long)(app->max_task_heartbeat > 999999UL ?
                                  999999UL : app->max_task_heartbeat),
                  (unsigned long)(app->ui_task_heartbeat > 999999UL ?
                                  999999UL : app->ui_task_heartbeat));
-  (void)snprintf(line[4], sizeof(line[4]), "BUF %u DR %u",
+  (void)snprintf(line[5], sizeof(line[5]), "BUF %u DR %u",
                  (unsigned int)app->sd_buffered,
                  (unsigned int)app->sd_dropped);
-  (void)snprintf(line[5], sizeof(line[5]), "OVF %lu GAP %u",
+  (void)snprintf(line[6], sizeof(line[6]), "OVF %lu GAP %u",
                  (unsigned long)(app->fifo_overflow_total > 999999UL ?
                                  999999UL : app->fifo_overflow_total),
                  (unsigned int)app->max_sample_gap_ms);
-  (void)snprintf(line[6], sizeof(line[6]), "HWM %u",
+  (void)snprintf(line[7], sizeof(line[7]), "HWM %u",
                  (unsigned int)app->fifo_high_watermark);
-  (void)snprintf(line[7], sizeof(line[7]), "");
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
   ssd1306_DrawString(0, 0, line[0]);

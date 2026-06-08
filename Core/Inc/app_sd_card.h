@@ -30,5 +30,7 @@ bool               APP_SD_Card_IsPresent(void);
 uint64_t           APP_SD_Card_GetCapacity(void);
 uint32_t           APP_SD_Card_GetBlockCount(void);
 SD_HandleTypeDef  *APP_SD_Card_GetHandle(void);
+uint8_t            APP_SD_Card_GetMode(void);       /* 0=1-bit, 1=4-bit, 2=4bit-failed-permanent */
+uint32_t           APP_SD_Card_GetLastError(void);  /* 最近一次 hsd.ErrorCode */
 
 #endif
