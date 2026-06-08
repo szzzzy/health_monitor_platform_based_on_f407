@@ -224,7 +224,6 @@ int main(void)
   MX_TIM6_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
-  MX_SDIO_SD_Init();
   MX_TIM2_Init();
   MX_IWDG_Init();
   /* USER CODE BEGIN 2 */

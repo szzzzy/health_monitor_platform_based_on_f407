@@ -481,8 +481,20 @@ void app_measurement_process(AppState_t *app)
   int32_t red_waveform_sample = 0;
   int32_t ir_waveform_sample = 0;
 
-  if ((app == NULL) || (app->finger_present == 0U))
+  if (app == NULL)
   {
+    return;
+  }
+
+  if (app->finger_present == 0U)
+  {
+    /* Safety: contact_settle_samples must only be >0 when finger is confirmed.
+     * If it was erroneously set (overflow/recovery while finger absent), clear it
+     * so finger_on_confirm_count can resume counting on the next placement. */
+    if (app->contact_settle_samples > 0U)
+    {
+      app->contact_settle_samples = 0U;
+    }
     return;
   }
 
@@ -718,9 +730,15 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
     app_ppg_pulse_reset();
     app_ptt_reset(app);
 
-    /* 进入接触稳定期，抑制算法输出 */
-    app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
     app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
+
+    /* Only enter contact settle when a finger is actually present.
+     * If finger is absent, reset the overflow/algorithm state above
+     * is sufficient — do not block finger_on_confirm_count. */
+    if (app->finger_present != 0U)
+    {
+      app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
+    }
 
     return 0U;
   }
@@ -862,9 +880,13 @@ static void app_measurement_do_recovery(AppState_t *app)
   sensor_last_stale_probe_tick = 0UL;
   sensor_stale_probe_count = 0U;
   sample_debug_state.initialized = 0U;
-  /* Enter short reacquire: keep finger_present so we don't show PLACE FINGER,
-   * but set contact_settle to suppress algorithm output during re-stabilization. */
-  app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
+  /* Enter short reacquire: if finger is present, set contact_settle to
+   * suppress algorithm output during re-stabilization. If finger is absent,
+   * stay in PLACE FINGER — do not enter settle. */
+  if (app->finger_present != 0U)
+  {
+    app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
+  }
   app->display_refresh_requested = 1U;
   app->report_due = 1U;
 }

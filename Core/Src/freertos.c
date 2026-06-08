@@ -224,6 +224,10 @@ static uint8_t app_rtos_sd_service_safe(const AppState_t *app)
   if (app->finger_present != 0U) { return 0U; }
   if (app->sensor_health != (uint8_t)SENSOR_HEALTH_OK) { return 0U; }
   if (app->contact_settle_samples > 0U) { return 0U; }
+  /* Refuse SD I/O while the raw signal detector sees a finger
+   * (prevent flush/write during the 8-beat confirm window). */
+  if (app->raw_signal_present != 0U) { return 0U; }
+  if (app->finger_on_confirm_count > 0U) { return 0U; }
   if (app->sensor_fifo_available_samples >= 4U) { return 0U; }
   if (app->sensor_last_sample_tick == 0UL) { return 0U; }
 
