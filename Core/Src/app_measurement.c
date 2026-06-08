@@ -379,31 +379,44 @@ void app_measurement_update_finger_state(AppState_t *app)
   {
     app->finger_off_confirm_count = 0U;
 
-    if (app->raw_signal_present == 0U)
+    if (app->raw_signal_present != 0U)
     {
-      app->finger_on_confirm_count = 0U;
-      app_ppg_signal_track_background_ir(app, &baseline_data);
-      return;
-    }
+      /* Integrate: each beat with raw signal present increments the counter. */
+      if (app->finger_on_confirm_count < APP_PPG_SIGNAL_FINGER_ON_CONFIRM_COUNT)
+      {
+        app->finger_on_confirm_count++;
+      }
 
-    if (app->finger_on_confirm_count < 0xFFU)
-    {
-      app->finger_on_confirm_count++;
+      if (app->finger_on_confirm_count >= APP_PPG_SIGNAL_FINGER_ON_CONFIRM_COUNT)
+      {
+        app->finger_present = 1U;
+        app->finger_on_confirm_count = 0U;
+        app_reset_measurement_outputs(app);
+        app_ppg_signal_reset_envelope();
+        app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
+        app->ir_pi_ac_ema = 0U;
+        app->ir_pi_ac_ema_valid = 0U;
+        app->last_beat_sample = 0U;
+        app->raw_signal_present = 1U;
+        app->report_due = 1U;
+        app->display_refresh_requested = 1U;
+      }
     }
-
-    if (app->finger_on_confirm_count >= APP_PPG_SIGNAL_FINGER_ON_CONFIRM_COUNT)
+    else
     {
-      app->finger_present = 1U;
-      app->finger_on_confirm_count = 0U;
-      app_reset_measurement_outputs(app);
-      app_ppg_signal_reset_envelope();
-      app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
-      app->ir_pi_ac_ema = 0U;
-      app->ir_pi_ac_ema_valid = 0U;
-      app->last_beat_sample = 0U;
-      app->raw_signal_present = 1U;
-      app->report_due = 1U;
-      app->display_refresh_requested = 1U;
+      /* Decrement on absence — tolerates 1-2 beat jitter instead of instant reset. */
+      if (app->finger_on_confirm_count > 0U)
+      {
+        app->finger_on_confirm_count--;
+      }
+
+      /* Only track background IR when signal is clearly below threshold.
+       * Near-threshold signals (ir_signal_delta >= on_delta/2) are suspected
+       * as a finger approaching — freeze baseline to avoid contamination. */
+      if (app->ir_signal_delta < (app->adaptive_finger_on_delta / 2U))
+      {
+        app_ppg_signal_track_background_ir(app, &baseline_data);
+      }
     }
 
     return;
@@ -771,6 +784,9 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
   for (i = 0U; i < count; i++)
   {
     uint32_t sample_tick;
+
+    /* 标记当前处于逐样本处理阶段（用于崩溃诊断） */
+    app->max_task_phase = PHASE_MAX_SAMPLE_PROC;
 
     /* 最后一个样本 = now，前面的按 10ms 向前回溯 */
     sample_tick = now - ((uint32_t)(count - 1U - i) * APP_SAMPLE_PERIOD_MS);

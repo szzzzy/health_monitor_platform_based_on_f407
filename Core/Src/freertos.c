@@ -34,6 +34,7 @@
 #include "app_protocol.h"
 #include "iwdg.h"
 #include "max30102.h"
+#include "app_diag.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -140,6 +141,11 @@ void app_rtos_bind_state(AppState_t *state)
   app_rtos_state = state;
 }
 
+AppState_t *app_rtos_get_state(void)
+{
+  return app_rtos_state;
+}
+
 void app_rtos_notify_max_from_isr(void)
 {
   BaseType_t higher_priority_task_woken = pdFALSE;
@@ -228,6 +234,9 @@ static uint8_t app_rtos_sd_service_safe(const AppState_t *app)
    * (prevent flush/write during the 8-beat confirm window). */
   if (app->raw_signal_present != 0U) { return 0U; }
   if (app->finger_on_confirm_count > 0U) { return 0U; }
+  /* Suspected near-finger: ir_signal_delta at half the on-threshold or above.
+   * Block SD I/O to avoid contention while the finger is approaching. */
+  if (app->ir_signal_delta >= (app->adaptive_finger_on_delta / 2U)) { return 0U; }
   if (app->sensor_fifo_available_samples >= 4U) { return 0U; }
   if (app->sensor_last_sample_tick == 0UL) { return 0U; }
 
@@ -249,17 +258,22 @@ static void app_rtos_service_max(AppState_t *app)
     return;
   }
 
+  app->max_task_phase = PHASE_MAX_ECG;
   (void)app_ecg_process_samples(app);
 
+  app->max_task_phase = PHASE_MAX_FIFO_CHECK;
   if (max30102_should_service_fifo() != 0U)
   {
+    app->max_task_phase = PHASE_MAX_I2C_ACQ;
     if (app_rtos_i2c_acquire(APP_RTOS_MAX_I2C_TIMEOUT_MS) != 0U)
     {
+      app->max_task_phase = PHASE_MAX_FIFO_DRAIN;
       fifo_batch_count = app_measurement_drain_fifo_batch(app);
 
       if ((fifo_batch_count == 0U) &&
           (app->sensor_last_read_status == (uint8_t)APP_MEASUREMENT_READ_ERROR))
       {
+        app->max_task_phase = PHASE_MAX_RECOVERY;
         app_measurement_recover_sensor(app);
       }
 
@@ -273,6 +287,7 @@ static void app_rtos_service_max(AppState_t *app)
 
   app_rtos_last_fifo_batch_count = fifo_batch_count;
 
+  app->max_task_phase = PHASE_MAX_WATCHDOG;
   if (app_rtos_i2c_acquire(0U) != 0U)
   {
     app_measurement_service_sensor_watchdog(app);
@@ -282,25 +297,21 @@ static void app_rtos_service_max(AppState_t *app)
 
 void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 {
-   /* Run time stack overflow checking is performed if
-   configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
-   called if a stack overflow is detected. */
+   /* Record crash before entering undefined-behavior territory.
+    * Stack overflow means the task's TCB may already be corrupted. */
+   (void)xTask;
+   (void)pcTaskName;
+   APP_Diag_CaptureCrash(DIAG_CRASH_STACKOVF, 0U, 0U);
+   /* No return — fall into HardFault or IWDG reset */
+   for (;;) {}
 }
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN 5 */
 void vApplicationMallocFailedHook(void)
 {
-   /* vApplicationMallocFailedHook() will only be called if
-   configUSE_MALLOC_FAILED_HOOK is set to 1 in FreeRTOSConfig.h. It is a hook
-   function that will get called if a call to pvPortMalloc() fails.
-   pvPortMalloc() is called internally by the kernel whenever a task, queue,
-   timer or semaphore is created. It is also called by various parts of the
-   demo application. If heap_1.c or heap_2.c are used, then the size of the
-   heap available to pvPortMalloc() is defined by configTOTAL_HEAP_SIZE in
-   FreeRTOSConfig.h, and the xPortGetFreeHeapSize() API function can be used
-   to query the size of free heap space that remains (although it does not
-   provide information on how the remaining heap might be fragmented). */
+   APP_Diag_CaptureCrash(DIAG_CRASH_MALLOCFAIL, 0U, 0U);
+   for (;;) {}
 }
 /* USER CODE END 5 */
 
@@ -396,9 +407,11 @@ void StartTask02(void *argument)
       continue;
     }
 
+    app_rtos_state->max_task_phase = PHASE_MAX_NOTIFY_WAIT;
     (void)ulTaskNotifyTake(pdTRUE,
                            pdMS_TO_TICKS(APP_RTOS_MAX_NOTIFY_TIMEOUT_MS));
     app_rtos_service_max(app_rtos_state);
+    app_rtos_state->max_task_phase = PHASE_MAX_HEARTBEAT;
     app_rtos_state->max_task_heartbeat++;
   }
   /* USER CODE END StartTask02 */
@@ -417,7 +430,24 @@ void StartTask03(void *argument)
   /* Infinite loop */
   for(;;)
   {
+    static uint8_t liveness_div = 0U;
+
+    if (app_rtos_state != NULL) {
+      app_rtos_state->wdt_task_phase = PHASE_WDT_REFRESH;
+    }
     APP_Watchdog_Refresh();
+
+    /* 每 20 轮 (~1s) 保存一次活体快照到 BKP */
+    liveness_div++;
+    if ((app_rtos_state != NULL) && (liveness_div >= 20U))
+    {
+      liveness_div = 0U;
+      APP_Diag_SaveLiveness(app_rtos_state);
+    }
+
+    if (app_rtos_state != NULL) {
+      app_rtos_state->wdt_task_phase = PHASE_WDT_DELAY;
+    }
     osDelay(APP_RTOS_WATCHDOG_PERIOD_MS);
   }
   /* USER CODE END StartTask03 */
@@ -449,12 +479,17 @@ void StartTask04(void *argument)
       continue;
     }
 
+    app_rtos_state->ui_task_phase = PHASE_UI_IDLE;
     app_rtos_state->ui_task_heartbeat++;
 
+    app_rtos_state->ui_task_phase = PHASE_UI_POLL_UART;
     app_protocol_poll_uart_commands(app_rtos_state);
+
+    app_rtos_state->ui_task_phase = PHASE_UI_BUTTONS;
     app_display_handle_buttons(app_rtos_state);
 
     now = HAL_GetTick();
+    app_rtos_state->ui_task_phase = PHASE_UI_DISPLAY_CHECK;
     if ((now - last_display_tick) >= APP_RTOS_DISPLAY_PERIOD_MS)
     {
       last_display_tick = now;
@@ -483,6 +518,7 @@ void StartTask04(void *argument)
 
       if ((should_skip == 0U) || (force_refresh != 0U))
       {
+        app_rtos_state->ui_task_phase = PHASE_UI_DISPLAY_REFRESH;
         if (app_rtos_i2c_acquire(0U) != 0U)
         {
           app_rtos_refresh_display_if_needed(app_rtos_state);
@@ -502,7 +538,31 @@ void StartTask04(void *argument)
       last_skip_tick = 0U;
     }
 
+    app_rtos_state->ui_task_phase = PHASE_UI_REPORT_SEND;
     app_rtos_send_report_if_due(app_rtos_state);
+
+    /* 每 20 轮 (~400ms) 采集一次栈水印 */
+    {
+      static uint8_t hwm_div = 0U;
+      hwm_div++;
+      if (hwm_div >= 20U)
+      {
+        uint16_t hwm_m, hwm_u, hwm_s, hwm_w;
+        hwm_div = 0U;
+        (void)APP_Diag_SampleStackHWM(&hwm_m, &hwm_u, &hwm_s, &hwm_w);
+        app_rtos_state->max_task_stack_hwm = hwm_m;
+        app_rtos_state->ui_task_stack_hwm  = hwm_u;
+        app_rtos_state->sd_task_stack_hwm  = hwm_s;
+        app_rtos_state->wdt_task_stack_hwm = hwm_w;
+        /* 持久化到 BKP — 最小剩余超过 0 则写入，否则保留上次值 */
+        if ((hwm_m > 0U) || (hwm_u > 0U) || (hwm_s > 0U) || (hwm_w > 0U))
+        {
+          APP_Diag_SaveStackHWMBkp(&hwm_m, &hwm_u, &hwm_s, &hwm_w);
+        }
+      }
+    }
+
+    app_rtos_state->ui_task_phase = PHASE_UI_DELAY;
     osDelay(APP_RTOS_UI_PERIOD_MS);
   }
   /* USER CODE END StartTask04 */
@@ -527,24 +587,30 @@ void StartTask05(void *argument)
       continue;
     }
 
+    app_rtos_state->sd_task_phase = PHASE_SD_SET_ACTIVE;
     APP_DataLog_SetMeasurementActive(
         (app_rtos_state->finger_present != 0U) &&
         (app_rtos_state->contact_settle_samples == 0U) &&
         (app_rtos_state->sensor_health == (uint8_t)SENSOR_HEALTH_OK));
 
+    app_rtos_state->sd_task_phase = PHASE_SD_SAFE_CHECK;
     if (app_rtos_sd_service_safe(app_rtos_state) != 0U)
     {
       if (APP_DataLog_IsFlushPending() != 0U)
       {
+        app_rtos_state->sd_task_phase = PHASE_SD_FLUSH;
         (void)APP_DataLog_ServiceDeferredStop();
       }
       else
       {
+        app_rtos_state->sd_task_phase = PHASE_SD_SERVICE_BUDGET;
         (void)APP_DataLog_ServiceBudget(10U, 512U);
       }
     }
 
+    app_rtos_state->sd_task_phase = PHASE_SD_STATUS;
     app_rtos_update_sd_log_status(app_rtos_state);
+    app_rtos_state->sd_task_phase = PHASE_SD_DELAY;
     osDelay(APP_RTOS_SD_PERIOD_MS);
   }
   /* USER CODE END StartTask05 */

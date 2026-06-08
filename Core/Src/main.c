@@ -45,6 +45,7 @@
 #include "iwdg.h"
 #include "max30102.h"
 #include "ssd1306.h"
+#include "app_diag.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -208,6 +209,8 @@ int main(void)
 
   /* USER CODE BEGIN Init */
   app_state_init(&app);
+  /* 尽早启用备份域写访问，确保后续 fault handler 可以写 BKP */
+  APP_Diag_Init();
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -227,6 +230,8 @@ int main(void)
   MX_TIM2_Init();
   MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
+  /* RTC 已就绪，读取上一轮崩溃记录 + 活体快照 (BKP 寄存器) */
+  APP_Diag_ReadCrashToAppState(&app);
   APP_Watchdog_Refresh();
   /* TIM6 中断稍后在 RTOS 就绪后启动，避免 ISR 在调度器启动前调用 FreeRTOS API */
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 5, 0);
@@ -477,7 +482,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  APP_Diag_CaptureCrash(DIAG_CRASH_ERROR_HANDLER, 0U, 0U);
   __disable_irq();
   while (1)
   {

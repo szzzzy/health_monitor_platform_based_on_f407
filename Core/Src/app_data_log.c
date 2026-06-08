@@ -19,6 +19,7 @@
 
 #include "app_data_log.h"
 #include "app_sd_file.h"
+#include "app_rtos.h"
 #include "main.h"
 #include <string.h>
 
@@ -452,7 +453,15 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
     /* fall through */
 
   case FLUSH_STATE_SYNC:
-    APP_SdFile_StopSession();
+    /* StopSession 内部: f_sync → f_close → f_mount(unmount) → Deinit
+     * 每一步都可能阻塞 (卡慢/坏卡时可达 200ms+)。
+     * 标记阶段码以便崩溃时定位在此。 */
+    {
+      AppState_t *s = app_rtos_get_state();
+      if (s != NULL) { s->sd_task_phase = PHASE_SD_FLUSH; }
+      APP_SdFile_StopSession();
+      if (s != NULL) { s->sd_task_phase = PHASE_SD_IDLE; }
+    }
     {
       uint16_t leftover = ring_clear_pending();
       total_dropped += leftover;

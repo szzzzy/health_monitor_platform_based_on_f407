@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 
+#include "app_diag.h"
 #include "app_measurement.h"
 #include "ssd1306.h"
 
@@ -883,8 +884,12 @@ static void app_display_debug_d5_algo(const AppState_t *app)
 static void app_display_debug_d6_sys(const AppState_t *app)
 {
   char line[8][24];
+  char crash_line[24];
+  char hwm_line[24];
+  char phase_line[24];
   const char *sd_state_str;
   const char *rtc;
+  const char *crash_name;
 
   if (app == NULL) { return; }
 
@@ -894,32 +899,65 @@ static void app_display_debug_d6_sys(const AppState_t *app)
 
   switch (app->sd_state)
   {
-  case 2U: sd_state_str = "ACTIVE"; break;  /* SD_STATE_ACTIVE */
-  case 3U: sd_state_str = "BOFF"; break;    /* SD_STATE_BACKOFF */
-  case 1U: sd_state_str = "TRY"; break;     /* SD_STATE_TRY_START */
+  case 2U: sd_state_str = "ACTIVE"; break;
+  case 3U: sd_state_str = "BOFF"; break;
+  case 1U: sd_state_str = "TRY"; break;
   default: sd_state_str = "IDLE"; break;
   }
 
-  (void)snprintf(line[0], sizeof(line[0]), "D6 SYS");
-  (void)snprintf(line[1], sizeof(line[1]), "RTC %s", rtc);
-  (void)snprintf(line[2], sizeof(line[2]), "UART R%s T%s",
-                 (app->uart_rx_message_valid) ? "V" : "I",
-                 (app->uart_tx_message_valid) ? "V" : "I");
-  (void)snprintf(line[3], sizeof(line[3]), "SD %s BUF%u%s",
-                 sd_state_str, (unsigned int)app->sd_buffered,
-                 (app->sd_paused != 0U) ? " PAUSE" : "");
-  (void)snprintf(line[4], sizeof(line[4]), "WR%u DR%u %lums",
+  /* 崩溃源名称 */
+  switch (app->crash_source)
+  {
+  case DIAG_CRASH_HARDFAULT:     crash_name = "HF"; break;
+  case DIAG_CRASH_MEMMANAGE:     crash_name = "MM"; break;
+  case DIAG_CRASH_BUSFAULT:      crash_name = "BF"; break;
+  case DIAG_CRASH_USAGEFAULT:    crash_name = "UF"; break;
+  case DIAG_CRASH_STACKOVF:      crash_name = "SO"; break;
+  case DIAG_CRASH_ASSERT:        crash_name = "AS"; break;
+  case DIAG_CRASH_MALLOCFAIL:    crash_name = "MF"; break;
+  case DIAG_CRASH_NMI:           crash_name = "NM"; break;
+  case DIAG_CRASH_ERROR_HANDLER: crash_name = "EH"; break;
+  default:                       crash_name = "--"; break;
+  }
+
+  if (app->crash_flag != 0U)
+    (void)snprintf(crash_line, sizeof(crash_line), "CR %s T%u@%u",
+                   crash_name,
+                   (unsigned int)app->crash_task,
+                   (unsigned int)app->crash_phase);
+  else
+    (void)snprintf(crash_line, sizeof(crash_line), "RST=0x%04lX",
+                   (unsigned long)(app->reset_flags & 0xFFFFU));
+
+  (void)snprintf(hwm_line, sizeof(hwm_line), "M%u U%u S%u",
+                 (unsigned int)app->max_task_stack_hwm,
+                 (unsigned int)app->ui_task_stack_hwm,
+                 (unsigned int)app->sd_task_stack_hwm);
+
+  (void)snprintf(phase_line, sizeof(phase_line), "PH M%uU%uS%uW%u",
+                 (unsigned int)app->max_task_phase,
+                 (unsigned int)app->ui_task_phase,
+                 (unsigned int)app->sd_task_phase,
+                 (unsigned int)app->wdt_task_phase);
+
+  (void)snprintf(line[0], sizeof(line[0]), "D6 SYS RB%lu",
+                 (unsigned long)app->reboot_count);
+  (void)snprintf(line[1], sizeof(line[1]), "%s", crash_line);
+  (void)snprintf(line[2], sizeof(line[2]), "%s", hwm_line);
+  (void)snprintf(line[3], sizeof(line[3]), "%s", phase_line);
+  (void)snprintf(line[4], sizeof(line[4]), "RTC %s SD %s",
+                 rtc, sd_state_str);
+  (void)snprintf(line[5], sizeof(line[5]), "BUF%u%s WR%uDR%u",
+                 (unsigned int)app->sd_buffered,
+                 (app->sd_paused != 0U) ? "P" : "",
                  (unsigned int)app->sd_written,
-                 (unsigned int)app->sd_dropped,
-                 (unsigned long)(app->sd_last_write_ms > 999UL ?
-                                 999UL : app->sd_last_write_ms));
-  (void)snprintf(line[5], sizeof(line[5]), "ERR %u SKIP %u",
-                 (unsigned int)app->sd_error, (unsigned int)app->display_skipped_count);
-  (void)snprintf(line[6], sizeof(line[6]), "DISP %lu",
+                 (unsigned int)app->sd_dropped);
+  (void)snprintf(line[6], sizeof(line[6]), "SKIP%u ERR%u",
+                 (unsigned int)app->display_skipped_count,
+                 (unsigned int)app->sd_error);
+  (void)snprintf(line[7], sizeof(line[7]), "DISP%lu HWM%u",
                  (unsigned long)(app->display_refresh_count > 999999UL ?
-                                 999999UL : app->display_refresh_count));
-  (void)snprintf(line[7], sizeof(line[7]), "P%u D%u HWM%u",
-                 (unsigned int)app->current_page, (unsigned int)app->debug_mode,
+                                 999999UL : app->display_refresh_count),
                  (unsigned int)app->fifo_high_watermark);
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);

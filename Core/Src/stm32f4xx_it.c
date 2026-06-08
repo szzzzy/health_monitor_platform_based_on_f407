@@ -27,6 +27,9 @@
 #include "max30102.h"
 #include "usart.h"
 #include "app_sd_card.h"
+#include "app_diag.h"
+#include "app_rtos.h"
+#include <stdint.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,7 +39,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* 故障 handler 从 AppState 推断"最可能正在运行的任务"及其阶段码。
+ * 因为 fault handler 在 exception context 中执行，不能调用 FreeRTOS API。
+ * 策略：非零 phase 的任务 = 最可能是肇事者（优先级高的优先）。 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,6 +61,37 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* 推断故障时正在运行的任务及其阶段码。
+ * 优先级顺序：MAX > UI > WDT > SD (匹配 FreeRTOS 优先级高低) */
+static void fault_get_task_phase(uint8_t *task_id, uint8_t *phase)
+{
+    AppState_t *s = app_rtos_get_state();
+
+    if ((task_id == NULL) || (phase == NULL)) return;
+
+    if (s != NULL)
+    {
+        if (s->max_task_phase != PHASE_MAX_IDLE)
+        {
+            *task_id = 1U;  *phase = s->max_task_phase; return;
+        }
+        if (s->ui_task_phase != PHASE_UI_IDLE)
+        {
+            *task_id = 3U;  *phase = s->ui_task_phase; return;
+        }
+        if (s->wdt_task_phase != PHASE_WDT_IDLE)
+        {
+            *task_id = 2U;  *phase = s->wdt_task_phase; return;
+        }
+        if (s->sd_task_phase != PHASE_SD_IDLE)
+        {
+            *task_id = 4U;  *phase = s->sd_task_phase; return;
+        }
+    }
+    *task_id = 0U;
+    *phase  = 0U;
+}
 
 /* USER CODE END 0 */
 
@@ -77,7 +113,7 @@ extern volatile uint8_t tim6_tick_flag;
 void NMI_Handler(void)
 {
   /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
+  APP_Diag_CaptureCrash(DIAG_CRASH_NMI, 0U, 0U);
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
   while (1)
@@ -92,7 +128,11 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  {
+    uint8_t tid, ph;
+    fault_get_task_phase(&tid, &ph);
+    APP_Diag_CaptureCrash(DIAG_CRASH_HARDFAULT, tid, ph);
+  }
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -107,7 +147,11 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
+  {
+    uint8_t tid, ph;
+    fault_get_task_phase(&tid, &ph);
+    APP_Diag_CaptureCrash(DIAG_CRASH_MEMMANAGE, tid, ph);
+  }
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -122,7 +166,11 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-
+  {
+    uint8_t tid, ph;
+    fault_get_task_phase(&tid, &ph);
+    APP_Diag_CaptureCrash(DIAG_CRASH_BUSFAULT, tid, ph);
+  }
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -137,7 +185,11 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-
+  {
+    uint8_t tid, ph;
+    fault_get_task_phase(&tid, &ph);
+    APP_Diag_CaptureCrash(DIAG_CRASH_USAGEFAULT, tid, ph);
+  }
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {
@@ -245,8 +297,8 @@ void I2C1_ER_IRQHandler(void)
 }
 
 /* MAX30102 PPG_RDY 中断（PE5 下降沿）
- * �? PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发�?
- * 系统会�?�过 TIM6 节拍兜底轮询�? */
+ * �? PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发�?
+ * 系统会�?�过 TIM6 节拍兜底轮询�? */
 /* HAL GPIO EXTI 统一回调，按引脚分发 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {

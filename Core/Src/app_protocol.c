@@ -173,7 +173,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
 
   (void)snprintf(buffer,
                  buffer_size,
-                 "M,%u,%04u%02u%02u,%02u%02u%02u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%d,%u,%u,%lu,%lu,%lu,%lu,%lu",
+                 "M,%u,%04u%02u%02u,%02u%02u%02u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%d,%u,%u,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu",
                  (unsigned int)app->rtc_time_valid,
                  (unsigned int)year,
                  (unsigned int)month,
@@ -262,7 +262,25 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
                  (unsigned long)app->ecg_adc_sat_count,
                  (unsigned long)app->ecg_dma_overflow_count,
                  (unsigned long)app->ecg_lead_off_count,
-                 (unsigned long)app->ecg_no_r_peak_timeout_count);
+                 (unsigned long)app->ecg_no_r_peak_timeout_count,
+                 /* 诊断字段: 崩溃/阶段码/栈水印 (旧上位机忽略尾部即可) */
+                 (unsigned int)app->crash_flag,
+                 (unsigned int)app->crash_source,
+                 (unsigned int)app->crash_task,
+                 (unsigned int)app->crash_phase,
+                 (unsigned long)app->crash_tick,
+                 (unsigned long)app->reboot_count,
+                 (unsigned long)app->reset_flags,
+                 (unsigned int)app->max_task_phase,
+                 (unsigned int)app->ui_task_phase,
+                 (unsigned int)app->sd_task_phase,
+                 (unsigned int)app->wdt_task_phase,
+                 (unsigned int)app->max_task_stack_hwm,
+                 (unsigned int)app->ui_task_stack_hwm,
+                 (unsigned int)app->sd_task_stack_hwm,
+                 (unsigned int)app->wdt_task_stack_hwm,
+                 (unsigned long)app->max_task_heartbeat,
+                 (unsigned long)app->ui_task_heartbeat);
 
   return (uint16_t)strlen(buffer);
 }

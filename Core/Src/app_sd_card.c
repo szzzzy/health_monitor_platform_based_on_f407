@@ -110,24 +110,22 @@ AppSdCardStatus_t APP_SD_Card_Init(void)
 
     HAL_SD_GetCardInfo(&hsd, &card_info);
 
-    /* 第二阶段：先更新高速分频，再让 HAL 在切换总线宽度时重配 SDIO 外设。 */
-    hsd.Init.ClockDiv = APP_SD_FAST_CLK_DIV;
-    hal_ret = HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B);
-    if (hal_ret != HAL_OK)
-    {
-        hsd.ErrorCode = HAL_SD_ERROR_NONE;
-        hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
-        hal_ret = HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_1B);
-        if (hal_ret != HAL_OK)
-        {
-            APP_SD_Card_Deinit();
-            return APP_SD_CARD_ERROR;
-        }
-    }
-    else
-    {
-        hsd.Init.BusWide = SDIO_BUS_WIDE_4B;
-    }
+    /* ---- TEMPORARY TEST: skip 4-bit wide-bus switch ----
+     * Hypothesis: HAL_SD_ConfigWideBusOperation(SDIO_BUS_WIDE_4B) or one of
+     * the D1-D3 lines (pull-up, signal integrity, card compatibility) causes
+     * the system to hang during the second PLACE-FINGER → measurement cycle.
+     *
+     * If the hang disappears with 1-bit-only operation, the root cause is in
+     * the 4-bit SDIO path (hardware or HAL). Revert this block after test.
+     *
+     * Normal code (commented out for test):
+     *   hsd.Init.ClockDiv = APP_SD_FAST_CLK_DIV;
+     *   hal_ret = HAL_SD_ConfigWideBusOperation(&hsd, SDIO_BUS_WIDE_4B);
+     *   if (hal_ret != HAL_OK) { ... fallback to 1-bit ... }
+     *   else { hsd.Init.BusWide = SDIO_BUS_WIDE_4B; }
+     */
+    (void)hal_ret;
+    /* Keep 400 kHz 1-bit — safe and sufficient for logging at 100 Hz. */
 
     card_initialized = true;
     block_count      = card_info.LogBlockNbr *

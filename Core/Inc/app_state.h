@@ -229,7 +229,60 @@ typedef struct
   /* PTT 状态 */
   uint8_t  ptt_valid;
   uint16_t ptt_ms;
+  /* ---- 诊断阶段码：每个任务在关键路径前写入，崩溃时从 BKP 寄存器恢复 ---- */
+  uint8_t  max_task_phase;       /* MAXtask 当前阶段 (0=idle/等待通知) */
+  uint8_t  ui_task_phase;        /* UiTask 当前阶段 */
+  uint8_t  sd_task_phase;        /* SDtask 当前阶段 */
+  uint8_t  wdt_task_phase;       /* watchdogtask 当前阶段 */
+  uint8_t  crash_flag;           /* 1 = 上次启动检测到崩溃 (BKP 中有有效记录) */
+  uint8_t  crash_source;         /* 崩溃源：1=HardFault 2=Mem 3=Bus 4=Usage 5=StackOvf 6=Assert */
+  uint8_t  crash_task;           /* 崩溃时所在任务 (1=MAX 2=WDT 3=UI 4=SD 5=default) */
+  uint8_t  crash_phase;          /* 崩溃时任务的阶段码 */
+  uint32_t crash_tick;           /* 崩溃时的系统 tick */
+  uint32_t reset_flags;          /* RCC_CSR 复位标志 (启动时捕获) */
+  uint32_t reboot_count;         /* 累计重启次数 (从 BKP 恢复) */
+  /* 各任务栈高水位 (0=未采样)，由 UiTask 周期性采集 */
+  uint16_t max_task_stack_hwm;   /* MAXtask 栈最小剩余字 */
+  uint16_t ui_task_stack_hwm;
+  uint16_t sd_task_stack_hwm;
+  uint16_t wdt_task_stack_hwm;
 } AppState_t;
+
+/* ---- 诊断阶段码定义 ---- */
+/* MAXtask phases */
+#define PHASE_MAX_IDLE           0U
+#define PHASE_MAX_NOTIFY_WAIT    1U
+#define PHASE_MAX_ECG            2U
+#define PHASE_MAX_FIFO_CHECK     3U
+#define PHASE_MAX_I2C_ACQ        4U
+#define PHASE_MAX_FIFO_DRAIN     5U
+#define PHASE_MAX_SAMPLE_PROC    6U
+#define PHASE_MAX_RECOVERY       7U
+#define PHASE_MAX_WATCHDOG       8U
+#define PHASE_MAX_HEARTBEAT      9U
+
+/* UiTask phases */
+#define PHASE_UI_IDLE            0U
+#define PHASE_UI_POLL_UART       1U
+#define PHASE_UI_BUTTONS         2U
+#define PHASE_UI_DISPLAY_CHECK   3U
+#define PHASE_UI_DISPLAY_REFRESH 4U
+#define PHASE_UI_REPORT_SEND     5U
+#define PHASE_UI_DELAY           6U
+
+/* SDtask phases */
+#define PHASE_SD_IDLE            0U
+#define PHASE_SD_SET_ACTIVE      1U
+#define PHASE_SD_SAFE_CHECK      2U
+#define PHASE_SD_FLUSH           3U
+#define PHASE_SD_SERVICE_BUDGET  4U
+#define PHASE_SD_STATUS          5U
+#define PHASE_SD_DELAY           6U
+
+/* Watchdogtask phases */
+#define PHASE_WDT_IDLE           0U
+#define PHASE_WDT_REFRESH        1U
+#define PHASE_WDT_DELAY          2U
 
 #ifdef __cplusplus
 }
