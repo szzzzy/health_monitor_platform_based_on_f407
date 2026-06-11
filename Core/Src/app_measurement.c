@@ -48,7 +48,7 @@
 #define APP_ADVANCED_PULSE_STALE_SAMPLES  (MAX30102_ALGO_SAMPLE_RATE_HZ * 8U)
 /* 手指接触稳定倒计数：避免接触瞬态污染检测器 */
 #define APP_CONTACT_SETTLE_SAMPLES        200U
-/* beat-based PI 超时：无新 beat 超过此窗口则标无效 */
+/* 基于 beat 的 PI 超时：无新 beat 超过此窗口则标无效 */
 #define APP_PI_STALE_SAMPLES              (MAX30102_ALGO_SAMPLE_RATE_HZ * 5U)
 #define APP_SENSOR_STALE_TIMEOUT_MS       3000U
 #define APP_SENSOR_STALE_CONFIRM_INTERVAL_MS 1000U
@@ -72,7 +72,7 @@ static struct
 } sample_debug_state;
 /* BPM 评估抽头计数器：每 N 个样本才跑一次完整 BPM 计算 */
 static uint8_t bpm_update_decimator;
-/* A delayed main loop must get a chance to drain FIFO before bus recovery. */
+/* 延迟的主循环必须在总线恢复前有机会耗尽 FIFO。 */
 static uint32_t sensor_last_recovery_tick = 0UL;
 static uint32_t sensor_last_stale_probe_tick = 0UL;
 static uint8_t  sensor_stale_probe_count = 0U;
@@ -83,13 +83,30 @@ static void app_invalidate_advanced_outputs(AppState_t *app);
 static void app_reset_advanced_metrics(AppState_t *app);
 static HAL_StatusTypeDef app_measurement_reinit_sensor(void);
 
-/* 初始化测量子系统的 AppState 字段（手指阈值、包络等）。 */
+/**
+ ******************************************************************************
+ * @brief  初始化 AppState 中的测量子系统字段。
+ * @param  app 指向共享应用状态（不能为 NULL）。
+ * @return 无。
+ * @note   委托给 app_ppg_signal_init_state 设置手指阈值
+ *         和 PPG 信号包络默认值。
+ ******************************************************************************
+ */
 void app_measurement_init_state(AppState_t *app)
 {
   app_ppg_signal_init_state(app);
 }
 
-/* 上电或手指状态切换时重置全部测量运行时状态。 */
+/**
+ ******************************************************************************
+ * @brief  重置所有测量运行时状态。
+ * @param  无。
+ * @return 无。
+ * @note   在上电时和每次手指状态切换时调用。重置
+ *         基线统计、SpO2 窗口、运动检测器、PPG 包络、
+ *         算法滤波器、波形显示和传感器看门狗定时器。
+ ******************************************************************************
+ */
 void app_measurement_reset_runtime(void)
 {
   max30102_baseline_reset(&baseline_data);
@@ -167,13 +184,30 @@ uint8_t app_measurement_collect_baseline_sample(AppState_t *app)
   return 1U;
 }
 
-/* 基线是否已采够目标样本数。 */
+/**
+ ******************************************************************************
+ * @brief  检查背景基线采集是否完成。
+ * @param  无。
+ * @return 如果基线样本数达到 APP_MEASUREMENT_BASELINE_SAMPLES 则返回 1，
+ *         否则返回 0。
+ * @note   在上电无手指阶段使用，用于控制进入正常
+ *         测量操作的门控。
+ ******************************************************************************
+ */
 uint8_t app_measurement_baseline_ready(void)
 {
   return max30102_baseline_is_ready(&baseline_data, APP_MEASUREMENT_BASELINE_SAMPLES);
 }
 
-/* 基线采集进度百分比（0–100），供 OLED 状态页显示。 */
+/**
+ ******************************************************************************
+ * @brief  获取基线采集进度百分比。
+ * @param  无。
+ * @return 进度 0--100，完成后固定为 100。
+ * @note   在上电基线采集阶段显示在 OLED 状态页面上。
+ *
+ ******************************************************************************
+ */
 uint16_t app_measurement_get_baseline_progress_percent(void)
 {
   if (baseline_data.sample_count >= APP_MEASUREMENT_BASELINE_SAMPLES)
@@ -184,31 +218,73 @@ uint16_t app_measurement_get_baseline_progress_percent(void)
   return (uint16_t)((baseline_data.sample_count * 100U) / APP_MEASUREMENT_BASELINE_SAMPLES);
 }
 
-/* 背景基线平均 IR 值（基线阶段采完后使用）。 */
+/**
+ ******************************************************************************
+ * @brief  获取背景基线采集的平均 IR 值。
+ * @param  无。
+ * @return 无手指基线阶段采集的平均 IR 原始值。
+ * @note   基线完成后用于初始化运行时跟踪滤波器。
+ ******************************************************************************
+ */
 uint32_t app_measurement_get_baseline_average(void)
 {
   return max30102_baseline_get_average_ir(&baseline_data);
 }
 
-/* 背景基线 IR 波动范围（用于评估背景稳定性）。 */
+/**
+ ******************************************************************************
+ * @brief  获取背景基线采集的 IR 波动范围。
+ * @param  无。
+ * @return 采集的 IR 样本峰峰值范围（最大值 - 最小值）。
+ * @note   用于评估环境噪声并判断基线是否
+ *         足够稳定以实现可靠的手指检测。
+ ******************************************************************************
+ */
 uint32_t app_measurement_get_baseline_range(void)
 {
   return max30102_baseline_get_range_ir(&baseline_data);
 }
 
-/* 运行时动态跟踪基线（跟随环境光/温度漂移）。 */
+/**
+ ******************************************************************************
+ * @brief  获取运行时跟踪的基线 IR 值。
+ * @param  无。
+ * @return 当前跟踪的 IR 基线，跟随环境光和
+ *         温度漂移。
+ * @note   与静态基线平均值不同，该值在手指离开期间持续更新
+ *         以跟踪环境变化。
+ ******************************************************************************
+ */
 uint32_t app_measurement_get_tracked_baseline(void)
 {
   return max30102_baseline_get_tracked_ir(&baseline_data);
 }
 
-/* 用开机背景采样结果为运行时基线跟踪器设定初值。 */
+/**
+ ******************************************************************************
+ * @brief  使用上电采集结果初始化运行时基线跟踪器。
+ * @param  baseline_ir 背景基线阶段的平均 IR 值。
+ * @param  noise_ir    估计的噪声基底，用于设置跟踪死区。
+ * @return 无。
+ * @note   必须在基线采集完成后、正常手指检测开始前
+ *         调用一次。
+ ******************************************************************************
+ */
 void app_measurement_seed_baseline_tracking(uint32_t baseline_ir, uint32_t noise_ir)
 {
   max30102_baseline_seed_tracking(&baseline_data, baseline_ir, noise_ir);
 }
 
-/* 判断背景基线是否足够稳定（波动范围在门限内）。 */
+/**
+ ******************************************************************************
+ * @brief  检查背景基线是否足够稳定。
+ * @param  无。
+ * @return 如果基线 IR 范围在 APP_MEASUREMENT_BASELINE_STABLE_RANGE 内则返回 1，
+ *         否则返回 0。
+ * @note   噪声较大的基线（波动范围大）可能导致手指检测误触发
+ *         或漏检手指离开事件。
+ ******************************************************************************
+ */
 uint8_t app_measurement_baseline_is_stable(void)
 {
   return max30102_baseline_is_stable(&baseline_data, APP_MEASUREMENT_BASELINE_STABLE_RANGE);
@@ -322,7 +398,7 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
   if (read_status == HAL_BUSY)
   {
     app->sensor_read_busy_count++;
-    /* BUSY + I2C 故障 → 返回 ERROR，走阈值恢复路径 */
+    /* 忙 + I2C 故障 → 返回错误，走阈值恢复路径 */
     if (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY)
     {
       app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
@@ -333,7 +409,7 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
       }
       return APP_MEASUREMENT_READ_ERROR;
     }
-    /* BUSY + I2C READY → FIFO 暂时空或溢出清空后的等待，保留 WAIT */
+    /* 忙 + I2C 就绪 → FIFO 暂时空或溢出清空后的等待，保留等待 */
     app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_WAIT;
     return APP_MEASUREMENT_READ_WAIT;
   }
@@ -350,7 +426,16 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
   return APP_MEASUREMENT_READ_ERROR;
 }
 
-/* 根据背景噪声自适应更新手指检测的 on/off 阈值。 */
+/**
+ ******************************************************************************
+ * @brief  根据当前噪声更新自适应手指检测阈值。
+ * @param  app 指向共享应用状态。
+ * @return 无。
+ * @note   委托给 app_ppg_signal_update_adaptive_thresholds，
+ *         该函数根据测量的背景 IR 噪声水平调整
+ *         手指就位/离开 delta 阈值。
+ ******************************************************************************
+ */
 void app_measurement_update_adaptive_thresholds(AppState_t *app)
 {
   app_ppg_signal_update_adaptive_thresholds(app, &baseline_data);
@@ -381,7 +466,7 @@ void app_measurement_update_finger_state(AppState_t *app)
 
     if (app->raw_signal_present != 0U)
     {
-      /* Integrate: each beat with raw signal present increments the counter. */
+      /* 积分：每拍原始信号存在时递增计数器。 */
       if (app->finger_on_confirm_count < APP_PPG_SIGNAL_FINGER_ON_CONFIRM_COUNT)
       {
         app->finger_on_confirm_count++;
@@ -404,15 +489,15 @@ void app_measurement_update_finger_state(AppState_t *app)
     }
     else
     {
-      /* Decrement on absence — tolerates 1-2 beat jitter instead of instant reset. */
+      /* 无信号时递减 — 容忍 1-2 拍抖动而非立即重置。 */
       if (app->finger_on_confirm_count > 0U)
       {
         app->finger_on_confirm_count--;
       }
 
-      /* Only track background IR when signal is clearly below threshold.
-       * Near-threshold signals (ir_signal_delta >= on_delta/2) are suspected
-       * as a finger approaching — freeze baseline to avoid contamination. */
+      /* 仅在信号明显低于阈值时跟踪背景 IR。
+       * 接近阈值的信号 (ir_signal_delta >= on_delta/2) 被怀疑为手指接近
+       * — 冻结基线以避免污染。 */
       if (app->ir_signal_delta < (app->adaptive_finger_on_delta / 2U))
       {
         app_ppg_signal_track_background_ir(app, &baseline_data);
@@ -430,8 +515,8 @@ void app_measurement_update_finger_state(AppState_t *app)
     return;
   }
 
-  /* Track background IR during finger-off confirmation window so the baseline
-   * converges toward the true no-finger level before finger is confirmed off. */
+  /* 在手指离开确认窗口期间跟踪背景 IR，使基线
+   * 在手指确认为离开之前收敛到真实的无手指水平。 */
   app_ppg_signal_track_background_ir(app, &baseline_data);
 
   if (app->finger_off_confirm_count < 0xFFU)
@@ -445,13 +530,13 @@ void app_measurement_update_finger_state(AppState_t *app)
     app->finger_off_confirm_count = 0U;
     app->finger_on_confirm_count = 0U;
 
-    /* 手指离开 → 设延迟 flush 标志（内部 O(1)），由后台在安全窗口分片执行 */
+    /* 手指离开 → 设延迟刷新标志（内部 O(1)），由后台在安全窗口分片执行 */
     APP_DataLog_OnMeasurementStop();
 
-    /* Background baseline has been tracked during the off-confirm window via
-     * app_ppg_signal_track_background_ir (called when raw_signal_present==0).
-     * Do not re-seed from a single IR sample here — it may still be elevated
-     * from the finger removal transient and would raise the finger-on threshold. */
+    /* 背景基线已在离开确认窗口期间通过
+     * app_ppg_signal_track_background_ir（在 raw_signal_present==0 时调用）跟踪。
+     * 不要在此处用单个 IR 样本重新播种 —— 它可能仍因手指移除瞬态
+     * 而偏高，会抬高手指就位阈值。 */
     app->baseline_ir = max30102_baseline_get_tracked_ir(&baseline_data);
     max30102_baseline_seed_tracking(&baseline_data,
                                     app->baseline_ir,
@@ -501,9 +586,9 @@ void app_measurement_process(AppState_t *app)
 
   if (app->finger_present == 0U)
   {
-    /* Safety: contact_settle_samples must only be >0 when finger is confirmed.
-     * If it was erroneously set (overflow/recovery while finger absent), clear it
-     * so finger_on_confirm_count can resume counting on the next placement. */
+    /* 安全：contact_settle_samples 仅在手指确认就位时才能 >0。
+     * 如果错误地设置了（手指离开时发生溢出/恢复），清除它
+     * 以便 finger_on_confirm_count 能在下次放置时重新计数。 */
     if (app->contact_settle_samples > 0U)
     {
       app->contact_settle_samples = 0U;
@@ -511,13 +596,13 @@ void app_measurement_process(AppState_t *app)
     return;
   }
 
-  /* 接触稳定倒计数：手指刚放上时抑制 motion/stale/beat detector */
+  /* 接触稳定倒计数：手指刚放上时抑制运动/停滞/拍检测器 */
   if (app->contact_settle_samples > 0U)
   {
     app->contact_settle_samples--;
     if (app->contact_settle_samples == 0U)
     {
-      /* Warm-up 结束：重置全部高级算法状态，避免接触瞬态污染 */
+      /* 预热结束：重置全部高级算法状态，避免接触瞬态污染 */
       app_ppg_pulse_reset();
       app_hrv_reset(app);
       app_rr_reset(app);
@@ -590,7 +675,7 @@ void app_measurement_process(AppState_t *app)
       app_invalidate_advanced_outputs(app);
     }
 
-    /* Beat-based PI：从已接受 beat 的 peak-to-trough 幅度 EMA 计算。
+    /* 基于 beat 的 PI：从已接受 beat 的峰谷幅度 EMA 计算。
      * 无新 beat 时保持最近值，超过阈值标无效。 */
     if (app->ir_pi_ac_ema_valid != 0U)
     {
@@ -675,8 +760,16 @@ void app_measurement_process(AppState_t *app)
   }
 }
 
-/* 20 拍 (=200ms) 计时器：置位 report_due 和 display_refresh_requested。
- * 由主循环在每次采样后调用，驱动协议上报和 OLED 刷新。 */
+/**
+ ******************************************************************************
+ * @brief  在 20 个样本（200 毫秒）节拍上更新周期性标志。
+ * @param  app 指向共享应用状态。
+ * @return 无。
+ * @note   在主循环中每个样本后调用。设置 report_due 和
+ *         display_refresh_requested，每 20 次调用使协议上报
+ *         和 OLED 刷新以约 5 Hz 运行，与采样率无关。
+ ******************************************************************************
+ */
 void app_measurement_update_periodic_flags(AppState_t *app)
 {
   if (app == NULL)
@@ -713,7 +806,7 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
   /* 批量读 MAX30102 FIFO */
   count = max30102_read_fifo_batch(red_batch, ir_batch, 24U, &ovf);
 
-  /* 同步 driver 层 FIFO debug 字段到 AppState */
+  /* 同步驱动层 FIFO 调试字段到 AppState */
   {
     const MAX30102_FifoDebug_t *fdbg = max30102_get_fifo_debug();
     if (fdbg != NULL)
@@ -728,7 +821,7 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
   /* 记录尝试 */
   app->sensor_read_attempt_count++;
 
-  /* 处理 overflow */
+  /* 处理溢出 */
   if (ovf > 0U)
   {
     app->fifo_overflow_total += ovf;
@@ -737,7 +830,7 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
       app->fifo_overflow_total = 999999UL;
     }
 
-    /* 立即重置连续性历史，不等到 settle 结束 */
+    /* 立即重置连续性历史，不等到稳定结束 */
     app_hrv_reset(app);
     app_rr_reset(app);
     app_ppg_pulse_reset();
@@ -745,9 +838,9 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
 
     app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
 
-    /* Only enter contact settle when a finger is actually present.
-     * If finger is absent, reset the overflow/algorithm state above
-     * is sufficient — do not block finger_on_confirm_count. */
+    /* 仅在手指实际就位时进入接触稳定状态。
+     * 如果手指不在，上面的溢出/算法状态重置
+     * 就足够了 — 不要阻塞 finger_on_confirm_count。 */
     if (app->finger_present != 0U)
     {
       app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
@@ -758,7 +851,7 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
 
   if (count == 0U)
   {
-    /* 非 overflow 返回 0 → 可能是 FIFO 空或 I2C 错误 */
+    /* 非溢出返回 0 → 可能是 FIFO 空或 I2C 错误 */
     if ((HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) ||
         (HAL_I2C_GetError(&hi2c1) != HAL_I2C_ERROR_NONE))
     {
@@ -791,7 +884,7 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
     /* 最后一个样本 = now，前面的按 10ms 向前回溯 */
     sample_tick = now - ((uint32_t)(count - 1U - i) * APP_SAMPLE_PERIOD_MS);
 
-    /* 跟踪样本间隔，包含上一批最后样本到本批第一个样本的 gap。 */
+    /* 跟踪样本间隔，包含上一批最后样本到本批第一个样本的时间间隔。 */
     if ((app->sensor_last_sample_tick != 0UL) &&
         (sample_tick > app->sensor_last_sample_tick))
     {
@@ -867,7 +960,7 @@ static void app_measurement_do_recovery(AppState_t *app)
   app->sensor_health = (uint8_t)SENSOR_HEALTH_RECOVERING;
   app->display_refresh_requested = 1U;
 
-  /* I2C bus recovery + MAX30102 re-init. */
+  /* I2C 总线恢复 + MAX30102 重新初始化。 */
   if (app_measurement_reinit_sensor() != HAL_OK)
   {
     app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
@@ -891,14 +984,14 @@ static void app_measurement_do_recovery(AppState_t *app)
   app->sensor_last_i2c_error = HAL_I2C_ERROR_NONE;
   app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
   app->sensor_recover_count++;
-  /* Give MAX30102 time to publish its first sample after reset. */
+  /* 给 MAX30102 时间在复位后发布其第一个样本。 */
   app->sensor_last_sample_tick = now;
   sensor_last_stale_probe_tick = 0UL;
   sensor_stale_probe_count = 0U;
   sample_debug_state.initialized = 0U;
-  /* Enter short reacquire: if finger is present, set contact_settle to
-   * suppress algorithm output during re-stabilization. If finger is absent,
-   * stay in PLACE FINGER — do not enter settle. */
+  /* 进入短时重新采集：如果手指就位，设置 contact_settle 以
+   * 在重新稳定期间抑制算法输出。如果手指不在，
+   * 保持 PLACE FINGER — 不进入稳定。 */
   if (app->finger_present != 0U)
   {
     app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
@@ -907,7 +1000,7 @@ static void app_measurement_do_recovery(AppState_t *app)
   app->report_due = 1U;
 }
 
-/* Runtime recovery helper: clear I2C, then retry MAX30102 init. */
+/* ---- 运行时恢复辅助函数：清除 I2C，然后重试 MAX30102 初始化。 ---- */
 static HAL_StatusTypeDef app_measurement_reinit_sensor(void)
 {
   HAL_StatusTypeDef init_status = HAL_ERROR;
@@ -929,7 +1022,16 @@ static HAL_StatusTypeDef app_measurement_reinit_sensor(void)
   return init_status;
 }
 
-/* Sensor ERROR-path recovery entry. */
+/**
+ ******************************************************************************
+ * @brief  传感器错误路径恢复的入口点。
+ * @param  app 指向共享应用状态。
+ * @return 无。
+ * @note   仅在 app->sensor_error_streak 达到 APP_SENSOR_RECOVERY_ERROR_COUNT
+ *         时触发完整的 I2C 总线恢复 + MAX30102 重新初始化。
+ *         两次尝试之间限频为 APP_SENSOR_RECOVERY_RETRY_MS。
+ ******************************************************************************
+ */
 void app_measurement_recover_sensor(AppState_t *app)
 {
   if ((app == NULL) || (app->sensor_error_streak < APP_SENSOR_RECOVERY_ERROR_COUNT))
@@ -954,7 +1056,7 @@ void app_measurement_service_sensor_watchdog(AppState_t *app)
 
   if (app == NULL) return;
 
-  /* 恢复期间不重复触发，等待恢复流程自行更新 health */
+  /* 恢复期间不重复触发，等待恢复流程自行更新健康状态 */
   if (app->sensor_health == (uint8_t)SENSOR_HEALTH_RECOVERING) return;
 
   now = HAL_GetTick();
@@ -985,8 +1087,8 @@ void app_measurement_service_sensor_watchdog(AppState_t *app)
     return;
   }
 
-  /* OLED/SD work can delay the main loop. Confirm a persistent stall before
-   * clearing MAX30102 FIFO and rebuilding the shared I2C bus. */
+  /* OLED/SD 工作可能延迟主循环。在清除 MAX30102 FIFO 和
+   * 重建共享 I2C 总线之前确认持久停顿。 */
   if ((sensor_last_stale_probe_tick != 0UL) &&
       ((now - sensor_last_stale_probe_tick) < APP_SENSOR_STALE_CONFIRM_INTERVAL_MS))
   {
@@ -1008,7 +1110,7 @@ void app_measurement_service_sensor_watchdog(AppState_t *app)
   app_measurement_do_recovery(app);
 }
 
-/* 手指状态切换时重置全部测量输出：波形、SpO2 窗口、滤波器、motion、包络等。 */
+/* ---- 手指状态切换时重置所有测量输出 ---- */
 static void app_reset_measurement_outputs(AppState_t *app)
 {
   if (app == NULL)
@@ -1036,7 +1138,7 @@ static void app_reset_measurement_outputs(AppState_t *app)
   app_ptt_reset(app);
 }
 
-/* 信号中断/motion 时仅标无效，不清 buffer，中断结束可立即恢复。 */
+/* ---- 信号丢失/运动时使高级输出无效（保留缓冲区） ---- */
 static void app_invalidate_advanced_outputs(AppState_t *app)
 {
   if (app == NULL)
@@ -1048,7 +1150,7 @@ static void app_invalidate_advanced_outputs(AppState_t *app)
   app->rr_valid = 0U;
 }
 
-/* 完全重置高级指标：清空 HRV/RR ring buffer + PPGA 脉搏检测器。 */
+/* ---- 完全重置高级指标（HRV / RR 环形缓冲区 + PPGA 脉搏检测器） ---- */
 static void app_reset_advanced_metrics(AppState_t *app)
 {
   app_hrv_reset(app);

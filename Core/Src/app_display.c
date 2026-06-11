@@ -2,8 +2,11 @@
 
 #include <stdio.h>
 
+#include "adc.h"
 #include "app_diag.h"
+#include "app_ecg.h"
 #include "app_measurement.h"
+#include "app_sched_diag.h"
 #include "app_sd_card.h"
 #include "ssd1306.h"
 
@@ -59,7 +62,8 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
                                  uint8_t width,
                                  uint8_t height,
                                  uint8_t dotted,
-                                 uint8_t markers);
+                                 uint8_t markers,
+                                 uint8_t stable_scale);
 static uint8_t app_display_text_width_px(const char *s);
 static void app_display_draw_right(uint8_t y, const char *s);
 static const char *app_get_finger_status(const AppState_t *app, char *buf, size_t buf_size);
@@ -74,6 +78,8 @@ static void app_display_debug_d4_ppg_q(const AppState_t *app);
 static void app_display_debug_d5_algo(const AppState_t *app);
 static void app_display_debug_d6_sys(const AppState_t *app);
 static void app_display_debug_d7_sd(const AppState_t *app);
+static void app_display_debug_d8_ecg(const AppState_t *app);
+static void app_display_debug_d9_sched(const AppState_t *app);
 static const char *app_get_quality_label(const AppState_t *app);
 static const char *app_get_balance_label(uint8_t balance_status);
 static const char *app_get_regular_label(const AppState_t *app);
@@ -85,6 +91,13 @@ static void app_format_rtc_lines(const AppState_t *app,
                                  char *date_line,
                                  size_t date_line_size);
 
+/**
+ * @brief  初始化应用结构体中的显示状态。
+ * @param  app 指向待初始化的应用状态结构体。
+ * @note   将默认页面设置为 DISPLAY_PAGE_BPM，重置调试模式，
+ *         配置按键端口/引脚分配，并重置 ECG 波形。
+ *         display_refresh_requested 被置为 1 以强制首次渲染。
+ */
 void app_display_init_state(AppState_t *app)
 {
   if (app == NULL)
@@ -106,6 +119,11 @@ void app_display_init_state(AppState_t *app)
   waveform_buffer_reset(&ecg_waveform);
 }
 
+/**
+ * @brief  同时清空 IR 和 RED 波形缓冲。
+ * @note   便捷包装函数，重置 ir_waveform 和 red_waveform。
+ *         通常在手指接触状态变化或传感器恢复后被调用，以丢弃过时的波形数据。
+ */
 /* 同时清空 IR / RED 两条波形缓冲。 */
 void app_display_reset_waveforms(void)
 {
@@ -113,38 +131,80 @@ void app_display_reset_waveforms(void)
   waveform_buffer_reset(&red_waveform);
 }
 
+/**
+ * @brief  向 IR 波形缓冲（脉搏页面）压入一个带通滤波后的 IR 样本。
+ * @param  filtered_value 带通滤波后的 IR 交流样本值。
+ * @note   委托 waveform_buffer_add_sample 操作 IR 波形缓冲。
+ *         样本将被绘制在 PULSE 页面的主波形区域。
+ */
 /* IR 页面使用的波形样本入口。 */
 void app_display_add_ir_sample(int32_t filtered_value)
 {
   waveform_buffer_add_sample(&ir_waveform, filtered_value);
 }
 
+/**
+ * @brief  向 RED 波形缓冲（SpO2 页面）压入一个带通滤波后的 RED 样本。
+ * @param  filtered_value 带通滤波后的 RED 交流样本值。
+ * @note   委托 waveform_buffer_add_sample 操作 RED 波形缓冲。
+ *         样本将被绘制在 OXY 页面的下方波形区域。
+ */
 /* SpO2 页面使用的波形样本入口。 */
 void app_display_add_red_sample(int32_t filtered_value)
 {
   waveform_buffer_add_sample(&red_waveform, filtered_value);
 }
 
+/**
+ * @brief  在 IR 波形缓冲中将最新样本标记为检测到的脉搏点。
+ * @note   委托 waveform_buffer_mark_latest 操作 IR 缓冲。
+ *         标记在 PULSE 页面上渲染为波形区域底部的小箭头。
+ */
 void app_display_add_ir_pulse_marker(void)
 {
   waveform_buffer_mark_latest(&ir_waveform);
 }
 
+/**
+ * @brief  将 ECG 波形缓冲重置为初始空状态。
+ * @note   委托 waveform_buffer_reset 操作 ecg_waveform 缓冲。
+ *         在 ECG 导联配置更改或导联脱落恢复后被调用，以丢弃过时的波形数据。
+ */
 void app_display_reset_ecg_waveform(void)
 {
   waveform_buffer_reset(&ecg_waveform);
 }
 
+/**
+ * @brief  向 ECG 波形缓冲压入一个带通滤波后的 ECG 样本。
+ * @param  filtered_value 滤波后的 ECG 样本值。
+ * @note   委托 waveform_buffer_add_sample 操作 ecg_waveform 缓冲。
+ *         样本将被绘制在 ECG 页面的全高波形区域。
+ *         该缓冲与 MAX30102 接触状态无关。
+ */
 void app_display_add_ecg_sample(int32_t filtered_value)
 {
   waveform_buffer_add_sample(&ecg_waveform, filtered_value);
 }
 
+/**
+ * @brief  在 ECG 波形缓冲中将最新样本标记为检测到的 R 峰。
+ * @note   委托 waveform_buffer_mark_latest 操作 ecg_waveform 缓冲。
+ *         标记在 ECG 页面上渲染为 ECG 波形区域底部的小指示符。
+ */
 void app_display_add_ecg_r_peak_marker(void)
 {
   waveform_buffer_mark_latest(&ecg_waveform);
 }
 
+/**
+ * @brief  轮询页面导航和调试切换按键。
+ * @param  app 指向应用状态的指针（页面和调试状态被更新）。
+ * @note   PE2 切换调试模式开/关。正常模式下，PE3/PE4 循环切换
+ *         测量页面 (DISPLAY_PAGE_NORMAL_COUNT)。调试模式下，
+ *         PE3/PE4 循环切换调试子页面。使用 page_button_poll_pressed()
+ *         进行消抖。任何页面切换后都会设置 display_refresh_requested。
+ */
 /* 处理页面切换按键，让 UI 切换与测量处理保持解耦。 */
 void app_display_handle_buttons(AppState_t *app)
 {
@@ -219,6 +279,13 @@ void app_display_handle_buttons(AppState_t *app)
   }
 }
 
+/**
+ * @brief  根据当前页面和调试模式渲染主测量页面。
+ * @param  app 指向应用状态的指针（页面选择、测量数据）。
+ * @note   调试模式下，派发到对应的调试子页面渲染器（d1 至 d7）。
+ *         正常模式下，派发到当前页面渲染器：PULSE、OXY、VITALS 或 ECG。
+ *         如果 app 为 NULL，则立即返回而不渲染。
+ */
 /* 根据当前页面与状态，绘制主测量页面。 */
 void app_display_measurement_page(const AppState_t *app)
 {
@@ -238,6 +305,8 @@ void app_display_measurement_page(const AppState_t *app)
       case DBG_SUB_D5_ALGO:     app_display_debug_d5_algo(app);     break;
       case DBG_SUB_D6_SYS:      app_display_debug_d6_sys(app);      break;
       case DBG_SUB_D7_SD:       app_display_debug_d7_sd(app);       break;
+      case DBG_SUB_D8_ECG:      app_display_debug_d8_ecg(app);      break;
+      case DBG_SUB_D9_SCHED:    app_display_debug_d9_sched(app);    break;
       case DBG_SUB_D1_MAX:
       default:                  app_display_debug_d1_max(app);      break;
     }
@@ -265,6 +334,13 @@ void app_display_measurement_page(const AppState_t *app)
   }
 }
 
+/**
+ * @brief  渲染 PULSE 页面：心率、IBI、SQ 和全高 IR 波形。
+ * @param  app 指向应用状态的指针（HR、IBI、SQ、手指状态）。
+ * @note   布局：y=0 显示 HR+IBI（左侧）和 SQ（右侧）；y=8 显示 REG/标签
+ *         （左侧）和页面标题（右侧）；y=16..63 为 48px 的 IR 波形。
+ *         如果手指未放置，则居中显示状态信息。
+ */
 /*
  * PULSE 页：2 行文本 + 全高 IR 波形 (y=16..63, 48px)。
  * y=0: 左侧 HR+IBI，右侧 SQ（如 "SQ42" 或 "M"）。
@@ -351,10 +427,18 @@ static void app_display_pulse_page(const AppState_t *app)
   app_display_draw_right(0, line0r);
   ssd1306_DrawString(0, 8, line1);
   app_display_draw_right(8, line1r);
-  waveform_buffer_draw(&ir_waveform, 0U, 16U, SSD1306_WIDTH, 48U, 0U, 1U);
+  waveform_buffer_draw(&ir_waveform, 0U, 16U, SSD1306_WIDTH, 48U, 0U, 1U, 0U);
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  渲染 OXY 页面：SpO2、比率、PI、IR + RED 双波形。
+ * @param  app 指向应用状态的指针（SpO2、比率、PI、平衡）。
+ * @note   布局：y=0 显示 SpO2+R（左侧）和 PI（右侧）；y=8 显示 BAL+SQ
+ *         （左侧）和标题（右侧）；y=16..39 为 24px 的 IR 波形；
+ *         y=40..63 为 24px 的 RED 波形（虚线）。如果手指未放置，
+ *         则居中显示状态信息。
+ */
 /*
  * OXY 页：2 行文本 + IR 波形 (y=16..39, 24px) + RED 波形 (y=40..63, 24px)。
  * y=0: 左侧 SpO2+R，右侧 "O" 标题 + PI。
@@ -434,11 +518,18 @@ static void app_display_oxy_page(const AppState_t *app)
   app_display_draw_right(0, line0r);
   ssd1306_DrawString(0, 8, line1);
   app_display_draw_right(8, line1r);
-  waveform_buffer_draw(&ir_waveform,  0U, 16U, SSD1306_WIDTH, 24U, 0U, 0U);
-  waveform_buffer_draw(&red_waveform, 0U, 40U, SSD1306_WIDTH, 24U, 1U, 0U);
+  waveform_buffer_draw(&ir_waveform,  0U, 16U, SSD1306_WIDTH, 24U, 0U, 0U, 0U);
+  waveform_buffer_draw(&red_waveform, 0U, 40U, SSD1306_WIDTH, 24U, 1U, 0U, 0U);
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  渲染 VITALS 汇总页面：HR、RR、IBI、HRV、PI、RTC。
+ * @param  app 指向应用状态的指针（所有生命体征字段）。
+ * @note   布局：8 行文本，显示 HR+RR、IBI、SDNN+RMSSD、SD1+SD2、PI、
+ *         RTC 状态、RTC 时间和 RTC 日期。无波形区域——纯文本。
+ *         如果手指未放置，则显示状态信息和 RTC 信息。
+ */
 /*
  * VITALS 汇总页：8 行纯文本。
  * y=0: 左侧 HR+RR，右侧 "V" 标题 + SQ。
@@ -551,11 +642,11 @@ static void app_display_vitals_page(const AppState_t *app)
                  (unsigned int)(app->signal_ir_pi_x1000 / 10U),
                  (unsigned int)(app->signal_ir_pi_x1000 % 10U));
 
-  /* --- y=40: RTC status --- */
+  /* --- y=40: RTC 状态 --- */
   (void)snprintf(line5, sizeof(line5), "%s", app_get_rtc_status_label(app));
   app_format_rtc_lines(app, time_line, sizeof(time_line), date_line, sizeof(date_line));
 
-  /* --- Draw --- */
+  /* --- 绘制 --- */
   ssd1306_Clear(SSD1306_COLOR_BLACK);
   ssd1306_DrawString(0, 0, line0);
   app_display_draw_right(0, line0r);
@@ -569,9 +660,16 @@ static void app_display_vitals_page(const AppState_t *app)
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  渲染 ECG 页面：ECG 心率、RR 间期、PTT 和滤波波形。
+ * @param  app 指向应用状态的指针（ECG 和 PTT 字段）。
+ * @note   布局：y=0 显示 HR+RR（左侧）和 "ECG" 标题（右侧）；y=8 显示
+ *         PTT（左侧）和滤波幅度（右侧）；y=16..63 为 48px 的 ECG 波形。
+ *         导联脱落时显示 "LEAD OFF" 和电极检查信息。ECG 波形与 MAX30102 接触无关。
+ */
 /*
- * ECG page: ECG HR/RR + PTT text and a full-height filtered ECG waveform.
- * The waveform buffer is independent of MAX30102 contact state.
+ * ECG 页面：ECG HR/RR + PTT 文本和一个全高滤波 ECG 波形。
+ * 波形缓冲与 MAX30102 接触状态无关。
  */
 static void app_display_ecg_page(const AppState_t *app)
 {
@@ -586,10 +684,11 @@ static void app_display_ecg_page(const AppState_t *app)
 
   if (app->ecg_lead_off != 0U)
   {
+    /* 红(LO-)/绿(LO+) 电极脱落。黄色 RL 无法通过 LO 引脚检测，此处不体现。 */
     (void)snprintf(line0, sizeof(line0), "LEAD OFF:%u",
                    (unsigned int)app->ecg_lead_off);
-    (void)snprintf(line1, sizeof(line1), "CHECK ELECTRODES");
-    line1r[0] = '\0';
+    (void)snprintf(line1, sizeof(line1), "CHECK RED/GREEN");
+    (void)snprintf(line1r, sizeof(line1r), "RL n/a");
   }
   else
   {
@@ -624,7 +723,8 @@ static void app_display_ecg_page(const AppState_t *app)
     {
       (void)snprintf(line1, sizeof(line1), "PTT:--MS");
     }
-    (void)snprintf(line1r, sizeof(line1r), "A:%d", (int)app->ecg_filtered);
+    (void)snprintf(line1r, sizeof(line1r), "LO:%u",
+                   (unsigned int)app_ecg_read_lead_off_raw());
   }
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
@@ -632,10 +732,17 @@ static void app_display_ecg_page(const AppState_t *app)
   app_display_draw_right(0, line0r);
   ssd1306_DrawString(0, 8, line1);
   app_display_draw_right(8, line1r);
-  waveform_buffer_draw(&ecg_waveform, 0U, 16U, SSD1306_WIDTH, 48U, 0U, 1U);
+  waveform_buffer_draw(&ecg_waveform, 0U, 16U, SSD1306_WIDTH, 48U, 0U, 1U, 1U);
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  调试页面 D1：MAX30102 传感器健康状态、I2C 错误、恢复状态。
+ * @param  app 指向应用状态的指针（传感器健康字段）。
+ * @note   显示传感器健康状态、I2C 错误码、错误连续次数、
+ *         恢复次数、恢复失败次数、样本年龄和过时计数。
+ *         读取状态显示为 OK/W/E。
+ */
 /* =========================================================================
  * D1 MAX — MAX30102 传感器健康、I2C、恢复状态
  * ========================================================================= */
@@ -700,6 +807,13 @@ static void app_display_debug_d1_max(const AppState_t *app)
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  调试页面 D2：FIFO 状态、读样本链路统计。
+ * @param  app 指向应用状态的指针（FIFO 和读取计数器）。
+ * @note   显示读取状态、尝试/成功/忙/错误计数、溢出计数、
+ *         FIFO 写/读指针和可用样本数、过时计数，
+ *         以及自上次成功读取以来的时间。
+ */
 /* =========================================================================
  * D2 FIFO — FIFO 状态 + 读样本链路统计
  * ========================================================================= */
@@ -757,6 +871,12 @@ static void app_display_debug_d2_fifo(const AppState_t *app)
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  调试页面 D3：PPG 原始值 — RED、IR、基线、手指检测。
+ * @param  app 指向应用状态的指针（原始 PPG 字段）。
+ * @note   显示 RED 和 IR 原始值、IR 基线、信号差值和跨度、
+ *         手指存在标志和原始信号标志，以及开/关确认计数。
+ */
 /* =========================================================================
  * D3 PPG RAW — RED/IR 原始值、基线、手指检测
  * ========================================================================= */
@@ -796,6 +916,12 @@ static void app_display_debug_d3_ppg_raw(const AppState_t *app)
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  调试页面 D4：PPG 信号质量、PI、运动伪影、SpO2 比率。
+ * @param  app 指向应用状态的指针（信号质量字段）。
+ * @note   显示信号质量评分、平衡状态、IR/RED PI 值、
+ *         IR/RED 交流 RMS 幅度、运动标志和分数，以及 SpO2 比率。
+ */
 /* =========================================================================
  * D4 PPG Q — 信号质量、PI、运动伪影、SpO2 ratio
  * ========================================================================= */
@@ -842,6 +968,12 @@ static void app_display_debug_d4_ppg_q(const AppState_t *app)
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  调试页面 D5：算法输出结果 — HR、SpO2、RR、IBI、HRV、PTT。
+ * @param  app 指向应用状态的指针（算法输出字段）。
+ * @note   显示所有主要生命体征及其有效标志：
+ *         HR、SpO2、RR、IBI（各带有效标志）、SDNN、RMSSD 和 PTT。
+ */
 /* =========================================================================
  * D5 ALGO — 算法输出结果
  * ========================================================================= */
@@ -879,6 +1011,13 @@ static void app_display_debug_d5_algo(const AppState_t *app)
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  调试页面 D6：系统级状态 — RTC、UART、SD 卡、显示。
+ * @param  app 指向应用状态的指针（系统诊断信息）。
+ * @note   显示重启次数、崩溃信息（来源/任务/阶段）、栈高水位
+ *         标记（MAX/UI/SD 任务）、任务阶段码、RTC 状态、SD 状态、
+ *         缓冲/写入/丢弃/暂停计数，以及显示刷新统计。
+ */
 /* =========================================================================
  * D6 SYS — 系统层状态（RTC、UART、SD、显示）
  * ========================================================================= */
@@ -973,6 +1112,14 @@ static void app_display_debug_d6_sys(const AppState_t *app)
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  调试页面 D7：SD 卡日志状态（从 D6 扩展而来）。
+ * @param  app 指向应用状态的指针（SD 日志诊断信息）。
+ * @note   显示 SD 状态和总线模式、HAL 错误码、显示跳帧和
+ *         强制刷新计数、I2C/OLED 恢复次数、任务心跳、
+ *         缓冲/丢弃计数、FIFO 溢出总数和最大样本间隔、
+ *         以及 FIFO 高水位标记。
+ */
 /* =========================================================================
  * D7 SD — SD 卡日志状态（新增页，替代原 D6 中放不下的字段）
  * ========================================================================= */
@@ -1030,6 +1177,187 @@ static void app_display_debug_d7_sd(const AppState_t *app)
                                  999999UL : app->fifo_overflow_total),
                  (unsigned int)app->max_sample_gap_ms);
   (void)snprintf(line[7], sizeof(line[7]), "HWM %u",
+                 (unsigned int)app->fifo_high_watermark);
+
+  ssd1306_Clear(SSD1306_COLOR_BLACK);
+  ssd1306_DrawString(0, 0, line[0]);
+  ssd1306_DrawString(0, 8, line[1]);
+  ssd1306_DrawString(0, 16, line[2]);
+  ssd1306_DrawString(0, 24, line[3]);
+  ssd1306_DrawString(0, 32, line[4]);
+  ssd1306_DrawString(0, 40, line[5]);
+  ssd1306_DrawString(0, 48, line[6]);
+  ssd1306_DrawString(0, 56, line[7]);
+  ssd1306_UpdateScreen();
+}
+
+/* =========================================================================
+ * D8 ECG/PPG — ECG vs PPG comparison: HR, BPM, diff, RR, raw/filtered
+ *              ranges, lead-off, display mode, error counters, ADC channel.
+ *              Yellow RL/RLD electrode not routed through LO+/- pins —
+ *              removing it does not change lead_off_raw. This is expected
+ *              HW behavior.
+ * ========================================================================= */
+static void app_display_debug_d8_ecg(const AppState_t *app)
+{
+  char line[8][24];
+  AppEcgDebugSnapshot_t snap;
+  const char *mode_str;
+  const char *diff_flag;
+  uint8_t  ecg_hr_disp;
+  uint8_t  ppg_bpm_disp;
+  int      diff_disp;
+  uint8_t  both_valid;
+
+  if (app == NULL) { return; }
+
+  app_ecg_get_debug_snapshot(app, &snap);
+
+#if (APP_ECG_DEBUG_DISPLAY_RAW != 0U)
+  mode_str = "R";
+#elif (APP_ECG_DEBUG_DISPLAY_FILTERED != 0U)
+  mode_str = "F";
+#elif (APP_ECG_DEBUG_DISPLAY_VISUAL != 0U)
+  mode_str = "V";
+#else
+  mode_str = "N";
+#endif
+
+  /* ECG-vs-PPG comparison: flag large discrepancies for debugging.
+   * Does NOT alter ECG/PPG algorithms — observation only. */
+  both_valid = ((snap.ecg_valid != 0U) && (snap.ppg_valid != 0U)
+                && (snap.ecg_hr > 0U) && (snap.ppg_bpm > 0U)) ? 1U : 0U;
+
+  ecg_hr_disp  = (snap.ecg_valid != 0U) ? snap.ecg_hr : 0U;
+  ppg_bpm_disp = (snap.ppg_valid != 0U) ? snap.ppg_bpm : 0U;
+
+  if (both_valid != 0U)
+  {
+    diff_disp = (int)snap.hr_diff;
+    if (diff_disp < 0)
+      diff_flag = (diff_disp > -11) ? "OK" : "!";
+    else
+      diff_flag = (diff_disp < 11) ? "OK" : "!";
+  }
+  else
+  {
+    diff_disp = 0;
+    diff_flag = "--";
+  }
+
+  (void)snprintf(line[0], sizeof(line[0]), "D8 ECG/PPG");
+  (void)snprintf(line[1], sizeof(line[1]), "E%03u P%03u D%+03d %s",
+                 (unsigned int)ecg_hr_disp,
+                 (unsigned int)ppg_bpm_disp,
+                 diff_disp, diff_flag);
+  (void)snprintf(line[2], sizeof(line[2]), "RR:%04u V%u L:%02X",
+                 (unsigned int)snap.ecg_rr_ms,
+                 (unsigned int)snap.ecg_valid,
+                 (unsigned int)snap.lead_raw);
+  (void)snprintf(line[3], sizeof(line[3]), "R:%u-%u d:%u",
+                 (unsigned int)snap.raw_min,
+                 (unsigned int)snap.raw_max,
+                 (unsigned int)(snap.raw_max - snap.raw_min));
+  (void)snprintf(line[4], sizeof(line[4]), "F:%d~%d M:%s",
+                 (int)snap.filt_min, (int)snap.filt_max, mode_str);
+  (void)snprintf(line[5], sizeof(line[5]), "SAT:%lu DMA:%lu",
+                 (unsigned long)(snap.adc_sat_count > 999999UL ?
+                                 999999UL : snap.adc_sat_count),
+                 (unsigned long)(snap.dma_overflow_count > 999999UL ?
+                                 999999UL : snap.dma_overflow_count));
+  (void)snprintf(line[6], sizeof(line[6]), "TO:%lu PA5 IN5",
+                 (unsigned long)(snap.no_r_peak_timeout_count > 999999UL ?
+                                 999999UL : snap.no_r_peak_timeout_count));
+  (void)snprintf(line[7], sizeof(line[7]), "SC:%lu",
+                 (unsigned long)(snap.sample_count > 999999UL ?
+                                 999999UL : snap.sample_count));
+
+  ssd1306_Clear(SSD1306_COLOR_BLACK);
+  ssd1306_DrawString(0, 0, line[0]);
+  ssd1306_DrawString(0, 8, line[1]);
+  ssd1306_DrawString(0, 16, line[2]);
+  ssd1306_DrawString(0, 24, line[3]);
+  ssd1306_DrawString(0, 32, line[4]);
+  ssd1306_DrawString(0, 40, line[5]);
+  ssd1306_DrawString(0, 48, line[6]);
+  ssd1306_DrawString(0, 56, line[7]);
+  ssd1306_UpdateScreen();
+}
+
+/* =========================================================================
+ * D9 SCHED — 调度诊断：TIM6 → MAXtask 100 Hz 闭环 + 运行时指标
+ *
+ * 本页面仅用于收尾验证。低频速率计算（约1秒一次），不做浮点、
+ * 不增加刷新频率、不参与实时采样路径。
+ * ========================================================================= */
+static void app_display_debug_d9_sched(const AppState_t *app)
+{
+  char line[8][24];
+  const char *sd_state_str;
+  uint32_t t6_count;
+  uint32_t mhb;
+  uint32_t uhb;
+
+  /* 低频 delta 计算 */
+  static uint32_t last_t6    = 0U;
+  static uint32_t last_mhb   = 0U;
+  static uint32_t last_tick  = 0U;
+  static uint32_t t6_rate    = 0U;
+  static uint32_t max_rate   = 0U;
+  uint32_t now_tick;
+  uint32_t elapsed;
+
+  if (app == NULL) { return; }
+
+  t6_count = APP_TIM6_GetIsrCount();
+  mhb      = app->max_task_heartbeat;
+  uhb      = app->ui_task_heartbeat;
+  now_tick = HAL_GetTick();
+
+  if (last_tick != 0U)
+  {
+    elapsed = now_tick - last_tick;
+    if (elapsed >= 1000U)
+    {
+      t6_rate  = (t6_count - last_t6) * 1000U / elapsed;
+      max_rate = (mhb  - last_mhb)  * 1000U / elapsed;
+      last_t6   = t6_count;
+      last_mhb  = mhb;
+      last_tick = now_tick;
+    }
+  }
+  else
+  {
+    last_t6   = t6_count;
+    last_mhb  = mhb;
+    last_tick = now_tick;
+  }
+
+  switch (app->sd_state)
+  {
+  case 2U: sd_state_str = "ACTIVE"; break;
+  case 3U: sd_state_str = "BOFF";   break;
+  case 1U: sd_state_str = "TRY";    break;
+  default: sd_state_str = "IDLE";   break;
+  }
+
+  (void)snprintf(line[0], sizeof(line[0]), "D9 SCHED");
+  (void)snprintf(line[1], sizeof(line[1]), "T6%4lu/s M%4lu/s",
+                 (unsigned long)t6_rate, (unsigned long)max_rate);
+  (void)snprintf(line[2], sizeof(line[2]), "TO%6lu TGAP%3u",
+                 (unsigned long)app->max_task_timeout_count,
+                 (unsigned int)app->max_task_gap_ms);
+  (void)snprintf(line[3], sizeof(line[3]), "MHB%6lu",
+                 (unsigned long)(mhb > 999999UL ? 999999UL : mhb));
+  (void)snprintf(line[4], sizeof(line[4]), "UHB%6lu",
+                 (unsigned long)(uhb > 999999UL ? 999999UL : uhb));
+  (void)snprintf(line[5], sizeof(line[5]), "SD %s",
+                 sd_state_str);
+  (void)snprintf(line[6], sizeof(line[6]), "OVF%5lu SGAP%3u",
+                 (unsigned long)(app->fifo_overflow_total > 999999UL ?
+                                 999999UL : app->fifo_overflow_total),
+                 (unsigned int)app->max_sample_gap_ms);
+  (void)snprintf(line[7], sizeof(line[7]), "HWM%3u",
                  (unsigned int)app->fifo_high_watermark);
 
   ssd1306_Clear(SSD1306_COLOR_BLACK);
@@ -1201,6 +1529,15 @@ static const char *app_get_rtc_status_label(const AppState_t *app)
   return "RTC RUN";
 }
 
+/**
+ * @brief  渲染简化的状态页面（用于启动/自检期间）。
+ * @param  app          指向应用状态的指针（用于 RTC 和 UART 数据）。
+ * @param  status_line_1 第一行状态文本（例如 "INIT..."）。
+ * @param  status_line_2 第二行状态文本（例如 "CALIBRATING"）。
+ * @note   布局：标题在 y=0，RTC 时间在 y=16，RTC 日期在 y=24，
+ *         状态行在 y=32/40，UART 状态在 y=48。
+ *         常用于初始传感器校准阶段。
+ */
 /*
  * 绘制简化状态页，常用于启动、自检与基线采集阶段。
  * 黄色区 (y=0) 放标题，蓝色区 (y>=16) 放 RTC 时间/日期。
@@ -1228,6 +1565,14 @@ void app_display_status_page(const AppState_t *app, const char *status_line_1, c
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  带消抖的按键轮询，仅检测新的按下沿。
+ * @param  button 指向按键状态结构的指针（端口、引脚、冷却时间）。
+ * @return 如果检测到新的按下沿（下降沿且冷却时间已过）则返回 1，
+ *         如果空闲、持续按住或冷却中则返回 0。
+ * @note   长按不会重复触发；仅首次按下沿触发一次。
+ *         冷却时间为 PAGE_BUTTON_DEBOUNCE_TICKS（与采样周期对齐）。
+ */
 /*
  * 轮询式按键消抖：
  * 只有检测到“新的按下沿”时才返回 1，长按不会连续翻页。
@@ -1264,7 +1609,14 @@ static uint8_t page_button_poll_pressed(PageButton_t *button)
   return 0U;
 }
 
-/* 将一条波形缓冲恢复到“尚无样本”的初始状态。 */
+/**
+ * @brief  将波形缓冲重置为初始空状态。
+ * @param  waveform 指向待重置的波形缓冲。
+ * @note   清零所有样本和标记，将 write_index 和 sample_count
+ *         重置为 0，并将 AGC 缩放估计重新初始化为 WAVEFORM_AGC_MIN_SCALE。
+ *         settle_count 也被重置，使稳定窗口重新开始。
+ */
+/* 将一条波形缓冲恢复到”尚无样本”的初始状态。 */
 static void waveform_buffer_reset(WaveformBuffer_t *waveform)
 {
   uint16_t i;
@@ -1296,6 +1648,15 @@ static uint32_t waveform_abs_i32(int32_t value)
   return (uint32_t)value;
 }
 
+/**
+ * @brief  向波形缓冲压入一个带通滤波后的 AC 样本。
+ * @param  waveform       指向波形缓冲。
+ * @param  filtered_value 带通滤波后的样本值（int32）。
+ * @note   前 WAVEFORM_SETTLE_SAMPLES 个样本被丢弃，让带通滤波器的
+ *         阶跃响应在填充显示窗口之前达到稳定。使用具有快攻击/慢释放
+ *         特性的 AGC 来将垂直缩放自适应到信号幅度。缩放估计值被钳位在
+ *         WAVEFORM_AGC_MIN_SCALE 和 WAVEFORM_AGC_MAX_SCALE 之间。
+ */
 /*
  * 压入一个已经带通滤波后的 AC 样本。
  * 前几个样本只用于等待滤波器阶跃响应消退，不进入显示窗口。
@@ -1361,6 +1722,13 @@ static void waveform_buffer_add_sample(WaveformBuffer_t *waveform, int32_t filte
   }
 }
 
+/**
+ * @brief  将波形缓冲中的最新样本标记为脉搏检测点。
+ * @param  waveform 指向待标记的波形缓冲。
+ * @note   标记被放置在最近写入的样本位置。
+ *         在 waveform_buffer_draw() 期间，标记被渲染为波形区域底部
+ *         3 行的小箭头。如果缓冲中没有样本（sample_count == 0）则无操作。
+ */
 /* 在当前波形写入位置标记一次脉搏检测点，供波形绘制时在底部显示脉搏指示箭头。 */
 static void waveform_buffer_mark_latest(WaveformBuffer_t *waveform)
 {
@@ -1377,6 +1745,20 @@ static void waveform_buffer_mark_latest(WaveformBuffer_t *waveform)
   waveform->markers[marker_index] = 1U;
 }
 
+/**
+ * @brief  在 OLED 上绘制动态缩放的波形。
+ * @param  waveform 指向包含样本和标记的波形缓冲。
+ * @param  x        波形绘制区域的 X 原点。
+ * @param  y        波形绘制区域的 Y 原点。
+ * @param  width    绘制区域的宽度（像素）。
+ * @param  height   绘制区域的高度（像素）。
+ * @param  dotted   非零表示绘制虚线（每隔一个像素），0 表示实线。
+ * @param  markers  非零表示在底部渲染脉搏检测标记。
+ * @note   两遍渲染：第一遍扫描 min/max 用于垂直自动缩放，
+ *         第二遍将每个样本映射到像素坐标，上下留 1px 边距。
+ *         如果缓冲为空，则绘制水平中心线。
+ *         如果 vis_range < 4，则强制最小范围为 4，以避免除零并保持小信号可见。
+ */
 /*
  * 动态缩放波形绘制：扫描可见样本的 min/max，把数据映射到 y+1..y+height-2，
  * 上下各留 1px 边距，避免峰/谷被屏幕边缘截断。
@@ -1389,7 +1771,8 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
                                  uint8_t width,
                                  uint8_t height,
                                  uint8_t dotted,
-                                 uint8_t markers)
+                                 uint8_t markers,
+                                 uint8_t stable_scale)
 {
   uint16_t i;
   uint16_t sample_count;
@@ -1402,11 +1785,11 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
   int32_t  vis_min;
   int32_t  vis_max;
   int32_t  vis_range;
-  int32_t  map_top;       /* 映射目标区域上界 (y+1) */
-  int32_t  map_bot;       /* 映射目标区域下界 (y+height-2) */
-  int32_t  map_range;     /* map_bot - map_top */
+  int32_t  map_top;
+  int32_t  map_bot;
+  int32_t  map_range;
   int32_t  draw_y_i;
-  uint8_t  marker_base;   /* 脉搏标记底部起始 y */
+  uint8_t  marker_base;
 
   if ((waveform == NULL) || (width == 0U) || (height == 0U)) { return; }
 
@@ -1436,19 +1819,32 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
     start_index = waveform->write_index;
   }
 
-  /* 第 1 遍：扫描可见样本范围 */
-  vis_min = INT32_MAX;
-  vis_max = INT32_MIN;
-  for (i = 0U; i < sample_count; i++)
+  /* 确定可视范围 */
+  if (stable_scale != 0U)
   {
-    sample_index = (uint16_t)((start_index + i) % SSD1306_WIDTH);
-    sample_value = waveform->samples[sample_index];
-    if (sample_value < vis_min) { vis_min = sample_value; }
-    if (sample_value > vis_max) { vis_max = sample_value; }
+    /* 稳定缩放：3× ±scale_estimate，中心 = 0（ECG 已去直流）。
+     * 较宽范围让波形更紧凑，R 峰占屏约 1/3 高度。 */
+    int32_t half = (int32_t)waveform->scale_estimate * 3;
+    if (half < 50) { half = 50; }
+    vis_min = -half;
+    vis_max =  half;
+  }
+  else
+  {
+    /* 动态缩放：扫描可见样本 min/max（PPG 原始行为） */
+    vis_min = INT32_MAX;
+    vis_max = INT32_MIN;
+    for (i = 0U; i < sample_count; i++)
+    {
+      sample_index = (uint16_t)((start_index + i) % SSD1306_WIDTH);
+      sample_value = waveform->samples[sample_index];
+      if (sample_value < vis_min) { vis_min = sample_value; }
+      if (sample_value > vis_max) { vis_max = sample_value; }
+    }
   }
 
   vis_range = vis_max - vis_min;
-  if (vis_range < 4) { vis_range = 4; }  /* 极小信号时保持最小显示幅度 */
+  if (vis_range < 4) { vis_range = 4; }
 
   /* 映射区间：y+1 到 y+height-2，上下各 1px margin */
   map_top = (int32_t)y + 1;
@@ -1462,7 +1858,7 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
     sample_index = (uint16_t)((start_index + i) % SSD1306_WIDTH);
     sample_value = waveform->samples[sample_index];
 
-    /* clamp 到可见范围，防单个毛刺压扁整体 */
+    /* clamp 到可见范围 */
     if (sample_value > vis_max) { sample_value = vis_max; }
     if (sample_value < vis_min) { sample_value = vis_min; }
 

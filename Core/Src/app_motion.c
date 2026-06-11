@@ -58,6 +58,14 @@ static struct
 static uint32_t app_motion_slow_follow_u32(uint32_t current, uint32_t target, uint8_t shift);
 static uint8_t app_motion_ac_rms_spike(uint32_t current_rms, uint32_t baseline_rms);
 
+/**
+ ******************************************************************************
+ * @brief  重置运动检测状态并清除伪影标志。
+ * @param  app AppState 指针（可为 NULL）。
+ * @note   测量重置时调用。清零内部状态并将
+ *         motion_artifact / motion_score 设为零。
+ ******************************************************************************
+ */
 void app_motion_reset(AppState_t *app)
 {
   (void)memset(&motion_state, 0, sizeof(motion_state));
@@ -71,6 +79,18 @@ void app_motion_reset(AppState_t *app)
   app->motion_score = 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  从纯 PPG 指标评估运动伪影（无加速度计）。
+ * @param  app         AppState 指针（可为 NULL）。
+ * @param  metrics     当前传感器信号指标（IR/RED AC RMS、DC）。
+ * @param  raw_quality 传感器驱动的原始信号质量评分。
+ * @note   来自三个检测器的评分：AC RMS 尖峰、RED/IR 平衡异常
+ *         和 SQ 骤降。使用迟滞（score>=75 连续 20 拍进入，
+ *         score<=30 连续 30 拍退出）。运动期间 AC RMS 基线冻结
+ *         以避免污染。
+ ******************************************************************************
+ */
 void app_motion_update_artifact(AppState_t *app,
                                 const MAX30102_SignalMetrics_t *metrics,
                                 uint8_t raw_quality)
@@ -225,6 +245,7 @@ void app_motion_update_artifact(AppState_t *app,
   motion_state.last_quality_valid = 1U;
 }
 
+/* ---- 检测当前 RMS 是否超过慢跟踪基线 ---- */
 static uint8_t app_motion_ac_rms_spike(uint32_t current_rms, uint32_t baseline_rms)
 {
   if ((baseline_rms < APP_MOTION_MIN_BASELINE_RMS) ||
@@ -243,6 +264,7 @@ static uint8_t app_motion_ac_rms_spike(uint32_t current_rms, uint32_t baseline_r
   return 0U;
 }
 
+/* ---- 慢跟随：当前值每步以 1/2^shift 向目标值移动 ---- */
 static uint32_t app_motion_slow_follow_u32(uint32_t current, uint32_t target, uint8_t shift)
 {
   uint32_t delta;

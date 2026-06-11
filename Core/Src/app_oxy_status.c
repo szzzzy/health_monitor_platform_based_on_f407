@@ -30,6 +30,12 @@
 
 static void app_oxy_status_update_balance(AppState_t *app, const MAX30102_SignalMetrics_t *metrics);
 
+/**
+ ******************************************************************************
+ * @brief  Reset all signal-quality and SpO2-ratio fields to zero/unknown.
+ * @param  app Pointer to AppState (may be NULL).
+ ******************************************************************************
+ */
 void app_oxy_status_reset(AppState_t *app)
 {
   if (app == NULL)
@@ -47,12 +53,27 @@ void app_oxy_status_reset(AppState_t *app)
   app->spo2_balance_status = APP_OXY_BALANCE_UNKNOWN;
 }
 
+/**
+ ******************************************************************************
+ * @brief  Instant clear of all signal-quality fields (same as reset).
+ * @param  app Pointer to AppState.
+ ******************************************************************************
+ */
 void app_oxy_status_clear_instant(AppState_t *app)
 {
   app_oxy_status_reset(app);
 }
 
-/* 从传感器指标结构体更新所有信号质量字段 */
+/**
+ ******************************************************************************
+ * @brief  Update all signal-quality and SpO2 fields from sensor metrics.
+ * @param  app         Pointer to AppState (may be NULL; cleared on NULL).
+ * @param  metrics     Sensor metrics containing AC RMS, DC, PI values.
+ * @param  raw_quality Raw signal quality score from the sensor driver.
+ * @note  Copies IR/RED AC RMS, PI, updates quality smoothed value, and
+ *        recomputes SpO2 ratio and balance status.
+ ******************************************************************************
+ */
 void app_oxy_status_update_from_metrics(AppState_t *app,
                                         const MAX30102_SignalMetrics_t *metrics,
                                         uint8_t raw_quality)
@@ -71,11 +92,14 @@ void app_oxy_status_update_from_metrics(AppState_t *app,
   app_oxy_status_update_balance(app, metrics);
 }
 
-/*
- * 信号质量平滑更新
- *
- * 采用非对称步进：每次最多改变 delta/4，但至少 ±1。
- * 质量上升与下降使用相同的平滑速率，避免高低频抖动。
+/**
+ ******************************************************************************
+ * @brief  Smooth signal quality using asymmetric step tracking.
+ * @param  app         Pointer to AppState (may be NULL).
+ * @param  raw_quality Raw quality score to track towards.
+ * @note   Step = delta/4 (min 1) for both rising and falling quality.
+ *         Prevents brief noise dips from collapsing the quality score.
+ ******************************************************************************
  */
 void app_oxy_status_update_quality(AppState_t *app, uint8_t raw_quality)
 {
@@ -119,18 +143,7 @@ void app_oxy_status_update_quality(AppState_t *app, uint8_t raw_quality)
   app->signal_quality = (uint8_t)(current_quality - step);
 }
 
-/*
- * 计算 SpO2 比率并判定传感器平衡状态
- *
- * SpO2 比率 = (Red_AC_rms / Red_DC) / (IR_AC_rms / IR_DC) × 1000
- *
- * 平衡判定：
- *   ratio < 500  → 偏低（传感器偏斜或接触不良）
- *   ratio > 2000 → 偏高（过压或组织差异）
- *   500-2000     → 正常
- *
- * 首帧有效比率直接采用，后续做 EMA 平滑 (75% 旧值 + 25% 新值)。
- */
+/* ---- SpO2 ratio computation + RED/IR balance status classification ---- */
 static void app_oxy_status_update_balance(AppState_t *app, const MAX30102_SignalMetrics_t *metrics)
 {
   uint32_t ratio_x1000;

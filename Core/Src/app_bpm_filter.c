@@ -41,7 +41,14 @@ static uint8_t app_bpm_limit_step(uint8_t current_bpm, uint8_t target_bpm, uint8
 static uint8_t app_bpm_median3_u8(uint8_t a, uint8_t b, uint8_t c);
 static uint8_t app_bpm_filter_raw(AppState_t *app, uint8_t raw_bpm_value);
 
-/* 重置所有 BPM 滤波状态 */
+/**
+ ******************************************************************************
+ * @brief  重置所有 BPM 滤波器状态（有效标志、历史、候选、保持）。
+ * @param  app AppState 指针（可为 NULL）。
+ * @note   清除 bpm_valid、raw_bpm_history 环形缓冲、候选跟踪
+ *         和无效保持计数器。
+ ******************************************************************************
+ */
 void app_bpm_filter_reset(AppState_t *app)
 {
   if (app == NULL)
@@ -60,12 +67,17 @@ void app_bpm_filter_reset(AppState_t *app)
 }
 
 /**
-  * BPM 滤波器主入口
-  *
-  * @param raw_bpm_valid  原始 BPM 是否有效
-  * @param raw_bpm_value  原始 BPM 值 (0-255 bpm)
-  * @return 0 = 正常（含平滑跟踪），1 = BPM 已因持续无效而被清除
-  */
+ ******************************************************************************
+ * @brief  主 BPM 滤波器入口：中值滤波、候选确认、EMA。
+ * @param  app            AppState 指针（可为 NULL）。
+ * @param  raw_bpm_valid  原始 BPM 值有效为 1，否则为 0。
+ * @param  raw_bpm_value  传感器算法输出的原始 BPM 估算值。
+ * @return 0 = 正常（滤波激活），1 = 持续无效导致 BPM 清零
+ *         （超过 APP_BPM_INVALID_HOLD_TICKS）。
+ * @note   流水线：3 样本中值 -> 候选状态机 -> EMA 平滑
+ *         -> 步进限幅器。首次锁定需要 2 拍连续一致。
+ ******************************************************************************
+ */
 uint8_t app_bpm_filter_update(AppState_t *app, uint8_t raw_bpm_valid, uint8_t raw_bpm_value)
 {
   uint8_t diff;
@@ -199,7 +211,7 @@ uint8_t app_bpm_filter_update(AppState_t *app, uint8_t raw_bpm_valid, uint8_t ra
   return 1U;
 }
 
-/* 无符号 8-bit 绝对值差 */
+/* ---- 无符号 8 位绝对值差值 ---- */
 static uint8_t app_bpm_abs_diff_u8(uint8_t lhs, uint8_t rhs)
 {
   if (lhs >= rhs)
@@ -210,7 +222,7 @@ static uint8_t app_bpm_abs_diff_u8(uint8_t lhs, uint8_t rhs)
   return (uint8_t)(rhs - lhs);
 }
 
-/* 限幅步进：每拍最多改变 max_step bpm */
+/* ---- 步进限幅器：限制每次更新的 BPM 变化不超过 max_step ---- */
 static uint8_t app_bpm_limit_step(uint8_t current_bpm, uint8_t target_bpm, uint8_t max_step)
 {
   if (target_bpm > current_bpm)
@@ -231,12 +243,12 @@ static uint8_t app_bpm_limit_step(uint8_t current_bpm, uint8_t target_bpm, uint8
   return target_bpm;
 }
 
-/* 3 值中位数滤波器 */
+/* ---- 3 元素中值滤波（排序网络实现） ---- */
 static uint8_t app_bpm_median3_u8(uint8_t a, uint8_t b, uint8_t c)
 {
   uint8_t temp;
 
-  /* 排序网络：3 次比较 + 1 次交换实现对 a/b/c 的偏序 */
+  /* 排序网络：3 次比较 + 1 次交换实现对 a/b/c 的部分排序 */
   if (a > b)
   {
     temp = a;
@@ -259,14 +271,7 @@ static uint8_t app_bpm_median3_u8(uint8_t a, uint8_t b, uint8_t c)
   return b;
 }
 
-/*
- * 原始 BPM 中值滤波
- *
- * 维护 3 样本环形缓冲区：
- * - 1 样本: 直接返回
- * - 2 样本: 返回均值
- * - 3 样本: 返回中位数（消除单拍尖峰干扰）
- */
+/* ---- 原始 BPM 3 样本中值/均值预滤波器 ---- */
 static uint8_t app_bpm_filter_raw(AppState_t *app, uint8_t raw_bpm_value)
 {
   uint8_t first_index;

@@ -36,23 +36,24 @@ static uint8_t max30102_poll_fallback_ticks = 0U;
 
 /* ---- 数据就绪 ---- */
 
-/* 由 EXTI 中断回调调用，标记 MAX30102 FIFO 有新数据可读。 */
+/**
+ * @brief  从 EXTI 中断回调标记 FIFO 数据就绪。
+ * @note   在 ISR 上下文中调用。设置数据就绪标志并记录
+ *         已观测到 INT 边沿，启用 INT 驱动模式。
+ */
 void max30102_mark_data_ready_from_isr(void)
 {
   max30102_data_ready_flag = 1U;
   max30102_int_seen = 1U;
 }
 
-/*
- * 主循环门控：决定当前节拍是否需要读 FIFO。
- *
- *   默认 MAX30102_USE_INT_PIN == 0：每拍返回 1，按 TIM6 纯轮询 FIFO。
- *   若启用 INT 且 INT 已触发过（int_seen != 0）：
- *     - data_ready_flag 已置位 → 立即读，同时清零 flag 和 fallback 计数
- *     - data_ready_flag 未置位 → 等待 INT（最多 INT_POLL_FALLBACK_TICKS 拍），
- *       超时后强制读一次，防止 INT 偶然丢失导致系统死等
- *   若启用 INT 但 INT 从未触发（int_seen == 0）：
- *     - 每拍都返回 1，纯轮询模式
+/**
+ * @brief  门控函数，决定本次节拍是否服务 FIFO。
+ * @return 1 表示本次周期应读取 FIFO，0 表示等待 INT。
+ * @note   默认为纯轮询（每节拍返回 1）。启用 INT 后：
+ *         当 data_ready_flag 置位时立即返回 1；
+ *         等待 INT 时返回 0（最多到回退节拍计数）；
+ *         超时后强制读取，防止死锁。
  */
 uint8_t max30102_should_service_fifo(void)
 {
@@ -81,10 +82,11 @@ uint8_t max30102_should_service_fifo(void)
 
 /* ---- 内部辅助 ---- */
 
-/*
- * 触发 MAX30102 软件复位。
- * 复位后内部状态机会回到默认状态，因此这里额外等待一小段时间，
- * 避免紧接着访问寄存器时芯片尚未准备好。
+/**
+ * @brief  触发 MAX30102 软件复位。
+ * @return HAL_OK 表示成功，否则返回 HAL_ERROR。
+ * @note   复位后添加 10 ms 延时以使芯片稳定。
+ *         复位内部 data-ready 和 INT-seen 标志。
  */
 static HAL_StatusTypeDef max30102_reset(void)
 {
@@ -104,10 +106,11 @@ static HAL_StatusTypeDef max30102_reset(void)
   return HAL_OK;
 }
 
-/*
- * 清空 FIFO 写指针、读指针与溢出计数器。
- * 这样做的目的是保证后续第一次读 FIFO 时拿到的是"当前配置下的新样本"，
- * 而不是上电或上次运行遗留下来的旧数据。
+/**
+ * @brief  清除 FIFO 写指针、读指针和溢出计数器。
+ * @return HAL_OK 表示成功，否则返回 HAL_ERROR。
+ * @note   确保后续 FIFO 读取返回新样本而非
+ *         之前会话的陈旧数据。
  */
 static HAL_StatusTypeDef max30102_clear_fifo(void)
 {
@@ -134,10 +137,11 @@ static HAL_StatusTypeDef max30102_clear_fifo(void)
   return HAL_OK;
 }
 
-/*
- * 清除 MAX30102 中断状态。
- * 读取 INTR_STATUS_1 和 INTR_STATUS_2 寄存器即可自动清除中断标志位。
- * INT 引脚模式的必需要操作——否则 INT 引脚会一直保持低电平，无法产生新中断。
+/**
+ * @brief  通过读取状态寄存器清除 MAX30102 中断状态。
+ * @return HAL_OK 表示成功，否则返回 HAL_ERROR。
+ * @note   INT 引脚模式下需要；读取 INTR_STATUS_1 和 INTR_STATUS_2
+ *         会自动清除中断标志，否则 INT 引脚保持低电平。
  */
 static HAL_StatusTypeDef max30102_clear_interrupt_status(void)
 {
@@ -153,6 +157,12 @@ static HAL_StatusTypeDef max30102_clear_interrupt_status(void)
   return max30102_read_reg(MAX30102_REG_INTR_STATUS_2, &status_value);
 }
 
+/**
+ * @brief  获取 FIFO 中可用样本数。
+ * @param  sample_count 可用样本数的输出指针。
+ * @return HAL_OK 表示成功，HAL_ERROR 表示参数为 NULL，HAL_BUSY 表示溢出。
+ * @note   发生溢出时，清除 FIFO 并复位 data-ready 标志。
+ */
 static HAL_StatusTypeDef max30102_get_fifo_sample_count(uint8_t *sample_count)
 {
   HAL_StatusTypeDef status;
@@ -215,6 +225,12 @@ static HAL_StatusTypeDef max30102_get_fifo_sample_count(uint8_t *sample_count)
 
 /* ---- 公共 API ---- */
 
+/**
+ * @brief  通过 I2C 向 MAX30102 寄存器写入单个字节。
+ * @param  reg_addr 寄存器地址。
+ * @param  data     要写入的值。
+ * @return HAL_OK 表示成功，HAL_ERROR 表示 I2C 通信失败。
+ */
 HAL_StatusTypeDef max30102_write_reg(uint8_t reg_addr, uint8_t data)
 {
   return HAL_I2C_Mem_Write(&hi2c1,
@@ -226,6 +242,12 @@ HAL_StatusTypeDef max30102_write_reg(uint8_t reg_addr, uint8_t data)
                            MAX30102_I2C_TIMEOUT_MS);
 }
 
+/**
+ * @brief  通过 I2C 从 MAX30102 寄存器读取单个字节。
+ * @param  reg_addr 寄存器地址。
+ * @param  data     读取值的输出指针。
+ * @return HAL_OK 表示成功，HAL_ERROR 表示参数为 NULL 或 I2C 通信失败。
+ */
 HAL_StatusTypeDef max30102_read_reg(uint8_t reg_addr, uint8_t *data)
 {
   if (data == NULL)
@@ -242,10 +264,12 @@ HAL_StatusTypeDef max30102_read_reg(uint8_t reg_addr, uint8_t *data)
                           MAX30102_I2C_TIMEOUT_MS);
 }
 
-/*
- * 初始化 MAX30102 当前所需的最小工作配置。
- * 现在目标是稳定读出 RED/IR 原始值，因此只打开 SpO2 模式下的基础寄存器配置，
- * 暂时不引入中断、温度通道或多 LED 时序配置。
+/**
+ * @brief  以最小工作配置初始化 MAX30102。
+ * @return HAL_OK 表示成功，HAL_ERROR 表示器件 ID 不匹配或 I2C 通信失败。
+ * @note   验证器件 ID、复位芯片、配置中断使能、FIFO
+ *         行为、SpO2 模式、ADC 量程、采样率和 LED 电流。
+ *         工作在 SpO2 模式（FIFO 中包含 RED + IR 样本）。
  */
 HAL_StatusTypeDef max30102_init(void)
 {
@@ -335,11 +359,14 @@ HAL_StatusTypeDef max30102_init(void)
   return HAL_OK;
 }
 
-/*
- * 从 FIFO 读取 6 字节原始样本（RED[3] + IR[3]）。
- *
- * 使用短超时阻塞 I2C 读（10ms），避免 DMA 中断链在 I2C 恢复/竞争期
- * 引入的复杂状态。ECG ADC DMA、UART RX DMA、SDIO 保持独立。
+/**
+ * @brief  从 MAX30102 FIFO 读取原始 SpO2 样本。
+ * @param  fifo_data 原始 FIFO 字节的输出缓冲区。
+ * @param  data_len  要读取的字节数（必须为 6 的倍数）。
+ * @return HAL_OK 表示成功，HAL_BUSY 表示样本不足，
+ *         HAL_ERROR 表示参数错误。
+ * @note   使用阻塞 I2C，超时时间短（10 ms）。每个样本为
+ *         6 字节（RED[3] + IR[3]）。
  */
 HAL_StatusTypeDef max30102_read_fifo(uint8_t *fifo_data, uint16_t data_len)
 {
@@ -394,14 +421,23 @@ HAL_StatusTypeDef max30102_read_fifo(uint8_t *fifo_data, uint16_t data_len)
   return status;
 }
 
+/**
+ * @brief  获取 FIFO 调试结构体的指针。
+ * @return 指向内部 MAX30102_FifoDebug_t 结构体的指针。
+ * @note   提供 FIFO 指针、溢出和样本计数诊断信息的访问，
+ *         用于调试和显示。
+ */
 const MAX30102_FifoDebug_t *max30102_get_fifo_debug(void)
 {
   return &max30102_fifo_debug;
 }
 
-/*
- * 把 FIFO 中 6 字节样本解析为 18 位 RED / IR 原始值。
- * MAX30102 每个通道占 3 字节，但真正有效位数是低 18 位，因此最后要掩码。
+/**
+ * @brief  将 6 字节 FIFO 样本解析为 18 位 RED 和 IR 原始值。
+ * @param  fifo_data 指向 6 字节原始 FIFO 数据的指针。
+ * @param  red       RED 通道值的输出指针。
+ * @param  ir        IR 通道值的输出指针。
+ * @note   每个通道占用 3 字节；仅低 18 位有效。
  */
 void max30102_parse_spo2_sample(const uint8_t *fifo_data, uint32_t *red, uint32_t *ir)
 {
@@ -421,10 +457,20 @@ void max30102_parse_spo2_sample(const uint8_t *fifo_data, uint32_t *red, uint32_
   *ir &= 0x03FFFFU;
 }
 
-/* ---- 批量 FIFO drain ---- */
+/* ---- 批量 FIFO 排空 ---- */
 
 static uint8_t fifo_batch_raw[MAX30102_FIFO_DEPTH * MAX30102_FIFO_BYTES_PER_SAMPLE_SPO2];
 
+/**
+ * @brief  从 FIFO 突发读取多个 SpO2 样本并解析。
+ * @param  red       RED 通道值的输出数组。
+ * @param  ir        IR 通道值的输出数组。
+ * @param  max_count 要读取的最大样本数。
+ * @param  p_ovf     溢出计数的输出指针（无溢出时为 0）。
+ * @return 实际读取的样本数（出错或溢出时返回 0）。
+ * @note   为提升效率，使用单次 I2C 突发事务。发生溢出时
+ *         清除 FIFO 并返回 0，同时设置溢出计数。
+ */
 uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
                                   uint8_t max_count, uint8_t *p_ovf)
 {
@@ -440,7 +486,7 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
 
   *p_ovf = 0U;
 
-  /* Step 1: read FIFO pointers */
+  /* 步骤 1：读取 FIFO 指针 */
   status = max30102_read_reg(MAX30102_REG_OVF_COUNTER, &ovf);
   if (status != HAL_OK) { return 0U; }
 
@@ -458,7 +504,7 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
   max30102_fifo_debug.write_ptr = wr_ptr;
   max30102_fifo_debug.read_ptr = rd_ptr;
 
-  /* Step 2: handle overflow — clear FIFO, return 0 with *p_ovf set */
+  /* 步骤 2：处理溢出 — 清除 FIFO，设置 *p_ovf 后返回 0 */
   if (ovf > 0U)
   {
     *p_ovf = ovf;
@@ -472,7 +518,7 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
     return 0U;
   }
 
-  /* Step 3: compute available samples */
+  /* 步骤 3：计算可用样本数 */
   available = (uint8_t)((wr_ptr - rd_ptr) & (MAX30102_FIFO_DEPTH - 1U));
   max30102_fifo_debug.available_samples = available;
 
@@ -480,7 +526,7 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
 
   to_read = (available < max_count) ? available : max_count;
 
-  /* Step 4: burst-read FIFO data — one I2C transaction for all samples */
+  /* 步骤 4：突发读取 FIFO 数据 — 所有样本一次 I2C 事务完成 */
   status = HAL_I2C_Mem_Read(&hi2c1,
                              MAX30102_I2C_ADDR,
                              MAX30102_REG_FIFO_DATA,
@@ -498,7 +544,7 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
   (void)max30102_clear_interrupt_status();
 #endif
 
-  /* Step 5: parse each sample */
+  /* 步骤 5：解析每个样本 */
   for (i = 0U; i < to_read; i++)
   {
     max30102_parse_spo2_sample(
@@ -506,7 +552,7 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
         &red[i], &ir[i]);
   }
 
-  /* Step 6: update available to reflect consumed samples */
+  /* 步骤 6：更新可用数以反映已消耗的样本 */
   max30102_fifo_debug.available_samples =
       (uint8_t)((wr_ptr - (rd_ptr + to_read)) & (MAX30102_FIFO_DEPTH - 1U));
 

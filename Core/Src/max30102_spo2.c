@@ -11,17 +11,17 @@
 #include <string.h>
 
 /* --------------------------------------------------------------------------
- * CMSIS-DSP 4th-order Butterworth bandpass (2 biquad stages)
+ * CMSIS-DSP 4 阶 Butterworth 带通滤波器（2 个双二阶节）
  *
- * Designed for fs = 100 Hz, passband ≈ 0.5–5 Hz (30–300 BPM).
- * Coefficients are in CMSIS order: {b0, b1, b2, -a1, -a2}.
+ * 设计参数：fs = 100 Hz，通带 ≈ 0.5–5 Hz（30–300 BPM）。
+ * 系数按 CMSIS 顺序排列：{b0, b1, b2, -a1, -a2}。
  * -------------------------------------------------------------------------- */
 #define BIQUAD_STAGES 2U
 
 static const float32_t biquad_coeffs[5U * BIQUAD_STAGES] = {
-  /* Stage 1 – HPF, fc ≈ 0.5 Hz */
+  /* 级 1 – 高通，截止频率 ≈ 0.5 Hz */
    0.97803048f, -1.95606096f, 0.97803048f,  1.95557824f, -0.95654368f,
-  /* Stage 2 – LPF, fc ≈ 5 Hz */
+  /* 级 2 – 低通，截止频率 ≈ 5 Hz */
    0.02008337f,  0.04016673f, 0.02008337f,  1.56101808f, -0.64135154f
 };
 
@@ -31,6 +31,11 @@ static float32_t biquad_state_red[4U * BIQUAD_STAGES];
 static float32_t biquad_state_ir[4U * BIQUAD_STAGES];
 static uint8_t biquad_initialized = 0U;
 
+/**
+ * @brief  CMSIS-DSP 双二阶滤波器的一次性初始化。
+ * @note   使用预计算系数初始化 RED 和 IR 的 4 阶 Butterworth 带通滤波器
+ *         （各 2 个双二阶节）。
+ */
 static void biquad_ensure_init(void)
 {
   if (biquad_initialized != 0U)
@@ -45,6 +50,10 @@ static void biquad_ensure_init(void)
   biquad_initialized = 1U;
 }
 
+/**
+ * @brief  将双二阶滤波器状态重置为初始条件。
+ * @note   清零状态缓冲并重新初始化滤波器实例。
+ */
 static void biquad_reset(void)
 {
   (void)memset(biquad_state_red, 0, sizeof(biquad_state_red));
@@ -55,10 +64,11 @@ static void biquad_reset(void)
 
 /* ---- 公共 API ---- */
 
-/*
- * 重置测量算法窗口。
- * 当前采用固定长度滑动窗口缓存最近一段 RED/IR 样本，
- * 供 BPM 峰值检测与 SpO2 AC/DC 比值计算共同使用。
+/**
+ * @brief  重置测量算法窗口。
+ * @param  spo2_state SpO2 状态结构体指针。
+ * @note   清零样本缓冲、运行总和、DC 估计值和滤波器状态。
+ *         对 RED/IR 样本使用固定长度滑动窗口。
  */
 void max30102_spo2_reset(MAX30102_SpO2_t *spo2_state)
 {
@@ -93,7 +103,15 @@ void max30102_spo2_reset(MAX30102_SpO2_t *spo2_state)
   biquad_reset();
 }
 
-/* 向测量算法窗口中压入一个新的 RED/IR 样本。 */
+/**
+ * @brief  向测量窗口推入一对新的 RED/IR 样本。
+ * @param  spo2_state SpO2 状态结构体指针。
+ * @param  red_value  新的 RED 通道原始样本。
+ * @param  ir_value   新的 IR 通道原始样本。
+ * @note   维护带运行总和的滑动窗口和滤波值。
+ *         应用 CMSIS-DSP 4 阶 Butterworth 带通滤波器分离脉搏波形。
+ *         total_samples 计数器永不重置。
+ */
 void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, uint32_t ir_value)
 {
   int32_t old_red_filtered;
@@ -142,7 +160,7 @@ void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, u
                                                           MAX30102_FILTER_DC_SHIFT);
   }
 
-  /* CMSIS-DSP 4th-order Butterworth bandpass isolates the pulse waveform. */
+  /* CMSIS-DSP 4 阶 Butterworth 带通分离脉搏波形。 */
   {
     float32_t in, out;
 
@@ -186,6 +204,13 @@ void max30102_spo2_add_sample(MAX30102_SpO2_t *spo2_state, uint32_t red_value, u
   }
 }
 
+/**
+ * @brief  获取最新的带通滤波 RED 和 IR 值。
+ * @param  spo2_state   SpO2 状态结构体指针。
+ * @param  red_filtered 滤波后 RED 值的输出指针。
+ * @param  ir_filtered  滤波后 IR 值的输出指针。
+ * @return 成功返回 1，窗口为空或参数为 NULL 返回 0。
+ */
 uint8_t max30102_spo2_get_latest_filtered(const MAX30102_SpO2_t *spo2_state,
                                           int32_t *red_filtered,
                                           int32_t *ir_filtered)
@@ -210,6 +235,14 @@ uint8_t max30102_spo2_get_latest_filtered(const MAX30102_SpO2_t *spo2_state,
   return 1U;
 }
 
+/**
+ * @brief  从样本窗口计算信号指标（DC、AC RMS、PI）。
+ * @param  spo2_state SpO2 状态结构体指针。
+ * @param  metrics    计算所得信号指标的输出指针。
+ * @return 成功返回 1，样本不足或参数为 NULL 返回 0。
+ * @note   PI 使用 max(滤波 RMS, 原始居中 RMS) 作为 AC 源，
+ *         以避免 DC 跟踪器稳定后的低估。
+ */
 uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_SignalMetrics_t *metrics)
 {
   uint16_t sample_count;
@@ -234,9 +267,9 @@ uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_
   metrics->ir_ac_rms = max30102_calculate_window_rms(spo2_state->ir_filtered_square_sum, sample_count);
 
   /*
-   * PI uses max(filtered RMS, raw centered RMS) as the AC source.
-   * Filtered RMS decays after the DC tracker settles on a steady finger,
-   * but the raw centered RMS retains the true pulse amplitude.
+   * PI 使用 max(滤波 RMS, 原始居中 RMS) 作为 AC 源。
+   * DC 跟踪器在稳定手指上收敛后，滤波 RMS 会衰减，
+   * 但原始居中 RMS 保留真实脉搏幅度。
    */
   red_pi_rms = max30102_calculate_centered_rms(spo2_state->red_sum,
                                                spo2_state->red_square_sum,
@@ -271,6 +304,15 @@ uint8_t max30102_get_signal_metrics(const MAX30102_SpO2_t *spo2_state, MAX30102_
   return 1U;
 }
 
+/**
+ * @brief  计算综合信号质量评分 (0-100)。
+ * @param  spo2_state    SpO2 状态结构体指针。
+ * @param  metrics       预计算信号指标的指针。
+ * @param  signal_quality 质量评分 (0-100) 的输出指针。
+ * @return 成功返回 1，参数为 NULL 返回 0。
+ * @note   评分因子：IR PI (30)、RED PI (20)、IR RMS (20)、
+ *         RED RMS (10)、窗口填充度 (5) 和 PI/RMS 比值 (15)。
+ */
 uint8_t max30102_calculate_signal_quality(const MAX30102_SpO2_t *spo2_state,
                                           const MAX30102_SignalMetrics_t *metrics,
                                           uint8_t *signal_quality)
@@ -334,10 +376,13 @@ uint8_t max30102_calculate_signal_quality(const MAX30102_SpO2_t *spo2_state,
   return 1U;
 }
 
-/*
- * 根据窗口内 RED/IR 的 AC/DC 比值估算 SpO2。
- * 这里先求直流分量 DC，再求交流分量的 RMS，最后计算比值 R。
- * 与简单 max-min 相比，RMS 对偶发毛刺更不敏感，结果通常更稳。
+/**
+ * @brief  从 RED 和 IR 通道的 AC/DC 比值估算 SpO2。
+ * @param  spo2_state SpO2 状态结构体指针。
+ * @param  spo2_value 估算 SpO2 百分比值的输出指针。
+ * @return 成功返回 1，样本不足、信号弱或结果越界返回 0。
+ * @note   使用基于 RMS 的 AC 幅值和来自常见 MAX3010x 开源示例的二次拟合曲线。
+ *         有效范围：70-100%。
  */
 uint8_t max30102_calculate_spo2(const MAX30102_SpO2_t *spo2_state, uint8_t *spo2_value)
 {

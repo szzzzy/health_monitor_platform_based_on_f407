@@ -61,18 +61,29 @@ static struct
   uint32_t hysteresis;          /* 当前迟滞值（从 EMA 或噪声门限推导） */
 } beat;
 
+/**
+ ******************************************************************************
+ * @brief  重置 PPG 脉搏状态机（清除所有内部状态）。
+ * @note   手指离开或测量重置时调用。清零整个搏动检测器结构体，
+ *         包括 IDLE 状态和 EMA 值。
+ ******************************************************************************
+ */
 void app_ppg_pulse_reset(void)
 {
   (void)memset(&beat, 0, sizeof(beat));
 }
 
-/*
- * 逐点脉搏检测主函数 — 每收到一个滤波后样本调用一次
- *
- * @param filtered_sample  带通滤波后的 PPG 样本值（AC 分量，已去 DC）
- * @param total_samples    传感器启动以来总样本数
- * @param pulse_info       输出：本次检测到的脉搏信息（若有）
- * @return 1 = 检测到有效脉搏，0 = 未检测到
+/**
+ ******************************************************************************
+ * @brief  通过脉搏检测状态机处理一个滤波后的 PPG 样本。
+ * @param  app             AppState 指针（内部检查 finger_present）。
+ * @param  filtered_sample 带通滤波后的 PPG AC 样本值。
+ * @param  total_samples   自启动以来的传感器样本总数。
+ * @param  pulse_info      检测到的搏动输出结构体（无时清零）。
+ * @return 检测到有效脉搏返回 1，否则返回 0。
+ * @note   状态机：IDLE -> RISING -> FALLING。迟滞自适应来自
+ *         beat_amp_ema。IBI 验证范围 [300, 2000] ms。
+ ******************************************************************************
  */
 uint8_t app_ppg_pulse_update(AppState_t *app,
                              int32_t filtered_sample,
@@ -252,15 +263,16 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
   return pulse_detected;
 }
 
-/*
- * 脉搏后处理：将检测到的脉搏信息推送至下游模块
- *
- * 流程：
- *   1. HRV 峰值可见性窗口检查（防同一脉搏被重复标记）
- *   2. 记录 IBI 到 HRV 环形缓冲区
- *   3. 更新 beat-based PI EMA
- *   4. 触发 OLED 脉搏标记
- *   5. 推送振幅到 RR 模块（仅在信号质量达标时）
+/**
+ ******************************************************************************
+ * @brief  后处理检测到的脉搏：推送 IBI 到 HRV、更新 PI、通知 RR。
+ * @param  app         AppState 指针。
+ * @param  pulse_info  检测到的脉搏信息（须 beat_valid=1）。
+ * @param  total_samples 自启动以来的传感器样本总数（用于 HRV 峰值窗口）。
+ * @note   流水线：HRV 峰值去重 -> IBI 添加 -> 基于搏动的 PI EMA ->
+ *         OLED 标记 -> RR 幅值推送（依赖信号质量）。被拒绝的
+ *         重复峰值或 IBI 静默返回。
+ ******************************************************************************
  */
 void app_ppg_pulse_process_metrics(AppState_t *app,
                                    const MAX30102_PulseInfo_t *pulse_info,

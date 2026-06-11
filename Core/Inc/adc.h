@@ -50,6 +50,12 @@ uint8_t app_ecg_adc_read_sample(uint16_t *raw_value,
                                 uint16_t avail_remaining);
 uint8_t app_ecg_adc_had_overflow(void);
 void app_ecg_adc_clear_overflow(void);
+uint16_t app_ecg_adc_debug_ndtr(void);
+uint32_t app_ecg_adc_debug_adc_state(void);
+uint32_t app_ecg_adc_debug_adc_cr2(void);
+uint32_t app_ecg_adc_debug_dma_cr(void);
+uint32_t app_ecg_adc_debug_dma_lisr(void);
+uint32_t app_ecg_adc_debug_dma_errcode(void);
 
 /* USER CODE END Prototypes */
 

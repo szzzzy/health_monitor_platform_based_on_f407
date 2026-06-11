@@ -1,4 +1,12 @@
-﻿#include "ssd1306.h"
+﻿/**
+  ******************************************************************************
+  * @file    ssd1306.c
+  * @brief   SSD1306 OLED display driver -- I2C command/data transfer,
+  *          frame buffer management, pixel drawing, and 5x7 font rendering
+  ******************************************************************************
+  */
+
+#include "ssd1306.h"
 #include "i2c.h"
 
 #include <string.h>
@@ -24,10 +32,12 @@
  */
 uint8_t ssd1306_FrameBuffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8U];
 
-/*
- * 向 OLED 发送单字节命令。
- * 先发控制字节 0x00 表示后续为命令，再发命令本身。
- * 这里采用阻塞 I2C 发送，SSD1306 命令/数据包最长为 2 字节。
+/**
+ * @brief  Send a single command byte to the SSD1306 over I2C.
+ * @param  cmd Command byte to send.
+ * @return HAL_OK on success, HAL_ERROR on I2C failure.
+ * @note   Prepends the control byte (0x00) for command mode.
+ *         Uses blocking I2C transmit.
  */
 static HAL_StatusTypeDef ssd1306_WriteCommand(uint8_t cmd)
 {
@@ -35,10 +45,12 @@ static HAL_StatusTypeDef ssd1306_WriteCommand(uint8_t cmd)
   return HAL_I2C_Master_Transmit(&hi2c1, SSD1306_I2C_ADDR, packet, sizeof(packet), SSD1306_TIMEOUT_MS);
 }
 
-/*
- * 向 OLED 发送一页（128 字节）GRAM 数据。
- * 包格式：0x40 控制字节 + 128 字节数据。
- * 发送前会检查长度，超过 128 字节直接返回。
+/**
+ * @brief  Send one page (128 bytes) of GDDRAM data to the OLED.
+ * @param  data Pointer to the data buffer.
+ * @param  size Number of data bytes (must not exceed SSD1306_WIDTH = 128).
+ * @return HAL_OK on success, HAL_ERROR if size exceeds 128 or I2C failure.
+ * @note   Prepends the control byte (0x40) for data mode.
  */
 static HAL_StatusTypeDef ssd1306_WriteData(const uint8_t *data, uint16_t size)
 {
@@ -54,11 +66,12 @@ static HAL_StatusTypeDef ssd1306_WriteData(const uint8_t *data, uint16_t size)
   return HAL_I2C_Master_Transmit(&hi2c1, SSD1306_I2C_ADDR, packet, size + 1U, SSD1306_TIMEOUT_MS);
 }
 
-/*
- * 5x7 字模垂直翻转。
- * SSD1306 的 GDDRAM 按页（page）组织，每页 8 像素垂直排列，
- * 字模中的位 0 对应页内最低像素。此函数将位顺序反转，
- * 使字模与 OLED 物理像素对齐。
+/**
+ * @brief  Vertically flip a 7-bit glyph column for SSD1306 page layout.
+ * @param  x Input byte (bit 0 = bottom, bit 6 = top).
+ * @return Flipped byte (bit 0 = top, bit 6 = bottom).
+ * @note   SSD1306 GDDRAM organises pixels vertically per page byte.
+ *         This reversal aligns the font bitmap with the physical pixel order.
  */
 static uint8_t ssd1306_FlipGlyph7(uint8_t x)
 {
@@ -76,11 +89,13 @@ static uint8_t ssd1306_FlipGlyph7(uint8_t x)
   return y;
 }
 
-/*
- * 获取字符的 5x7 像素字模。
- * 仅支持 ASCII 可打印字符（含部分符号）。
- * 小写字母先转大写再查表，字模高位在上。
- * 大写字母最后要垂直翻转 (ssd1306_FlipGlyph7)，使其底部对齐页边界。
+/**
+ * @brief  Retrieve the 5x7 pixel glyph bitmap for an ASCII character.
+ * @param  c     Input character (printable ASCII).
+ * @param  glyph Output array of 5 bytes representing the glyph columns.
+ * @note   Lowercase letters are converted to uppercase before lookup.
+ *         Uppercase glyphs are vertically flipped via ssd1306_FlipGlyph7
+ *         to align with the OLED page orientation.
  */
 static void ssd1306_GetGlyph5x7(char c, uint8_t glyph[5])
 {
@@ -158,12 +173,11 @@ static void ssd1306_GetGlyph5x7(char c, uint8_t glyph[5])
   }
 }
 
-/*
- * 初始化 OLED 控制器。
- * 上电后先等待 100ms 确保电源稳定，再依次发送 SSD1306 初始化命令序列。
- * 命令序列包括：关显示、设地址模式、设对比度、设扫描方向、开电荷泵、
- * 设预充电周期、设 COM 引脚配置、开显示。
- * 最后清屏并刷新，确保上电后不显示随机噪点。
+/**
+ * @brief  Initialise the SSD1306 OLED controller.
+ * @note   Waits 100 ms for power stabilisation, sends the initialisation
+ *         command sequence, then clears the frame buffer and refreshes
+ *         the display to ensure no random noise is shown after power-on.
  */
 void ssd1306_Init(void)
 {
@@ -207,13 +221,23 @@ void ssd1306_Init(void)
   ssd1306_UpdateScreen();
 }
 
+/**
+ * @brief  Set the OLED display contrast.
+ * @param  contrast Contrast value (0-255).
+ * @note   Sends the Set Contrast command (0x81) followed by the value.
+ */
 void ssd1306_SetContrast(uint8_t contrast)
 {
   if (ssd1306_WriteCommand(0x81U) != HAL_OK) { return; }
   ssd1306_WriteCommand(contrast);
 }
 
-/* 清空帧缓冲：白 = 全 0xFF，黑 = 全 0x00 */
+/**
+ * @brief  Clear the frame buffer to black or white.
+ * @param  color SSD1306_COLOR_BLACK (0x00) or SSD1306_COLOR_WHITE (0xFF).
+ * @note   Only modifies the in-memory buffer; call ssd1306_UpdateScreen()
+ *         to flush to the OLED hardware.
+ */
 void ssd1306_Clear(SSD1306_COLOR color)
 {
   memset(ssd1306_FrameBuffer,
@@ -221,11 +245,11 @@ void ssd1306_Clear(SSD1306_COLOR color)
          sizeof(ssd1306_FrameBuffer));
 }
 
-/*
- * 将帧缓冲刷新到 OLED。
- * 逐页发送：先设页地址 (0xB0+page)，再设列地址低/高字节 (0x00, 0x10)，
- * 最后发送该页 128 字节 GRAM 数据。
- * 全屏刷新 8 页 × 128 字节 = 1KB I2C 传输。
+/**
+ * @brief  Flush the entire frame buffer to the OLED display.
+ * @note   Transfers 8 pages x 128 bytes = 1 KB over I2C. For each page,
+ *         sets the page address (0xB0 + page), column address (0x00, 0x10),
+ *         then sends 128 bytes of GDDRAM data.
  */
 void ssd1306_UpdateScreen(void)
 {
@@ -240,11 +264,14 @@ void ssd1306_UpdateScreen(void)
   }
 }
 
-/*
- * 在帧缓冲中绘制单个像素。
- * SSD1306 内存组织：每字节对应 1 列中的 8 个垂直像素 (page)。
- * 写入 = 置位对应 bit，擦除 = 清零对应 bit。
- * 坐标越界自动忽略。
+/**
+ * @brief  Set or clear a single pixel in the frame buffer.
+ * @param  x     X coordinate (0 to SSD1306_WIDTH - 1).
+ * @param  y     Y coordinate (0 to SSD1306_HEIGHT - 1).
+ * @param  color SSD1306_COLOR_WHITE (set) or SSD1306_COLOR_BLACK (clear).
+ * @note   SSD1306 memory is organised as pages: each byte represents
+ *         8 vertical pixels in a column. Out-of-range coordinates are
+ *         silently ignored.
  */
 void ssd1306_DrawPixel(uint8_t x, uint8_t y, SSD1306_COLOR color)
 {
@@ -269,11 +296,14 @@ void ssd1306_DrawPixel(uint8_t x, uint8_t y, SSD1306_COLOR color)
   }
 }
 
-/*
- * 在指定位置绘制 ASCII 字符串。
- * 使用 5×7 像素字模，字符间距 1 像素，总宽 6 像素/字符。
- * 超出右边界自动换行（x=0, y+8）；超出下边界停止绘制。
- * 每个字符先画前景像素，再用黑色画字符间距列。
+/**
+ * @brief  Draw an ASCII string at the specified position.
+ * @param  x   X coordinate of the top-left corner.
+ * @param  y   Y coordinate of the top-left corner.
+ * @param  str Null-terminated ASCII string to draw.
+ * @note   Uses 5x7 pixel font with 1-pixel character spacing (6 pixels
+ *         total per character). Auto-wraps to the next page on right-edge
+ *         overflow. Stops drawing if the bottom of the screen is reached.
  */
 void ssd1306_DrawString(uint8_t x, uint8_t y, const char *str)
 {

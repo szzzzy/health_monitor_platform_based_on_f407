@@ -59,15 +59,15 @@
  * - Sample rate: 100 sps
  * - LED pulse width: 411 us / 18-bit
  *
- * The firmware drains every pending FIFO sample during each 10 ms service pass,
- * so keep the sensor at 100 Hz to match the algorithm's fixed sample-rate math.
- * Use the largest ADC range so finger contact does not pin RED/IR at 0x03FFFF.
+ * 固件在每个 10 ms 服务周期中读取所有待处理的 FIFO 样本，
+ * 因此传感器保持 100 Hz 以匹配算法固定的采样率计算。
+ * 使用最大 ADC 量程，使手指接触不会将 RED/IR 锁定在 0x03FFFF。
  */
 #define MAX30102_DEFAULT_SPO2_CONFIG            0x67U
 
-/* LED current: value * 0.2 mA. With the ADC range at 16384 nA, 25.6 mA
-   should bring finger-contact DC values back near the useful mid-scale range
-   without pinning RED/IR at 0x03FFFF. */
+/* LED 电流：数值 * 0.2 mA。在 ADC 量程为 16384 nA 时，25.6 mA
+   应将手指接触的 DC 值恢复至有用的中量程范围附近，
+   而不会将 RED/IR 锁定在 0x03FFFF。 */
 #define MAX30102_DEFAULT_LED1_PA                0x80U
 #define MAX30102_DEFAULT_LED2_PA                0x80U
 

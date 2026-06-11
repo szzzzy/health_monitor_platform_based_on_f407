@@ -46,6 +46,14 @@ static uint8_t app_rr_order_to_index(uint8_t order);
 static uint32_t app_rr_get_peak_sample(uint8_t order);
 static uint32_t app_rr_get_amplitude(uint8_t order);
 
+/**
+ ******************************************************************************
+ * @brief  重置 RR 模块：清除环形缓冲和输出字段。
+ * @param  app AppState 指针（可为 NULL）。
+ * @note   手指离开或测量重置时调用。清零整个 rr_state 结构体
+ *         并清除 rr_valid / rr_bpm。
+ ******************************************************************************
+ */
 void app_rr_reset(AppState_t *app)
 {
   (void)memset(&rr_state, 0, sizeof(rr_state));
@@ -59,6 +67,14 @@ void app_rr_reset(AppState_t *app)
   app->rr_bpm = 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  记录脉搏搏动的样本索引和幅度用于 RIAV 分析。
+ * @param  peak_sample  检测到的脉搏峰值的全局样本索引。
+ * @param  amplitude    该搏动的峰谷幅度。
+ * @note   写入环形缓冲；调用者确保数据有效。
+ ******************************************************************************
+ */
 void app_rr_add_beat(uint32_t peak_sample, uint32_t amplitude)
 {
   rr_state.peak_sample[rr_state.write_index] = peak_sample;
@@ -70,6 +86,15 @@ void app_rr_add_beat(uint32_t peak_sample, uint32_t amplitude)
   }
 }
 
+/**
+ ******************************************************************************
+ * @brief  从 RIAV 幅度包络计算呼吸率。
+ * @param  app AppState 指针（可为 NULL）。
+ * @note   应用三个门控：最小搏动计数、最小时间窗口和
+ *         最小调制深度。包络峰值间隔转换为
+ *         呼吸次数/分钟。输出范围钳位在 [8, 30] bpm。
+ ******************************************************************************
+ */
 void app_rr_update_output(AppState_t *app)
 {
   uint8_t i;
@@ -201,6 +226,7 @@ void app_rr_update_output(AppState_t *app)
   app->rr_bpm = (uint8_t)rr_estimate;
 }
 
+/* ---- 环形缓冲顺序到索引映射（处理回绕） ---- */
 static uint8_t app_rr_order_to_index(uint8_t order)
 {
   uint8_t start_index;
@@ -217,11 +243,13 @@ static uint8_t app_rr_order_to_index(uint8_t order)
   return (uint8_t)((start_index + order) % APP_RR_RIAV_HISTORY_SIZE);
 }
 
+/* ---- 按插入顺序从环形缓冲读取峰值样本时间戳 ---- */
 static uint32_t app_rr_get_peak_sample(uint8_t order)
 {
   return rr_state.peak_sample[app_rr_order_to_index(order)];
 }
 
+/* ---- 按插入顺序从环形缓冲读取搏动幅度 ---- */
 static uint32_t app_rr_get_amplitude(uint8_t order)
 {
   return rr_state.amplitude[app_rr_order_to_index(order)];

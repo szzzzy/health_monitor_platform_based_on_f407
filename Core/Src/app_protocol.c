@@ -26,12 +26,25 @@ static uint8_t app_parse_datetime_text(const char *text, APP_RTC_DateTime_t *dat
 static void app_send_rtc_set_response(AppState_t *app, uint8_t success, const char *reason);
 static bool app_process_uart_line(AppState_t *app, const char *line);
 
+/**
+ * @brief  Initialize the UART command-line protocol module.
+ * @note   Resets the internal UART RX line buffer length to zero.
+ *         Must be called once at system startup before any UART communication.
+ */
 /* 初始化串口接收行缓冲。 */
 void app_protocol_init(void)
 {
   uart_rx_line_len = 0U;
 }
 
+/**
+ * @brief  Read the current RTC date/time snapshot into the application state.
+ * @param  app Pointer to the application state (rtc_datetime field is updated).
+ * @note   Updates rtc_read_ok and rtc_time_valid flags based on RTC status.
+ *         On read failure, the rtc_datetime structure is zeroed out.
+ *         This snapshot is used by both display and serial report functions
+ *         to ensure consistent timestamps within a single refresh cycle.
+ */
 /* 读取 RTC 当前快照，供显示与上报统一使用。 */
 void app_protocol_update_rtc_snapshot(AppState_t *app)
 {
@@ -53,6 +66,15 @@ void app_protocol_update_rtc_snapshot(AppState_t *app)
   app->rtc_time_valid = APP_RTC_IsTimeValid();
 }
 
+/**
+ * @brief  Poll the USART2 DMA circular buffer for incoming command lines.
+ * @param  app Pointer to the application state (updated on valid commands).
+ * @note   Processes received bytes from the DMA idle-line interrupt.
+ *         Lines are delimited by '\n'; '\r' characters are skipped.
+ *         Recognized commands: TIME (query) and SETTIME (set RTC).
+ *         On a valid SETTIME command, the RTC is updated and a response is sent.
+ *         If a line exceeds UART_RX_LINE_SIZE, the buffer is reset.
+ */
 /* 轮询 USART2 DMA 缓冲区，按”单行命令”协议接收 TIME / SETTIME。 */
 void app_protocol_poll_uart_commands(AppState_t *app)
 {
@@ -112,6 +134,13 @@ void app_protocol_poll_uart_commands(AppState_t *app)
   }
 }
 
+/**
+ * @brief  Build and transmit the current sensor measurement report over UART.
+ * @param  app Pointer to the application state (reads all measurement fields).
+ * @note   Updates the RTC snapshot before building the packet, then sends the
+ *         formatted line via USART2. The report is built by build_sensor_packet()
+ *         and transmitted by send_uart_line().
+ */
 /* 组装当前测量报文并通过串口发送。 */
 void app_protocol_send_sensor_report(AppState_t *app)
 {
@@ -127,8 +156,19 @@ void app_protocol_send_sensor_report(AppState_t *app)
   (void)send_uart_line(app, json_payload, payload_len);
 }
 
+/**
+ * @brief  Build the comma-separated sensor measurement report packet.
+ * @param  app         Pointer to the application state struct.
+ * @param  buffer      Output buffer for the formatted packet string.
+ * @param  buffer_size Size of the output buffer.
+ * @return The length of the formatted packet string in bytes, or 0 on error.
+ * @note   The report format is backward-compatible: legacy host software can
+ *         parse the leading fields while newer hosts use the appended diagnostic
+ *         fields (SQ, PI, R/BAL, sensor/SD/RTC diagnostics) for confidence.
+ *         Fields: M,rtc_valid,yyyymmdd,hhmmss,red,ir,...,crash_flag,...,stack_hwm
+ */
 /*
- * 紧凑测量报文格式：原有前缀字段保持不变，新诊断字段只追加在尾部。 * Realtime report format. Keep existing prefix fields stable and append new diagnostics.
+ * 紧凑测量报文格式：原有前缀字段保持不变，新诊断字段只追加在尾部。 * 实时报文格式。保持原有前缀字段不变，仅追加新的诊断字段。
  * M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2,
  *   rr_valid,rr,ibi_valid,ibi,hrv_valid,mean_ibi,sdnn,rmssd,
  *   motion_artifact,motion_score,sd1,sd2,sd1_sd2_x100,rhythm_irregular,
@@ -285,6 +325,16 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   return (uint16_t)strlen(buffer);
 }
 
+/**
+ * @brief  Send a text line over USART2 with CRLF termination.
+ * @param  app          Pointer to the application state (used for flags).
+ * @param  payload      The string to transmit (no CRLF appended yet).
+ * @param  payload_len  Length of the payload string.
+ * @return true if both payload and CRLF were transmitted successfully,
+ *         false otherwise (app->uart_tx_message_valid is updated).
+ * @note   Uses a blocking HAL_UART_Transmit with a 100 ms timeout per segment.
+ *         A static CRLF byte sequence is appended automatically.
+ */
 /* 通过 USART2 发送一行文本，并在末尾补充 CRLF。 */
 static bool send_uart_line(AppState_t *app, const char *payload, uint16_t payload_len)
 {
@@ -319,6 +369,11 @@ static bool send_uart_line(AppState_t *app, const char *payload, uint16_t payloa
   return app->uart_tx_message_valid;
 }
 
+/**
+ * @brief  Skip leading whitespace characters (spaces and tabs) in a string.
+ * @param  text Pointer to the input string.
+ * @return Pointer to the first non-whitespace character, or NULL if text is NULL.
+ */
 /* 跳过命令字符串前导空格。 */
 static const char *app_skip_spaces(const char *text)
 {

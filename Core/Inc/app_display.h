@@ -9,7 +9,7 @@ extern "C" {
 
 /* 初始化显示相关状态，例如默认页面与页面切换按键。 */
 void app_display_init_state(AppState_t *app);
-/* Poll display-related buttons: page up/down and brightness cycle. */
+/* 轮询显示相关按键：上下翻页和亮度循环。 */
 void app_display_handle_buttons(AppState_t *app);
 /* 清空波形缓冲区，常用于“无手指”或重新开始测量时。 */
 void app_display_reset_waveforms(void);
@@ -17,13 +17,13 @@ void app_display_reset_waveforms(void);
 void app_display_add_ir_sample(int32_t filtered_value);
 /* 向 RED 波形缓冲区压入一个带通滤波后的 PPG 样本。 */
 void app_display_add_red_sample(int32_t filtered_value);
-/* Mark a recently detected IR pulse peak on the pulse waveform. */
+/* 在脉搏波形上标记最近检测到的 IR 脉冲峰值。 */
 void app_display_add_ir_pulse_marker(void);
-/* Clear only the ECG waveform buffer. PPG contact changes must not affect it. */
+/* 仅清除 ECG 波形缓冲区，PPG 接触变化不得影响 ECG 波形。 */
 void app_display_reset_ecg_waveform(void);
-/* Push one filtered ECG sample into the ECG waveform buffer. */
+/* 将一个滤波后的 ECG 样本压入 ECG 波形缓冲区。 */
 void app_display_add_ecg_sample(int32_t filtered_value);
-/* Mark a recently detected ECG R peak on the ECG waveform. */
+/* 在 ECG 波形上标记最近检测到的 ECG R 峰。 */
 void app_display_add_ecg_r_peak_marker(void);
 /* 根据当前页面绘制测量结果页。 */
 void app_display_measurement_page(const AppState_t *app);

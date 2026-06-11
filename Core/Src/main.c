@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : 主程序入口与应用层调�?
+  * @brief          : 主程序入口与应用层调度
   * @attention
   *
   * <h2><center>&copy; Copyright (c) 2026 STMicroelectronics.
@@ -41,6 +41,7 @@
 #include "app_measurement.h"
 #include "app_protocol.h"
 #include "app_rtos.h"
+#include "app_sched_diag.h"
 #include "app_sd_card.h"
 #include "iwdg.h"
 #include "max30102.h"
@@ -71,7 +72,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-volatile uint8_t tim6_tick_flag = 0;
+volatile uint8_t  tim6_tick_flag = 0;
+static volatile uint32_t tim6_isr_count = 0U;  /* TIM6 ISR 回调计数，仅供调试器观测 */
 static AppState_t app;
 /* USER CODE END PV */
 
@@ -81,16 +83,17 @@ void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 /* 初始化共享状态，并让各模块完成自己的默认配置 */
 static void app_state_init(AppState_t *app);
-/* 若当前轮次需要上报，则发送一帧测量报�? */
+/* 若当前轮次需要上报，则发送一帧测量报文 */
 static void app_send_report_if_due(AppState_t *app);
-/* 若当前轮次需要刷新显示，则更�? OLED 画面 */
+/* 若当前轮次需要刷新显示，则更新 OLED 画面 */
 static void app_refresh_display_if_needed(AppState_t *app);
 static void app_update_sd_log_status(AppState_t *app);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/* 应用层统�?初始化入口，main 中只保留调度 */
+/* 应用层统一初始化入口，main 中只保留调度 */
+/* ---- Initialize shared AppState and all subsystem defaults ---- */
 static void app_state_init(AppState_t *app)
 {
   if (app == NULL)
@@ -104,7 +107,8 @@ static void app_state_init(AppState_t *app)
   app_protocol_init();
 }
 
-/* �?"是否上报"的时序控制收口到�?个函数里，避免主循环继续膨胀 */
+/* 设置"是否上报"的时序控制收口到一个函数里，避免主循环继续膨胀 */
+/* ---- Send a sensor report frame when report_due is set ---- */
 static void app_send_report_if_due(AppState_t *app)
 {
   if ((app == NULL) || (app->report_due == 0U))
@@ -115,12 +119,13 @@ static void app_send_report_if_due(AppState_t *app)
   app_protocol_send_sensor_report(app);
   app->report_due = 0U;
 
-  /* SD PushSample 已在 app_measurement_read_sensor_sample 中完�?
-   *（每次成�? FIFO 读取后调�? APP_DataLog_PushSample）�??
-   * 此处不再做任�? SD 相关操作�? */
+  /* SD PushSample 已在 app_measurement_read_sensor_sample 中完成。
+   *（每次成功 FIFO 读取后调用 APP_DataLog_PushSample）。
+   * 此处不再做任何 SD 相关操作。 */
 }
 
-/* OLED 刷新单独封装，让主循环更像调度器而不是细节堆�? */
+/* OLED 刷新单独封装，让主循环更像调度器而不是细节堆积 */
+/* ---- Refresh OLED display when display_refresh_requested is set ---- */
 static void app_refresh_display_if_needed(AppState_t *app)
 {
   if ((app == NULL) || (app->display_refresh_requested == 0U))
@@ -133,9 +138,10 @@ static void app_refresh_display_if_needed(AppState_t *app)
   app->display_refresh_count++;
   app->display_last_refresh_tick = HAL_GetTick();
   app->display_refresh_requested = 0U;
-  app->fifo_high_watermark = 0U;  /* 刷新成功后重�? backlog 门控 */
+  app->fifo_high_watermark = 0U;  /* 刷新成功后重置 backlog 门控 */
 }
 
+/* ---- Copy SD card log status fields from DataLog to AppState ---- */
 static void app_update_sd_log_status(AppState_t *app)
 {
   DataLogStatus_t st;
@@ -155,8 +161,8 @@ static void app_update_sd_log_status(AppState_t *app)
 }
 
 /*
- * SD 安全窗口�?查：全部满足才返�? 1�?
- * 核心约束：测量中 finger_present==1 时绝对禁止任�? FatFs/SDIO 操作�?
+ * SD 安全窗口检查：全部满足才返回 1。
+ * 核心约束：测量中 finger_present==1 时绝对禁止任何 FatFs/SDIO 操作。
  */
 static uint8_t app_sd_service_safe(const AppState_t *app)
 {
@@ -164,19 +170,19 @@ static uint8_t app_sd_service_safe(const AppState_t *app)
 
   if (app == NULL) { return 0U; }
 
-  /* 测量中禁止一�? SD I/O */
+  /* 测量中禁止一切 SD I/O */
   if (app->finger_present != 0U) { return 0U; }
 
-  /* 传感器状�? */
+  /* 传感器状态检查 */
   if (app->sensor_health != (uint8_t)SENSOR_HEALTH_OK) { return 0U; }
 
-  /* 接触稳定�? */
+  /* 接触稳定中 */
   if (app->contact_settle_samples > 0U) { return 0U; }
 
-  /* FIFO 积压�? */
+  /* FIFO 积压检查 */
   if (app->sensor_fifo_available_samples >= 4U) { return 0U; }
 
-  /* �?�? MAX 样本时间 < 25ms */
+  /* 确保 MAX 样本时间 < 25ms */
   if (app->sensor_last_sample_tick == 0UL) { return 0U; }
   now = HAL_GetTick();
   if ((now - app->sensor_last_sample_tick) >= APP_SD_SAFE_SAMPLE_AGE_MS) { return 0U; }
@@ -227,6 +233,7 @@ int main(void)
   MX_TIM6_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
+  MX_SDIO_SD_Init();
   MX_TIM2_Init();
   MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
@@ -235,7 +242,7 @@ int main(void)
   APP_Watchdog_Refresh();
   /* TIM6 中断稍后在 RTOS 就绪后启动，避免 ISR 在调度器启动前调用 FreeRTOS API */
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 5, 0);
-  /* 启动显示、读取 RTC，并先给出开机状态页。
+  /* 启动显示、读取 RTC，并先给出开机状态页面
    * 先恢复 I2C1 总线，确保 OLED 和 MAX30102 不会因为上电总线卡死而初始化失败。 */
   (void)MX_I2C1_RecoverBus();
   app.i2c_recover_count++;
@@ -295,14 +302,14 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* SD 卡日志：延迟到首�? APP_DataLog_Service() 时懒启动�?
-   * 避免坏卡/无卡在启动阶段阻塞主功能（MAX30102/OLED/RTC/按键/串口）�??
-   * 此处仅初始化内部静�?�变量，不执行硬件访问�?? */
+  /* SD 卡日志：延迟到首次 APP_DataLog_Service() 时懒启动。
+   * 避免坏卡/无卡在启动阶段阻塞主功能（MAX30102/OLED/RTC/按键/串口）。
+   * 此处仅初始化内部静态变量，不执行硬件访问。 */
   APP_DataLog_Init();
   app_update_sd_log_status(&app);
   APP_Watchdog_Refresh();
 
-  /* 上电先采集一段�?�无手指”背景，建立 IR 基线 */
+  /* 上电先采集一段"无手指"背景，建立 IR 基线 */
   while (app_measurement_baseline_ready() == 0U)
   {
     app_protocol_poll_uart_commands(&app);
@@ -331,7 +338,7 @@ int main(void)
     HAL_Delay(APP_MAIN_LOOP_DELAY_MS);
   }
 
-  /* 基线就绪后，给后台跟踪器播种并立即发送一帧初始状�? */
+  /* 基线就绪后，给后台跟踪器播种并立即发送一帧初始状态 */
   app.baseline_ir = app_measurement_get_baseline_average();
   app.baseline_range_ir = app_measurement_get_baseline_range();
   {
@@ -351,7 +358,7 @@ int main(void)
   app.baseline_ir = app_measurement_get_tracked_baseline();
   app_protocol_send_sensor_report(&app);
 
-  /* 根据采集到的波动范围提示”稳�? / 噪声偏大�? */
+  /* 根据采集到的波动范围提示”稳定” / “噪声偏大” */
   (void)snprintf(status_line, sizeof(status_line), "BASE:%lu", (unsigned long)app.baseline_ir);
   if (app_measurement_baseline_is_stable() != 0U)
   {
@@ -365,7 +372,8 @@ int main(void)
   app.report_due = 1U;
   app.display_refresh_requested = 1U;
 
-  /* ECG ADC �?? PPG 基线完成后启动，避免 baseline 阶段（~5 秒）DMA 无消费导致必然覆�?? */
+  /* ECG ADC start deferred until after PPG baseline completes,
+     to avoid guaranteed DMA overflow during baseline phase (~5s) with no consumer. */
   app_ecg_adc_start();
   app_rtos_bind_state(&app);
   /* USER CODE END 2 */
@@ -373,15 +381,6 @@ int main(void)
   /* Init scheduler */
   osKernelInitialize();  /* Call init function for freertos objects (in freertos.c) */
   MX_FREERTOS_Init();
-
-  /* 任务已创建，现在启动 TIM6 中断通知 MAXtask。
-   * 在调度器启动前启动 TIM6，确保第一个 tick 立刻到达。 */
-  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
-  HAL_TIM_Base_Start_IT(&htim6);
-
-  /* 标记 RTOS 就绪——此后 ISR 可以安全调用 FreeRTOS API */
-  app_rtos_mark_ready();
-
   /* Start scheduler */
   osKernelStart();
 
@@ -446,6 +445,11 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+uint32_t APP_TIM6_GetIsrCount(void)
+{
+  return tim6_isr_count;
+}
+
 /* USER CODE END 4 */
 
 /**
@@ -461,13 +465,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* USER CODE BEGIN Callback 0 */
   if ((htim != NULL) && (htim->Instance == TIM6))
   {
+    tim6_isr_count++;
     tim6_tick_flag = 1U;
     max30102_mark_data_ready_from_isr();
     app_rtos_notify_max_from_isr();
     return;
   }
   /* USER CODE END Callback 0 */
-  if ((htim != NULL) && (htim->Instance == TIM7)) {
+  if (htim->Instance == TIM7) {
     HAL_IncTick();
   }
   /* USER CODE BEGIN Callback 1 */

@@ -27,6 +27,13 @@ static struct
   uint8_t value;        /* 当前平滑后的 SpO2 值 */
 } spo2_smooth_state;
 
+/**
+ ******************************************************************************
+ * @brief  重置 SpO2 平滑滤波器状态和输出字段。
+ * @param  app AppState 指针（可为 NULL）。
+ * @note   清零 EMA 状态结构体并清除 spo2_valid / spo2_value。
+ ******************************************************************************
+ */
 void app_spo2_filter_reset(AppState_t *app)
 {
   (void)memset(&spo2_smooth_state, 0, sizeof(spo2_smooth_state));
@@ -40,6 +47,16 @@ void app_spo2_filter_reset(AppState_t *app)
   app->spo2_value = 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  通过 EMA 平滑原始 SpO2；原始值无效时不推进状态。
+ * @param  app             AppState 指针（可为 NULL）。
+ * @param  raw_spo2_valid  原始 SpO2 有效为 1，否则为 0。
+ * @param  raw_spo2_value  原始 SpO2 百分比估算值。
+ * @note   当 raw_spo2_valid==0 时，滤波器保留其状态和旧输出值
+ *         （供带 "?" 标记的 UI 显示），但清除 app->spo2_valid。
+ ******************************************************************************
+ */
 void app_spo2_filter_update_output(AppState_t *app,
                                    uint8_t raw_spo2_valid,
                                    uint8_t raw_spo2_value)

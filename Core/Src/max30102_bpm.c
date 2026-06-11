@@ -44,6 +44,10 @@ static float32_t fft_out[FFT_SIZE];
 static arm_rfft_fast_instance_f32 rfft_inst;
 static uint8_t rfft_initialized = 0U;
 
+/**
+ * @brief  One-time initialisation of the RFFT instance for autocorrelation.
+ * @note   Initialises arm_rfft_fast_instance_f32 for FFT_SIZE (256) points.
+ */
 static void autocorr_ensure_init(void)
 {
   if (rfft_initialized == 0U)
@@ -53,19 +57,28 @@ static void autocorr_ensure_init(void)
   }
 }
 
-/*
- * 根据 IR 波形检测峰值，并用相邻峰值的间隔估算心率。
+/**
+ * @brief  Estimate heart rate from IR waveform peak detection.
+ * @param  spo2_state Pointer to the SpO2 state structure.
+ * @param  bpm_value  Output pointer for estimated BPM.
+ * @return 1 on success, 0 if insufficient peaks or out-of-range BPM.
+ * @note   Convenience wrapper; calls max30102_calculate_bpm_with_pulse
+ *         with pulse_info set to NULL.
  */
 uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_value)
 {
   return max30102_calculate_bpm_with_pulse(spo2_state, bpm_value, NULL);
 }
 
-/*
- * BPM + 脉冲信息联合计算：
- * 与 max30102_calculate_bpm 使用相同的峰值检测逻辑，但额外通过 pulse_info
- * 向上层流式脉冲检测器 (app_stream_pulse_update) 提供交叉校验数据，
- * 解决原始窗口峰值算法在某些波形形态下漏检 IBI 的问题。
+/**
+ * @brief  Estimate BPM with additional pulse information for cross-validation.
+ * @param  spo2_state Pointer to the SpO2 state structure.
+ * @param  bpm_value  Output pointer for estimated BPM.
+ * @param  pulse_info Output pointer for detailed pulse information (may be NULL).
+ * @return 1 on success, 0 if insufficient peaks or out-of-range BPM.
+ * @note   Uses smoothed 3-point peak detection with prominence and edge
+ *         thresholds. When pulse_info is provided, fills in IBI, amplitude,
+ *         and sample timing for upstream streaming pulse detection.
  */
 uint8_t max30102_calculate_bpm_with_pulse(const MAX30102_SpO2_t *spo2_state,
                                           uint8_t *bpm_value,
@@ -344,23 +357,15 @@ uint8_t max30102_calculate_bpm_with_pulse(const MAX30102_SpO2_t *spo2_state,
   return 1U;
 }
 
-/* --------------------------------------------------------------------------
- * 基于 FFT 的自相关心率估算（Wiener–Khinchin 定理）
- *
- * 原理：信号的自相关 = 功率谱的逆傅里叶变换
- *       自相关峰值位置 = 信号的基频周期
- *
- * 算法流程：
- *   1. 从环形缓冲区复制 256 个滤波后的 IR 样本
- *   2. 减均值 + Hann 窗 → 抑制频谱泄漏
- *   3. 正变换 RFFT → 功率谱 |X[k]|^2
- *   4. 逆变换 RFFT → 自相关序列
- *   5. 在 [LAG_MIN, LAG_MAX] 范围内搜索自相关峰值
- *   6. BPM = 采样率 × 60 / 滞后值
- *
- * 相比时域峰值检测，自相关法对弱灌注 / 噪声信号更鲁棒，
- * 但对突变心率（如心律不齐）响应较慢（需要 256 点 ≈ 2.56 秒窗口）。
- * -------------------------------------------------------------------------- */
+/**
+ * @brief  Estimate BPM using FFT-based autocorrelation (Wiener-Khinchin).
+ * @param  spo2_state Pointer to the SpO2 state structure.
+ * @param  bpm        Output pointer for estimated BPM.
+ * @return 1 on success, 0 if insufficient samples or no valid peak found.
+ * @note   Uses 256-point RFFT with Hann window. Autocorrelation peak in
+ *         the lag range [27, 171] maps to [35, 220] BPM at 100 Hz sample
+ *         rate. More robust than peak detection for low-perfusion signals.
+ */
 uint8_t max30102_autocorr_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm)
 {
   uint16_t i;

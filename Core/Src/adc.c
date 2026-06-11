@@ -26,7 +26,8 @@
 
 #define APP_ECG_ADC_SAMPLE_PERIOD_MS 4U
 
-static uint16_t app_ecg_adc_buf[APP_ECG_ADC_BUF_SIZE];
+static uint16_t app_ecg_adc_buf[APP_ECG_ADC_BUF_SIZE]
+    __attribute__((section(".bss.ARM.__at_0x2001F800"), aligned(4), used));
 static volatile uint16_t app_ecg_adc_consume_idx = 0U;
 static volatile uint8_t app_ecg_adc_overflow_flag = 0U;
 
@@ -106,7 +107,7 @@ void MX_ADC1_Init(void)
   }
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_10;
+  sConfig.Channel = ADC_CHANNEL_5;
   sConfig.Rank = 1;
   sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
@@ -131,14 +132,14 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
     /* ADC1 clock enable */
     __HAL_RCC_ADC1_CLK_ENABLE();
 
-    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
     /**ADC1 GPIO Configuration
-    PC0     ------> ADC1_IN10
+    PA5     ------> ADC1_IN5
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Pin = GPIO_PIN_5;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* ADC1 DMA Init */
     /* ADC1 Init */
@@ -177,9 +178,9 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
     __HAL_RCC_ADC1_CLK_DISABLE();
 
     /**ADC1 GPIO Configuration
-    PC0     ------> ADC1_IN10
+    PA5     ------> ADC1_IN5
     */
-    HAL_GPIO_DeInit(GPIOC, GPIO_PIN_0);
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_5);
 
     /* ADC1 DMA DeInit */
     HAL_DMA_DeInit(adcHandle->DMA_Handle);
@@ -300,6 +301,36 @@ uint8_t app_ecg_adc_had_overflow(void)
 void app_ecg_adc_clear_overflow(void)
 {
   app_ecg_adc_overflow_flag = 0U;
+}
+
+uint16_t app_ecg_adc_debug_ndtr(void)
+{
+  return (uint16_t)__HAL_DMA_GET_COUNTER(&hdma_adc1);
+}
+
+uint32_t app_ecg_adc_debug_adc_state(void)
+{
+  return HAL_ADC_GetState(&hadc1);
+}
+
+uint32_t app_ecg_adc_debug_adc_cr2(void)
+{
+  return (uint32_t)ADC1->CR2;
+}
+
+uint32_t app_ecg_adc_debug_dma_cr(void)
+{
+  return (uint32_t)DMA2_Stream0->CR;
+}
+
+uint32_t app_ecg_adc_debug_dma_lisr(void)
+{
+  return (uint32_t)(DMA2->LISR & 0x3DU); /* Stream0: TCIF0|HTIF0|TEIF0|DMEIF0|FEIF0 */
+}
+
+uint32_t app_ecg_adc_debug_dma_errcode(void)
+{
+  return (uint32_t)hdma_adc1.ErrorCode;
 }
 
 /* USER CODE END 1 */

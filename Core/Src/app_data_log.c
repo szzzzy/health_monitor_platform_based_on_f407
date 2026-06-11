@@ -23,7 +23,7 @@
 #include "main.h"
 #include <string.h>
 
-/* Ring buffer: 2048 x 16B = 32KB. */
+/* 环形缓冲区：2048 x 16B = 32KB */
 static DataLogRawSample_t ring[DATA_LOG_RING_SAMPLES];
 static uint16_t ring_head  = 0U;
 static uint16_t ring_tail  = 0U;
@@ -74,6 +74,14 @@ static uint8_t fmt_buf[sizeof(DataLogFileHeader_t) + WRITE_CHUNK_BYTES];
 
 /* ---- 内部辅助 ---- */
 
+/**
+ ******************************************************************************
+ * @brief  禁用中断并返回先前的 PRIMASK 状态
+ * @param  无
+ * @return 先前的 PRIMASK 值，用于 ring_exit_critical
+ * @note  必须与 ring_exit_critical 配对使用。不支持嵌套调用。
+ ******************************************************************************
+ */
 static uint32_t ring_enter_critical(void)
 {
   uint32_t primask = __get_PRIMASK();
@@ -81,6 +89,14 @@ static uint32_t ring_enter_critical(void)
   return primask;
 }
 
+/**
+ ******************************************************************************
+ * @brief  恢复中断至 ring_enter_critical 之前的状态
+ * @param  primask 由 ring_enter_critical 保存的 PRIMASK 值
+ * @return 无
+ * @note  仅在临界区之前中断已启用时才重新启用中断。
+ ******************************************************************************
+ */
 static void ring_exit_critical(uint32_t primask)
 {
   if ((primask & 1U) == 0U)
@@ -89,6 +105,14 @@ static void ring_exit_critical(uint32_t primask)
   }
 }
 
+/**
+ ******************************************************************************
+ * @brief  获取环形缓冲区中当前的样本数
+ * @param  无
+ * @return 缓冲样本数（线程安全）
+ * @note  使用临界区保证原子读取
+ ******************************************************************************
+ */
 static uint16_t ring_get_count(void)
 {
   uint16_t count;
@@ -98,6 +122,14 @@ static uint16_t ring_get_count(void)
   return count;
 }
 
+/**
+ ******************************************************************************
+ * @brief  丢弃环形缓冲区中当前的所有样本
+ * @param  无
+ * @return 被丢弃的样本数
+ * @note  在 flush 完成期间用于原子地丢弃剩余数据
+ ******************************************************************************
+ */
 static uint16_t ring_clear_pending(void)
 {
   uint16_t dropped;
@@ -108,6 +140,15 @@ static uint16_t ring_clear_pending(void)
   ring_exit_critical(primask);
   return dropped;
 }
+/**
+ ******************************************************************************
+ * @brief  从环形缓冲区弹出最多 count 个样本
+ * @param  dst 用于复制样本的目标数组
+ * @param  count 最多弹出的样本数
+ * @return 实际复制的样本数
+ * @note  线程安全；使用临界区。如果缓冲区数据不足，返回值可能小于 count。
+ ******************************************************************************
+ */
 static uint16_t ring_pop(DataLogRawSample_t *dst, uint16_t count)
 {
   uint16_t copied = 0U;
@@ -125,6 +166,15 @@ static uint16_t ring_pop(DataLogRawSample_t *dst, uint16_t count)
   return copied;
 }
 
+/**
+ ******************************************************************************
+ * @brief  根据反压阈值检查环形缓冲区积压
+ * @param  无
+ * @return 如果积压可接受返回 1，如果暂停或过大返回 0
+ * @note  当积压超过 50% 容量时设置 sd_paused。
+ *        当环形缓冲区超过 25% 时阻止 SD 写入。
+ ******************************************************************************
+ */
 /* 检查反压：ring 积压过多 → 不入队，让 FIFO 优先 */
 static uint8_t backlog_ok_for_sd(void)
 {
@@ -142,6 +192,14 @@ static uint8_t backlog_ok_for_sd(void)
   return 1U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  启动或重新启动 SD 二进制日志会话
+ * @param  enforce_backlog_guard 非零则在启动前强制检查积压
+ * @return 成功返回 1，失败返回 0（backoff 待处理、积压已满或 SD 错误）
+ * @note  启动会话后写入文件头。重复失败时进入 BACKOFF 状态。
+ ******************************************************************************
+ */
 /* 启动/重新启动 SD 二进制日志会话。受 backlog_ok_for_sd 门控。 */
 static uint8_t sd_try_start(uint8_t enforce_backlog_guard)
 {
@@ -192,6 +250,15 @@ static uint8_t sd_try_start(uint8_t enforce_backlog_guard)
   return 1U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  从环形缓冲区弹出一个 chunk 并写入 SD 卡
+ * @param  budget_ms 允许的最大写入持续时间（毫秒）
+ * @return 写入的样本数，失败时返回 0
+ * @note  写入失败或超预算时进入 BACKOFF 状态。
+ *        chunk 大小为 DATA_LOG_CHUNK_SAMPLES（32 个样本，512 字节）。
+ ******************************************************************************
+ */
 /*
  * 从环形缓冲 pop 一个 chunk，直接 f_write 写入 SD。
  * 每次 512B @ 12MHz SDIO ≈ 0.3ms，远在预算内。
@@ -243,6 +310,15 @@ static uint16_t sd_write_one_chunk(uint32_t budget_ms)
 
 /* ---- 公共 API ---- */
 
+/**
+ ******************************************************************************
+ * @brief  初始化数据日志模块及其环形缓冲区
+ * @param  无
+ * @return 无
+ * @note  清除所有状态变量并初始化底层 SD 文件层。
+ *        必须在任何其他数据日志 API 之前调用一次。
+ ******************************************************************************
+ */
 void APP_DataLog_Init(void)
 {
   APP_SdFile_Init();
@@ -266,13 +342,25 @@ void APP_DataLog_Init(void)
   flush_deferred_state = FLUSH_STATE_IDLE;
 }
 
+/**
+ ******************************************************************************
+ * @brief  从实时上下文向环形缓冲区推送一个原始样本
+ * @param  tick HAL 滴答计数器值
+ * @param  red  红色 LED 原始读数
+ * @param  ir   红外 LED 原始读数
+ * @param  ecg  ECG 原始读数
+ * @param  flags 样本状态标志
+ * @return 无
+ * @note  O(1) 且中断安全。环形缓冲区满时丢弃最旧样本。
+ ******************************************************************************
+ */
 void APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
                              int16_t ecg, uint8_t flags)
 {
   DataLogRawSample_t *dst;
   uint32_t primask = ring_enter_critical();
 
-  /* Ring full: overwrite the oldest sample. */
+  /* 环形缓冲区满：覆盖最旧样本 */
   if (ring_count >= DATA_LOG_RING_SAMPLES)
   {
     ring_tail = (ring_tail + 1U) % DATA_LOG_RING_SAMPLES;
@@ -292,6 +380,16 @@ void APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
   ring_count++;
   ring_exit_critical(primask);
 }
+/**
+ ******************************************************************************
+ * @brief  在时间预算内服务 SD 写入路径
+ * @param  budget_ms 此服务调用的最大允许时间
+ * @param  max_bytes 最大写入字节数（保留，未使用）
+ * @return 写入的字节数，如果未写入则返回 0
+ * @note  实现 SD 状态机（IDLE, TRY_START, ACTIVE, BACKOFF）。
+ *        当 measurement_active 设置时不会发生物理 SD I/O。
+ ******************************************************************************
+ */
 uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms, uint16_t max_bytes)
 {
   uint16_t chunk_bytes;
@@ -348,6 +446,15 @@ uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms, uint16_t max_bytes)
   }
 }
 
+/**
+ ******************************************************************************
+ * @brief  通知测量会话已停止
+ * @param  无
+ * @return 无
+ * @note  O(1)；仅设置待处理标志。实际的 flush 工作由
+ *        APP_DataLog_ServiceDeferredStop 在安全窗口中完成。
+ ******************************************************************************
+ */
 /*
  * 手指离开时：仅设置延迟 flush 标志 (O(1))。
  * 实际 drain + f_sync + f_close 由 APP_DataLog_ServiceDeferredStop() 在安全窗口分片执行。
@@ -358,6 +465,14 @@ void APP_DataLog_OnMeasurementStop(void)
   flush_deferred_state = FLUSH_STATE_IDLE;
 }
 
+/**
+ ******************************************************************************
+ * @brief  将当前数据日志状态读入状态结构体
+ * @param  status 指向要填充的 DataLogStatus_t 的指针
+ * @return 无
+ * @note  如果 status 为 NULL 则不执行任何操作。返回计数器和状态的快照。
+ ******************************************************************************
+ */
 void APP_DataLog_GetStatus(DataLogStatus_t *status)
 {
   uint16_t buffered;
@@ -374,16 +489,40 @@ void APP_DataLog_GetStatus(DataLogStatus_t *status)
   status->last_write_ms = last_write_ms;
   status->last_backlog  = last_backlog;
 }
+/**
+ ******************************************************************************
+ * @brief  检查 SD 写入会话当前是否活跃
+ * @param  无
+ * @return 活跃时返回 1，否则返回 0
+ ******************************************************************************
+ */
 uint8_t APP_DataLog_IsActive(void)
 {
   return (sd_state == SD_STATE_ACTIVE) ? 1U : 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  设置控制 SD I/O 的测量活跃标志
+ * @param  active 非零表示测量活跃，零允许 SD 写入
+ * @return 无
+ * @note  当活跃时，APP_DataLog_ServiceBudget 不执行物理 SD 写入。
+ ******************************************************************************
+ */
 void APP_DataLog_SetMeasurementActive(uint8_t active)
 {
   measurement_active = active;
 }
 
+/**
+ ******************************************************************************
+ * @brief  服务延迟 flush 状态机（drain, sync, close）
+ * @param  无
+ * @return flush 完全完成时返回 1，仍在进行中时返回 0
+ * @note  实现多周期状态机：IDLE -> DRAINING -> SYNC -> DONE。
+ *        每次调用仅执行一次 I/O 操作以避免长时间阻塞。
+ ******************************************************************************
+ */
 /*
  * 分片延迟 flush 状态机。
  * 每轮只做一个动作（1 chunk f_write 或 1 次 f_sync+f_close），
@@ -484,6 +623,13 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
   }
 }
 
+/**
+ ******************************************************************************
+ * @brief  检查延迟 flush 是否待处理
+ * @param  无
+ * @return 如果 flush 待处理则返回 1，否则返回 0
+ ******************************************************************************
+ */
 uint8_t APP_DataLog_IsFlushPending(void)
 {
   return flush_pending;

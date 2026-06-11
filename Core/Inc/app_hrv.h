@@ -17,9 +17,9 @@
  * - SD1/SD2 x100 为短/长期变异性比值。
  * - rhythm_irregular: 短窗口提示（RMSSD>=120ms 且 SD1/SD2>=0.70），非诊断分类。
  *
- * - Frequency HRV is a short-window LF/HF estimate from 32 beats.
- *   It is not diagnostic and not standard 5-minute frequency HRV.
- * - VLF is not estimated because the 32-beat window is too short.
+ * - 频域 HRV 是基于 32 拍的短窗口 LF/HF 估计。
+ *   非诊断用途，也非标准 5 分钟频域 HRV。
+ * - 未估计 VLF，因为 32 拍窗口过短。
  */
 #ifndef __APP_HRV_H__
 #define __APP_HRV_H__

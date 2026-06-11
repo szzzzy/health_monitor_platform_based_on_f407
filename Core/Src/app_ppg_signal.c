@@ -35,7 +35,14 @@ static struct
 /* 慢跟随辅助函数：当前值以 1/2^shift 速率向目标值衰减 */
 static uint32_t app_ppg_signal_slow_follow_u32(uint32_t current, uint32_t target, uint8_t shift);
 
-/* 初始化自适应手指检测阈值为默认值 */
+/**
+ ******************************************************************************
+ * @brief  将自适应手指检测阈值初始化为默认值。
+ * @param  app AppState 指针（可为 NULL）。
+ * @note   启动时调用一次。将 adaptive_finger_on_delta 和
+ *         adaptive_finger_off_delta 设置为其编译时默认值。
+ ******************************************************************************
+ */
 void app_ppg_signal_init_state(AppState_t *app)
 {
   if (app == NULL)
@@ -47,23 +54,26 @@ void app_ppg_signal_init_state(AppState_t *app)
   app->adaptive_finger_off_delta = MAX30102_FINGER_OFF_DELTA;
 }
 
-/* 重置信号包络（手指状态切换时调用） */
+/**
+ ******************************************************************************
+ * @brief  将 IR/RED 信号包络跟踪器重置为零。
+ * @note   手指状态变化（放入/移除）时调用。清除所有
+ *         高/低包络值，以便在下一个样本上重新获取。
+ ******************************************************************************
+ */
 void app_ppg_signal_reset_envelope(void)
 {
   (void)memset(&signal_envelope, 0, sizeof(signal_envelope));
 }
 
-/*
- * 更新信号包络与活动指标
- *
- * 包络追踪策略：
- *   - 新样本突破当前包络 → 立即跟随（快速上升/下降）
- *   - 新样本在包络范围内 → 慢速向当前值衰减 (1/16 每拍)
- *
- * 输出字段：
- *   ir_signal_delta  = IR - 基线 (当前偏移量)
- *   ir_signal_span   = IR 包络峰谷差 (反映搏动幅度)
- *   red_signal_span  = RED 包络峰谷差
+/**
+ ******************************************************************************
+ * @brief  跟踪 IR/RED 信号包络并计算活动指标。
+ * @param  app AppState 指针（可为 NULL）。
+ * @note   包络立即跟随强信号，在信号减弱时缓慢衰减（每步 1/16）。
+ *         更新 AppState 中的 ir_signal_delta、ir_signal_span 和
+ *         red_signal_span。
+ ******************************************************************************
  */
 void app_ppg_signal_update_activity(AppState_t *app)
 {
@@ -121,13 +131,14 @@ void app_ppg_signal_update_activity(AppState_t *app)
                          (signal_envelope.red_high - signal_envelope.red_low) : 0U;
 }
 
-/*
- * 基于背景噪声自适应更新手指检测阈值
- *
- * on_delta  = noise × 4  (就位需要更严格的阈值)
- * off_delta = noise × 2  (离开更敏感)
- *
- * 自适应值不低于默认值，不高于上限。
+/**
+ ******************************************************************************
+ * @brief  根据背景噪声更新自适应手指检测阈值。
+ * @param  app      AppState 指针（可为 NULL）。
+ * @param  baseline 提供噪声估计的基线跟踪器指针。
+ * @note   on_delta = noise*4（插入时更严格），off_delta = noise*2
+ *         （移除时更敏感）。钳位于编译时最大值。
+ ******************************************************************************
  */
 void app_ppg_signal_update_adaptive_thresholds(AppState_t *app,
                                                const MAX30102_Baseline_t *baseline)
@@ -171,15 +182,14 @@ void app_ppg_signal_update_adaptive_thresholds(AppState_t *app,
   }
 }
 
-/*
- * 原始 PPG 信号存在性判定
- *
- * 逻辑：
- *   手指就位时使用较低的离开阈值（避免频繁切换）
- *   手指离开时使用较高的就位阈值（防止噪声误触发）
- *   滞回特性提高了状态切换的稳定性。
- *
- * 返回值：1 = 信号存在（IR 偏移超过阈值），0 = 无信号
+/**
+ ******************************************************************************
+ * @brief  检查原始 PPG 信号是否超过自适应阈值存在。
+ * @param  app AppState 指针（只读）。
+ * @return 若 IR 增量超过滞回阈值则返回 1，否则返回 0。
+ * @note   手指已存在时使用较低阈值（off_delta），
+ *         不存在时使用较高阈值（on_delta），提供迟滞。
+ ******************************************************************************
  */
 uint8_t app_ppg_signal_is_raw_present(const AppState_t *app)
 {
@@ -206,7 +216,14 @@ uint8_t app_ppg_signal_is_raw_present(const AppState_t *app)
   return (ir_delta >= finger_delta_threshold) ? 1U : 0U;
 }
 
-/* 将当前 IR 值送入基线跟踪器，更新跟踪基线 */
+/**
+ ******************************************************************************
+ * @brief  将当前 IR 值送入背景基线跟踪器。
+ * @param  app      AppState 指针（可为 NULL）。
+ * @param  baseline 基线跟踪器实例指针。
+ * @note   从跟踪器的输出更新 app->baseline_ir。
+ ******************************************************************************
+ */
 void app_ppg_signal_track_background_ir(AppState_t *app, MAX30102_Baseline_t *baseline)
 {
   if ((app == NULL) || (baseline == NULL))
@@ -218,14 +235,7 @@ void app_ppg_signal_track_background_ir(AppState_t *app, MAX30102_Baseline_t *ba
   app->baseline_ir = max30102_baseline_get_tracked_ir(baseline);
 }
 
-/*
- * 慢跟随函数
- *
- * 当前值以 1/2^shift 速率向目标值趋近。
- * 每拍步长 = |current - target| / 2^shift，最小 1。
- *
- * 用途：包络线在信号减弱时缓慢衰减而非骤降，保持包络的稳定性。
- */
+/* ---- 慢跟随：当前值每步以 1/2^shift 向目标值移动 ---- */
 static uint32_t app_ppg_signal_slow_follow_u32(uint32_t current, uint32_t target, uint8_t shift)
 {
   uint32_t delta;

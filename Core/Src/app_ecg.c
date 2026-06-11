@@ -25,6 +25,11 @@
 #include "adc.h"
 #include <string.h>
 
+#if (APP_ECG_DEBUG_PRINTF != 0U)
+#include <stdio.h>
+#include "usart.h"
+#endif
+
 /* === ECG 采样率 ============================================================ */
 #define APP_ECG_SAMPLE_RATE_HZ      250U
 #define APP_ECG_SAMPLE_PERIOD_MS    4U    /* 1000 / 250 = 4 ms */
@@ -51,6 +56,26 @@
 /* === ADC 饱和检测阈值 ====================================================== */
 #define APP_ECG_ADC_SAT_THRESHOLD   4090U
 
+/* === Visual display filter parameters (OLED only, not used for QRS) ======== */
+/* DC removal: alpha = 1/256, cutoff ≈ 250/(2π·256) ≈ 0.16 Hz — very slow,
+ * keeps baseline stable without distorting ST segment morphology. */
+#define APP_ECG_VISUAL_DC_SHIFT     8U
+/* Low-pass: alpha = 1/4, cutoff ≈ 250/(2π·4) ≈ 10 Hz — smooths noise
+ * while preserving R-peak sharpness. */
+#define APP_ECG_VISUAL_LP_SHIFT     2U
+/* Fixed gain applied after filtering. 3× makes ~200 LSB AC visible on OLED. */
+#define APP_ECG_VISUAL_GAIN         3
+/* Display clamp: keeps visual output within ±1200 to prevent OLED overdraw. */
+#define APP_ECG_VISUAL_CLAMP        1200
+/* Decimation: push 1 sample per 3, 250/3 ≈ 83 px/s, 128px ≈ 1.5 s window. */
+#define APP_ECG_VISUAL_DECIM        3U
+/* Reserved: 50 Hz notch for 250 Hz sample rate. Keep 0 until biquad verified. */
+#define APP_ECG_VISUAL_ENABLE_NOTCH 0U
+
+/* 保持 ECG 波形运行同时观察原始 AD8232 导联脱落引脚。
+ * 在验证 PE5/PE6 接线后设置为 1。 */
+#define APP_ECG_ENABLE_LEAD_OFF_GATE 0U
+
 /* === 内部状态结构 ========================================================== */
 typedef struct
 {
@@ -71,20 +96,144 @@ typedef struct
 
 static AppEcgState_t ecg_state;
 
+/* === OLED 显示滤波 ========================================================= */
+/* 检测链路使用 ecg_state.smooth_value（不变）。
+ * 显示链路额外做 5 点滑动平均 + 慢速振幅跟踪 + 软限幅，
+ * 目的是让 OLED 波形平滑稳定，不被单个 R 峰拉满屏。 */
+typedef struct
+{
+  int32_t buf[5];
+  uint8_t idx;
+  uint8_t count;
+  int32_t amplitude;
+  uint8_t decim;   /* 降采样计数器：每 2 个样本推 1 次，减慢滚动 */
+} EcgDispFilter_t;
+
+static EcgDispFilter_t ecg_disp;
+static uint8_t ecg_debug_disp_decim; /* debug 显示模式独立降采样计数器 */
+
+/* === OLED visual display filter — independent of QRS detection chain ======= */
+/* Output only goes to app_display_add_ecg_sample(). Never feeds back into
+ * ecg_state or app->ecg_filtered. Reset on lead-off, DMA overflow, etc. */
+typedef struct
+{
+  int32_t dc;        /* slow DC tracking for baseline wander removal */
+  int32_t lp;        /* low-pass state for high-frequency noise reduction */
+  uint8_t decim;     /* independent decimation counter */
+} EcgVisualFilter_t;
+
+static EcgVisualFilter_t ecg_visual;
+
+/* === ECG 调试统计 ========================================================== */
+typedef struct
+{
+  uint16_t raw_min;
+  uint16_t raw_max;
+  int16_t  filt_min;
+  int16_t  filt_max;
+  uint16_t sample_cnt;   /* 当前统计窗口内已累计样本数 */
+} EcgDebugStats_t;
+
+static EcgDebugStats_t ecg_dbg_stats;
+
+#if (APP_ECG_DEBUG_PRINTF != 0U)
+static void app_ecg_debug_print_stats(const EcgDebugStats_t *s,
+                                      const AppState_t *app)
+{
+  char line[96];
+  int len;
+
+  if ((s == NULL) || (app == NULL)) return;
+
+  len = snprintf(line, sizeof(line),
+                 "ECGDBG raw_min=%u raw_max=%u raw_diff=%u"
+                 " filt_min=%d filt_max=%d lead=0x%02X hr=%u rr=%u\r\n",
+                 (unsigned int)s->raw_min,
+                 (unsigned int)s->raw_max,
+                 (unsigned int)(s->raw_max - s->raw_min),
+                 (int)s->filt_min,
+                 (int)s->filt_max,
+                 (unsigned int)app_ecg_read_lead_off_raw(),
+                 (unsigned int)app->ecg_hr,
+                 (unsigned int)app->ecg_rr_ms);
+
+  if ((len > 0) && ((size_t)len < sizeof(line)))
+  {
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)line, (uint16_t)len, 100U);
+  }
+}
+#endif /* APP_ECG_DEBUG_PRINTF */
+
+/* ---- ECG 调试快照 getter（供 OLED D8 页面使用） ---- */
+void app_ecg_get_debug_snapshot(const AppState_t *app,
+                                AppEcgDebugSnapshot_t *out)
+{
+  if (out == NULL) return;
+
+  (void)memset(out, 0, sizeof(*out));
+
+  out->raw_min  = ecg_dbg_stats.raw_min;
+  out->raw_max  = ecg_dbg_stats.raw_max;
+  out->filt_min = ecg_dbg_stats.filt_min;
+  out->filt_max = ecg_dbg_stats.filt_max;
+  out->lead_raw = app_ecg_read_lead_off_raw();
+
+  if (app != NULL)
+  {
+    out->ecg_valid               = app->ecg_valid;
+    out->ecg_hr                  = app->ecg_hr;
+    out->ecg_rr_ms              = app->ecg_rr_ms;
+    out->sample_count           = app->ecg_sample_count;
+    out->dma_overflow_count     = app->ecg_dma_overflow_count;
+    out->adc_sat_count          = app->ecg_adc_sat_count;
+    out->lead_off_count         = app->ecg_lead_off_count;
+    out->no_r_peak_timeout_count = app->ecg_no_r_peak_timeout_count;
+
+    /* PPG fields from existing MAX30102/PPG BPM pipeline.
+     * ppg_bpm > 0 is used as secondary validity guard in case bpm_valid
+     * is set but the value was never populated with a real measurement. */
+    out->ppg_bpm   = app->bpm_value;
+    out->ppg_valid = app->bpm_valid;
+
+    if ((out->ecg_valid != 0U) && (out->ppg_valid != 0U)
+        && (out->ecg_hr > 0U) && (out->ppg_bpm > 0U))
+    {
+      out->hr_diff = (int16_t)out->ecg_hr - (int16_t)out->ppg_bpm;
+    }
+    else
+    {
+      out->hr_diff = 0;
+    }
+  }
+}
+
 /* === 前向声明 ============================================================== */
 static void     app_ecg_reset_detector(void);
+static void     app_ecg_reset_display_filter(void);
+static void     app_ecg_reset_visual_filter(void);
+static void     app_ecg_reset_debug_stats(void);
+static void     app_ecg_debug_update_raw(uint16_t raw_value,
+                                         const AppState_t *app);
+static void     app_ecg_debug_update_filtered(int16_t filtered_value);
 static uint32_t app_ecg_abs_i32(int32_t v);
 static int16_t  app_ecg_clamp_i16(int32_t v);
 static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
                                              int32_t filtered,
                                              uint32_t timestamp_ms);
 
-/* ========================================================================== */
-/*  ECG 模块重置                                                               */
-/* ========================================================================== */
+/**
+ ******************************************************************************
+ * @brief  重置 ECG 模块：检测器、AppState 字段、PTT、显示波形。
+ * @param  app AppState 指针（可为 NULL）。
+ * @note   清除 ecg_raw、ecg_filtered、lead_off、valid、HR、RR、R 峰
+ *         时间戳、PTT 字段，并重置 QRS 检测器状态机。
+ ******************************************************************************
+ */
 void app_ecg_reset(AppState_t *app)
 {
   app_ecg_reset_detector();
+  app_ecg_reset_display_filter();
+  app_ecg_reset_debug_stats();
   if (app == NULL) return;
 
   app->ecg_raw       = 0U;
@@ -100,11 +249,31 @@ void app_ecg_reset(AppState_t *app)
   app_display_reset_ecg_waveform();
 }
 
-/* ========================================================================== */
-/*  读取 AD8232 LO- / LO+ 引脚电平 → 导联脱落掩码                                */
-/*  LO- → PE5, LO+ → PE6                                                        */
-/* ========================================================================== */
+/**
+ ******************************************************************************
+ * @brief  读取 AD8232 导联脱落引脚（LO- = PE5，LO+ = PE6）。
+ * @return APP_ECG_LEAD_OFF_MINUS (0x01 = 红色电极) 和/或
+ *         APP_ECG_LEAD_OFF_PLUS (0x02 = 绿色电极) 的位掩码。置位表示
+ *         该电极已断开或接触不良。
+ * @note   仅红色 (LO-) 和绿色 (LO+) 电极可检测。
+ *         黄色 RL/RLD 参考电极不经过 AD8232 LO 引脚，
+ *         因此移除它不会改变返回值。
+ *         这是预期的硬件行为，非软件错误。
+ ******************************************************************************
+ */
 uint8_t app_ecg_read_lead_off(void)
+{
+  uint8_t lead_off = app_ecg_read_lead_off_raw();
+
+#if (APP_ECG_ENABLE_LEAD_OFF_GATE != 0U)
+  return lead_off;
+#else
+  (void)lead_off;
+  return 0U;
+#endif
+}
+
+uint8_t app_ecg_read_lead_off_raw(void)
 {
   uint8_t lead_off = 0U;
 
@@ -119,12 +288,18 @@ uint8_t app_ecg_read_lead_off(void)
   return lead_off;
 }
 
-/* ========================================================================== */
-/*  主入口：消费 DMA 缓冲中全部待处理样本                                         */
-/*                                                                             */
-/*  每个样本获得独立的推算时间戳（4 ms 间隔），解决批量消费时时间戳相同的问题。     */
-/*  发生 DMA 覆盖时丢弃已损样本、重置检测器、清除 ecg_valid/ptt_valid。           */
-/* ========================================================================== */
+/**
+ ******************************************************************************
+ * @brief  处理来自 DMA 环形缓冲的所有可用 ECG 样本。
+ * @param  app AppState 指针。
+ * @return 若该批次至少检测到一个 R 峰则返回 1，否则返回 0。
+ * @note   每个样本获得独立的 4 ms 插值时间戳。
+ *         DMA 溢出导致检测器重置并清除 ecg_valid/ptt_valid。
+ *         流水线：导联脱落检查 -> ADC 饱和 -> DC 消除 ->
+ *         低通平滑 -> QRS 状态机。即使无新样本到达也检查
+ *         R 峰超时（APP_ECG_STALE_MS）。
+ ******************************************************************************
+ */
 uint8_t app_ecg_process_samples(AppState_t *app)
 {
   uint16_t raw_value;
@@ -152,6 +327,8 @@ uint8_t app_ecg_process_samples(AppState_t *app)
     /* 丢弃已被覆盖的旧样本已在 adc.c read_sample 中处理，
      * 这里仅重置检测器状态和 ECG/PTT 输出 */
     app_ecg_reset_detector();
+    app_ecg_reset_display_filter();
+    app_ecg_reset_debug_stats();
     app->ecg_valid = 0U;
     app->ecg_hr = 0U;
     app->ecg_rr_ms = 0U;
@@ -185,6 +362,8 @@ uint8_t app_ecg_process_samples(AppState_t *app)
       if ((lead_off != 0U) && (app->ecg_lead_off == 0U))
       {
         app_display_reset_ecg_waveform();
+        app_ecg_reset_display_filter();
+        app_ecg_reset_debug_stats();
       }
       app->ecg_lead_off = lead_off;
       if (lead_off != 0U)
@@ -204,7 +383,10 @@ uint8_t app_ecg_process_samples(AppState_t *app)
 
       app->ecg_raw = raw_value;
 
-      /* 2. ADC 饱和检测 — 饱和样本不可用于 QRS 检测 */
+      /* 2a. 调试统计 — raw min/max 在饱和检测之前，以观察 4095 附近饱和样本 */
+      app_ecg_debug_update_raw(raw_value, app);
+
+      /* 2b. ADC 饱和检测 — 饱和样本不可用于 QRS 检测 */
       if (raw_value >= APP_ECG_ADC_SAT_THRESHOLD)
       {
         app->ecg_adc_sat_count++;
@@ -228,10 +410,98 @@ uint8_t app_ecg_process_samples(AppState_t *app)
       ecg_state.dc_estimate += (delta / (int32_t)(1UL << APP_ECG_DC_SHIFT));
       ac_value = raw_i32 - ecg_state.dc_estimate;
 
-      /* 5. 滑动平均平滑 — 一阶低通 */
+      /* 5. 检测用低通平滑 (fc≈13.3 Hz, 不变) */
       ecg_state.smooth_value += ((ac_value - ecg_state.smooth_value) / APP_ECG_SMOOTH_DIV);
       app->ecg_filtered = app_ecg_clamp_i16(ecg_state.smooth_value);
-      app_display_add_ecg_sample(app->ecg_filtered);
+
+      /* 5a. 调试统计 — filtered min/max 在滤波计算完成后更新 */
+      app_ecg_debug_update_filtered(app->ecg_filtered);
+
+      /* 5b. OLED 显示 */
+#if (APP_ECG_DEBUG_DISPLAY_RAW != 0U)
+      {
+        /* Direct raw ADC display: raw - 2048, 3:1 decimation */
+        ecg_debug_disp_decim++;
+        if ((ecg_debug_disp_decim % 3U) == 0U)
+        {
+          app_display_add_ecg_sample(raw_i32 - 2048);
+        }
+      }
+#elif (APP_ECG_DEBUG_DISPLAY_FILTERED != 0U)
+      {
+        /* Direct filtered display: ecg_filtered, 3:1 decimation */
+        ecg_debug_disp_decim++;
+        if ((ecg_debug_disp_decim % 3U) == 0U)
+        {
+          app_display_add_ecg_sample((int32_t)app->ecg_filtered);
+        }
+      }
+#elif (APP_ECG_DEBUG_DISPLAY_VISUAL != 0U)
+      {
+        /* Visual-optimized display filter chain (OLED only, not for QRS):
+         *   raw_i32 -> slow DC removal -> mild LP -> gain -> clamp -> display
+         * Independent of ecg_state / app->ecg_filtered / QRS detection. */
+        int32_t ac, disp;
+
+        /* A. Slow DC removal: fc ~0.16 Hz, baseline-stable, ST-preserving */
+        ecg_visual.dc += (raw_i32 - ecg_visual.dc) >> APP_ECG_VISUAL_DC_SHIFT;
+        ac = raw_i32 - ecg_visual.dc;
+
+        /* B. Mild low-pass: fc ~10 Hz, reduces noise, keeps R-peak sharp */
+        ecg_visual.lp += (ac - ecg_visual.lp) >> APP_ECG_VISUAL_LP_SHIFT;
+
+#if (APP_ECG_VISUAL_ENABLE_NOTCH != 0U)
+        /* Reserved: 50 Hz notch for 250 Hz sample rate — not implemented */
+#endif
+
+        /* C. Fixed gain */
+        disp = ecg_visual.lp * APP_ECG_VISUAL_GAIN;
+
+        /* D. Soft clamp to prevent OLED overdraw */
+        if (disp > APP_ECG_VISUAL_CLAMP)       { disp =  APP_ECG_VISUAL_CLAMP; }
+        else if (disp < -APP_ECG_VISUAL_CLAMP) { disp = -APP_ECG_VISUAL_CLAMP; }
+
+        /* E. Decimation: push 1 per VISUAL_DECIM samples */
+        ecg_visual.decim++;
+        if ((ecg_visual.decim % APP_ECG_VISUAL_DECIM) == 0U)
+        {
+          app_display_add_ecg_sample(disp);
+        }
+      }
+#else
+      /* Original display chain: 5-point MA + slow amplitude tracking
+       * + soft limiting + 3:1 decimation. Preserved as fallback. */
+      {
+        int32_t disp_val, abs_val, limit;
+        uint8_t  k;
+
+        ecg_disp.buf[ecg_disp.idx] = (int32_t)app->ecg_filtered;
+        ecg_disp.idx = (uint8_t)((ecg_disp.idx + 1U) % 5U);
+        if (ecg_disp.count < 5U) { ecg_disp.count++; }
+
+        disp_val = 0;
+        for (k = 0U; k < ecg_disp.count; k++) { disp_val += ecg_disp.buf[k]; }
+        disp_val /= (int32_t)ecg_disp.count;
+
+        abs_val = (disp_val >= 0) ? disp_val : -disp_val;
+        if (ecg_disp.amplitude == 0) { ecg_disp.amplitude = abs_val; }
+        /* Slow EMA: alpha ~1/64, amplitude does not track single spikes */
+        ecg_disp.amplitude += (abs_val - ecg_disp.amplitude) / 64;
+        if (ecg_disp.amplitude < 50) { ecg_disp.amplitude = 50; }
+
+        /* Soft limit: 6x amplitude, keeps R-peak visible, suppresses spikes */
+        limit = ecg_disp.amplitude * 6;
+        if (disp_val > limit)      { disp_val = limit; }
+        else if (disp_val < -limit) { disp_val = -limit; }
+
+        /* 3:1 decimation: 128px ~1.5 s */
+        ecg_disp.decim++;
+        if ((ecg_disp.decim % 3U) == 0U)
+        {
+          app_display_add_ecg_sample(disp_val);
+        }
+      }
+#endif
 
       if (ecg_state.sample_count < 0xFFFFFFFFUL)
       {
@@ -264,23 +534,7 @@ uint8_t app_ecg_process_samples(AppState_t *app)
   return r_peak_found;
 }
 
-/* ========================================================================== */
-/*  QRS 检测状态机（简化 Pan-Tompkins）                                         */
-/*                                                                             */
-/*  空闲态：                                                                     */
-/*    - 持续更新噪声基线（非对称：快升 1/32，慢降 1/16）                          */
-/*    - 幅值 > 动态阈值 且 满足不应期 → 进入候选态                               */
-/*                                                                             */
-/*  候选态：                                                                     */
-/*    - 追踪波群内最大峰值                                                      */
-/*    - 波群结束条件：幅值 < 候选峰值/END_DIV 或 超时                            */
-/*    - 候选峰值 ≥ 阈值 → 确认 R 峰                                             */
-/*                                                                             */
-/*  有效 RR 计算：                                                               */
-/*    - 首个 R 峰只记录时间戳，ecg_valid 保持 0                                  */
-/*    - 至少 2 个满足生理范围的峰才计算 HR/RR 并设 ecg_valid=1                   */
-/*    - PTT 仅在 ecg_valid=1 后允许发布                                         */
-/* ========================================================================== */
+/* ---- 简化 Pan-Tompkins QRS 状态机（单样本迭代） ---- */
 static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
                                              int32_t filtered_value,
                                              uint32_t timestamp_ms)
@@ -418,19 +672,84 @@ static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
   return update;
 }
 
-/* ========================================================================== */
-/*  辅助函数                                                                   */
-/* ========================================================================== */
+/* ---- 清零整个 ECG 检测器状态 ---- */
 static void app_ecg_reset_detector(void)
 {
   (void)memset(&ecg_state, 0, sizeof(ecg_state));
 }
 
+/* ---- 清零 ECG 显示滤波器内部缓冲 ---- */
+static void app_ecg_reset_display_filter(void)
+{
+  (void)memset(&ecg_disp, 0, sizeof(ecg_disp));
+  ecg_debug_disp_decim = 0U;
+  app_ecg_reset_visual_filter();
+}
+
+/* ---- 清零 ECG visual 显示滤波器 ---- */
+static void app_ecg_reset_visual_filter(void)
+{
+  (void)memset(&ecg_visual, 0, sizeof(ecg_visual));
+}
+
+/* ---- 清零 ECG 调试统计窗口 ---- */
+static void app_ecg_reset_debug_stats(void)
+{
+  (void)memset(&ecg_dbg_stats, 0, sizeof(ecg_dbg_stats));
+}
+
+/* ---- 更新 raw ADC 调试统计（在饱和检测之前调用，含饱和样本） ---- */
+static void app_ecg_debug_update_raw(uint16_t raw_value,
+                                     const AppState_t *app)
+{
+  if (ecg_dbg_stats.sample_cnt == 0U)
+  {
+    ecg_dbg_stats.raw_min = raw_value;
+    ecg_dbg_stats.raw_max = raw_value;
+  }
+  else
+  {
+    if (raw_value < ecg_dbg_stats.raw_min)
+      ecg_dbg_stats.raw_min = raw_value;
+    if (raw_value > ecg_dbg_stats.raw_max)
+      ecg_dbg_stats.raw_max = raw_value;
+  }
+  ecg_dbg_stats.sample_cnt++;
+
+#if (APP_ECG_DEBUG_PRINTF != 0U)
+  if (ecg_dbg_stats.sample_cnt >= 250U)
+  {
+    app_ecg_debug_print_stats(&ecg_dbg_stats, app);
+    (void)memset(&ecg_dbg_stats, 0, sizeof(ecg_dbg_stats));
+  }
+#endif
+}
+
+/* ---- 更新 filtered ECG 调试统计（仅在滤波计算完成后调用） ---- */
+static void app_ecg_debug_update_filtered(int16_t filtered_value)
+{
+  /* 复位后 filt_min == filt_max == 0 表示首个样本 */
+  if (ecg_dbg_stats.filt_min == 0 && ecg_dbg_stats.filt_max == 0)
+  {
+    ecg_dbg_stats.filt_min = filtered_value;
+    ecg_dbg_stats.filt_max = filtered_value;
+  }
+  else
+  {
+    if (filtered_value < ecg_dbg_stats.filt_min)
+      ecg_dbg_stats.filt_min = filtered_value;
+    if (filtered_value > ecg_dbg_stats.filt_max)
+      ecg_dbg_stats.filt_max = filtered_value;
+  }
+}
+
+/* ---- 32 位有符号绝对值 ---- */
 static uint32_t app_ecg_abs_i32(int32_t v)
 {
   return (v < 0) ? (uint32_t)(-v) : (uint32_t)v;
 }
 
+/* ---- 将 int32 钳位到 int16 范围 ---- */
 static int16_t app_ecg_clamp_i16(int32_t v)
 {
   if (v > 32767L)  return 32767;

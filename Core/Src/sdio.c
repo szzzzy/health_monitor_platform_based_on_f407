@@ -1,8 +1,17 @@
 /**
   ******************************************************************************
   * @file    sdio.c
-  * @brief   This file provides code for the configuration
-  *          of the SDIO instances.
+  * @brief   SDIO peripheral initialization and GPIO MSP configuration.
+  *
+  * MX_SDIO_SD_Init() is kept as a CubeMX-compatible safe placeholder that
+  * only populates the hsd handle fields.  The real SD-card initialisation is
+  * deferred to APP_SD_Card_Init() (lazy-start path), so a missing or bad
+  * card does not block the boot sequence (OLED / MAX30102 / RTC / RTOS).
+  *
+  * HAL_SD_MspInit() configures the SDIO GPIO pins:
+  *   PC8-PC11 (DAT0-DAT3) : AF12, PULLUP  — 4-bit data lines, idle-high
+  *   PC12     (CLK)        : AF12, NOPULL  — clock, 100R series on PCB
+  *   PD2      (CMD)        : AF12, PULLUP  — command/response, idle-high
   ******************************************************************************
   * @attention
   *
@@ -28,6 +37,13 @@ SD_HandleTypeDef hsd;
 
 /* SDIO init function */
 
+/**
+ * @brief  CubeMX-compatible SDIO placeholder — handle fields only, no HW access.
+ * @note   The application owns card bring-up through APP_SD_Card_Init()
+ *         (lazy-start via APP_DataLog_ServiceBudget → f_mount → disk_initialize).
+ *         This function must NOT call HAL_SD_Init() or HAL_SD_ConfigWideBus-
+ *         Operation(), so boot can proceed when no SD card is inserted.
+ */
 void MX_SDIO_SD_Init(void)
 {
 
@@ -60,6 +76,13 @@ void MX_SDIO_SD_Init(void)
 
 }
 
+/**
+ * @brief  SDIO MSP Initialization — GPIO pin configuration.
+ * @param  sdHandle SD handle (must have Instance == SDIO).
+ * @note   Enables SDIO, GPIOC, and GPIOD clocks.  Configures DAT0-DAT3 and CMD
+ *         with internal pull-ups to prevent floating inputs in 4-bit mode;
+ *         CLK is left NOPULL (board has a 100R series resistor).
+ */
 void HAL_SD_MspInit(SD_HandleTypeDef* sdHandle)
 {
 
@@ -75,14 +98,14 @@ void HAL_SD_MspInit(SD_HandleTypeDef* sdHandle)
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOD_CLK_ENABLE();
     /**SDIO GPIO Configuration
-    PC8     ------> SDIO_D0
-    PC9     ------> SDIO_D1
-    PC10     ------> SDIO_D2
-    PC11     ------> SDIO_D3
-    PC12     ------> SDIO_CK
-    PD2     ------> SDIO_CMD
+    PC8     ------> SDIO_D0   (PULLUP)
+    PC9     ------> SDIO_D1   (PULLUP)
+    PC10    ------> SDIO_D2   (PULLUP)
+    PC11    ------> SDIO_D3   (PULLUP)
+    PC12    ------> SDIO_CK   (NOPULL — clock, 100R series on PCB)
+    PD2     ------> SDIO_CMD  (PULLUP)
     */
-    /* D0-D3: 数据线上拉 */
+    /* D0-D3: data lines with internal pull-up for 4-bit idle state */
     GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -90,12 +113,12 @@ void HAL_SD_MspInit(SD_HandleTypeDef* sdHandle)
     GPIO_InitStruct.Alternate = GPIO_AF12_SDIO;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* CLK: 独立 NOPULL */
+    /* CLK: separate NOPULL — pull-up would distort the clock edge */
     GPIO_InitStruct.Pin = GPIO_PIN_12;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-    /* CMD: 上拉 */
+    /* CMD: internal pull-up for idle-high command line */
     GPIO_InitStruct.Pin = GPIO_PIN_2;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -109,6 +132,12 @@ void HAL_SD_MspInit(SD_HandleTypeDef* sdHandle)
   }
 }
 
+/**
+ * @brief  SDIO MSP De-Initialization — disable clock and de-init GPIO pins.
+ * @param  sdHandle SD handle (must have Instance == SDIO).
+ * @note   Disables the SDIO peripheral clock and de-initializes all SDIO GPIOs
+ *         (PC8-PC12, PD2).
+ */
 void HAL_SD_MspDeInit(SD_HandleTypeDef* sdHandle)
 {
 

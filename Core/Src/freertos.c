@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * File Name          : freertos.c
-  * Description        : Code for freertos applications
+  * Description        : FreeRTOS 应用代码
   ******************************************************************************
   * @attention
   *
@@ -35,6 +35,7 @@
 #include "iwdg.h"
 #include "max30102.h"
 #include "app_diag.h"
+#include "tim.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -71,42 +72,42 @@ void app_rtos_mark_ready(void)
   app_rtos_ready = 1U;
 }
 /* USER CODE END Variables */
-/* Definitions for defaultTask */
+/* definition of defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for MAXtask */
+/* definition of MAXtask */
 osThreadId_t MAXtaskHandle;
 const osThreadAttr_t MAXtask_attributes = {
   .name = "MAXtask",
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
-/* Definitions for watchdogtask */
+/* definition of watchdogtask */
 osThreadId_t watchdogtaskHandle;
 const osThreadAttr_t watchdogtask_attributes = {
   .name = "watchdogtask",
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
-/* Definitions for Uitask */
+/* definition of Uitask */
 osThreadId_t UitaskHandle;
 const osThreadAttr_t Uitask_attributes = {
   .name = "Uitask",
   .stack_size = 384 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for SDtask */
+/* definition of SDtask */
 osThreadId_t SDtaskHandle;
 const osThreadAttr_t SDtask_attributes = {
   .name = "SDtask",
   .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
-/* Definitions for i2c1Mutex */
+/* definition of i2c1Mutex */
 osMutexId_t i2c1MutexHandle;
 const osMutexAttr_t i2c1Mutex_attributes = {
   .name = "i2c1Mutex"
@@ -131,21 +132,45 @@ void StartTask05(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
-/* Hook prototypes */
+/* 钩子函数原型 */
 void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName);
 void vApplicationMallocFailedHook(void);
 
 /* USER CODE BEGIN 4 */
+/**
+ ******************************************************************************
+ * @brief  绑定应用程序状态指针以供 RTOS 任务访问。
+ * @param  state 指向全局 AppState 结构体的指针
+ * @return 无。
+ * @note  必须在启动时、任何任务运行之前调用一次。
+ ******************************************************************************
+ */
 void app_rtos_bind_state(AppState_t *state)
 {
   app_rtos_state = state;
 }
 
+/**
+ ******************************************************************************
+ * @brief  获取已绑定的应用程序状态指针。
+ * @param  无。
+ * @return 指向 AppState 结构体的指针，若尚未绑定则返回 NULL。
+ * @note  所有任务通过此函数访问共享的应用程序状态。
+ ******************************************************************************
+ */
 AppState_t *app_rtos_get_state(void)
 {
   return app_rtos_state;
 }
 
+/**
+ ******************************************************************************
+ * @brief  从中断上下文通知 MAX30102 处理任务。
+ * @param  无。
+ * @return 无。
+ * @note  使用 vTaskNotifyGiveFromISR；若尚未初始化则为空操作。
+ ******************************************************************************
+ */
 void app_rtos_notify_max_from_isr(void)
 {
   BaseType_t higher_priority_task_woken = pdFALSE;
@@ -160,6 +185,14 @@ void app_rtos_notify_max_from_isr(void)
   portYIELD_FROM_ISR(higher_priority_task_woken);
 }
 
+/**
+ ******************************************************************************
+ * @brief  带超时地获取 I2C1 总线互斥锁。
+ * @param  timeout_ms 最大等待时间（毫秒）
+ * @return 成功返回 1，超时或句柄为 NULL 返回 0。
+ * @note  序列化 MAX 任务与 UI 任务之间的 I2C 访问。
+ ******************************************************************************
+ */
 static uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms)
 {
   if (i2c1MutexHandle == NULL)
@@ -170,6 +203,14 @@ static uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms)
   return (osMutexAcquire(i2c1MutexHandle, timeout_ms) == osOK) ? 1U : 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  释放 I2C1 总线互斥锁。
+ * @param  无。
+ * @return 无。
+ * @note  句柄为 NULL 时调用安全（空操作）。
+ ******************************************************************************
+ */
 static void app_rtos_i2c_release(void)
 {
   if (i2c1MutexHandle != NULL)
@@ -178,6 +219,14 @@ static void app_rtos_i2c_release(void)
   }
 }
 
+/**
+ ******************************************************************************
+ * @brief  若有待发送的 UART 传感器报告则发送之。
+ * @param  app 指向应用程序状态的指针
+ * @return 无。
+ * @note  检查 report_due 标志；发送后清除。若 app 为 NULL 则为空操作。
+ ******************************************************************************
+ */
 static void app_rtos_send_report_if_due(AppState_t *app)
 {
   if ((app == NULL) || (app->report_due == 0U))
@@ -189,6 +238,14 @@ static void app_rtos_send_report_if_due(AppState_t *app)
   app->report_due = 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  若有刷新请求则刷新 OLED 显示屏。
+ * @param  app 指向应用程序状态的指针
+ * @return 无。
+ * @note  更新 RTC 快照和显示内容；重置刷新标志和 FIFO 高水位线。
+ ******************************************************************************
+ */
 static void app_rtos_refresh_display_if_needed(AppState_t *app)
 {
   if ((app == NULL) || (app->display_refresh_requested == 0U))
@@ -204,6 +261,14 @@ static void app_rtos_refresh_display_if_needed(AppState_t *app)
   app->fifo_high_watermark = 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  将 SD 数据日志状态计数器复制到应用程序状态中。
+ * @param  app 指向应用程序状态的指针
+ * @return 无。
+ * @note  更新缓冲、丢弃、写入、暂停、错误和刷新字段。
+ ******************************************************************************
+ */
 static void app_rtos_update_sd_log_status(AppState_t *app)
 {
   DataLogStatus_t st;
@@ -222,6 +287,14 @@ static void app_rtos_update_sd_log_status(AppState_t *app)
   app->flush_pending = APP_DataLog_IsFlushPending();
 }
 
+/**
+ ******************************************************************************
+ * @brief  检查执行 SD I/O 是否安全。
+ * @param  app 指向应用程序状态的指针
+ * @return 安全返回 1，手指存在或传感器忙返回 0。
+ * @note  手指存在、接触稳定期间或传感器 FIFO 仍包含新样本时阻止 SD I/O。
+ ******************************************************************************
+ */
 static uint8_t app_rtos_sd_service_safe(const AppState_t *app)
 {
   uint32_t now;
@@ -230,12 +303,12 @@ static uint8_t app_rtos_sd_service_safe(const AppState_t *app)
   if (app->finger_present != 0U) { return 0U; }
   if (app->sensor_health != (uint8_t)SENSOR_HEALTH_OK) { return 0U; }
   if (app->contact_settle_samples > 0U) { return 0U; }
-  /* Refuse SD I/O while the raw signal detector sees a finger
-   * (prevent flush/write during the 8-beat confirm window). */
+  /* 原始信号检测器检测到手指时拒绝 SD I/O
+   * （在 8 拍确认窗口期间阻止刷新/写入）。 */
   if (app->raw_signal_present != 0U) { return 0U; }
   if (app->finger_on_confirm_count > 0U) { return 0U; }
-  /* Suspected near-finger: ir_signal_delta at half the on-threshold or above.
-   * Block SD I/O to avoid contention while the finger is approaching. */
+  /* 疑似手指接近：ir_signal_delta 达到开启阈值的一半或以上。
+   * 手指接近时阻止 SD I/O 以避免争用。 */
   if (app->ir_signal_delta >= (app->adaptive_finger_on_delta / 2U)) { return 0U; }
   if (app->sensor_fifo_available_samples >= 4U) { return 0U; }
   if (app->sensor_last_sample_tick == 0UL) { return 0U; }
@@ -249,6 +322,15 @@ static uint8_t app_rtos_sd_service_safe(const AppState_t *app)
   return 1U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  运行 MAX30102 服务周期（心电图、FIFO 排空、看门狗）。
+ * @param  app 指向应用程序状态的指针
+ * @return 无。
+ * @note  从 MAX 任务调用；内部获取 I2C 互斥锁。
+ *        更新阶段跟踪变量以便诊断可见。
+ ******************************************************************************
+ */
 static void app_rtos_service_max(AppState_t *app)
 {
   uint8_t fifo_batch_count = 0U;
@@ -295,19 +377,36 @@ static void app_rtos_service_max(AppState_t *app)
   }
 }
 
+/**
+ ******************************************************************************
+ * @brief  FreeRTOS 栈溢出钩子函数。
+ * @param  xTask 溢出任务的句柄（可能已损坏）
+ * @param  pcTaskName 溢出任务的名称（可能已损坏）
+ * @return 无。
+ * @note  捕获诊断快照，然后进入无限循环，依赖 IWDG 复位系统。
+ ******************************************************************************
+ */
 void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 {
-   /* Record crash before entering undefined-behavior territory.
-    * Stack overflow means the task's TCB may already be corrupted. */
+   /* 在进入未定义行为区域之前记录崩溃。
+    * 栈溢出意味着任务的 TCB 可能已损坏。 */
    (void)xTask;
    (void)pcTaskName;
    APP_Diag_CaptureCrash(DIAG_CRASH_STACKOVF, 0U, 0U);
-   /* No return — fall into HardFault or IWDG reset */
+   /* 不返回 — 陷入 HardFault 或 IWDG 复位 */
    for (;;) {}
 }
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN 5 */
+/**
+ ******************************************************************************
+ * @brief  FreeRTOS malloc 失败钩子函数。
+ * @param  无。
+ * @return 无。
+ * @note  捕获诊断快照，然后进入无限循环，依赖 IWDG 复位系统。
+ ******************************************************************************
+ */
 void vApplicationMallocFailedHook(void)
 {
    APP_Diag_CaptureCrash(DIAG_CRASH_MALLOCFAIL, 0U, 0U);
@@ -316,71 +415,71 @@ void vApplicationMallocFailedHook(void)
 /* USER CODE END 5 */
 
 /**
-  * @brief  FreeRTOS initialization
-  * @param  None
-  * @retval None
+  * @brief  FreeRTOS 初始化
+  * @param  无
+  * @retval 无
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
 
   /* USER CODE END Init */
-  /* Create the mutex(es) */
-  /* creation of i2c1Mutex */
+  /* 创建互斥锁 */
+  /* 创建 i2c1Mutex */
   i2c1MutexHandle = osMutexNew(&i2c1Mutex_attributes);
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
+  /* 添加互斥锁，... */
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
+  /* 添加信号量，... */
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
+  /* 启动定时器，添加新定时器，... */
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  /* 添加队列，... */
   /* USER CODE END RTOS_QUEUES */
 
-  /* Create the thread(s) */
-  /* creation of defaultTask */
+  /* 创建线程 */
+  /* 创建 defaultTask */
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
-  /* creation of MAXtask */
+  /* 创建 MAXtask */
   MAXtaskHandle = osThreadNew(StartTask02, NULL, &MAXtask_attributes);
 
-  /* creation of watchdogtask */
+  /* 创建 watchdogtask */
   watchdogtaskHandle = osThreadNew(StartTask03, NULL, &watchdogtask_attributes);
 
-  /* creation of Uitask */
+  /* 创建 Uitask */
   UitaskHandle = osThreadNew(StartTask04, NULL, &Uitask_attributes);
 
-  /* creation of SDtask */
+  /* 创建 SDtask */
   SDtaskHandle = osThreadNew(StartTask05, NULL, &SDtask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  /* 添加线程，... */
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
-  /* add events, ... */
+  /* 添加事件，... */
   /* USER CODE END RTOS_EVENTS */
 
 }
 
 /* USER CODE BEGIN Header_StartDefaultTask */
 /**
-  * @brief  Function implementing the defaultTask thread.
-  * @param  argument: Not used
-  * @retval None
+  * @brief  实现 defaultTask 线程的函数。
+  * @param  argument: 未使用
+  * @retval 无
   */
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-  /* Infinite loop */
+  /* 无限循环 */
   for(;;)
   {
     osDelay(1000);
@@ -390,15 +489,20 @@ void StartDefaultTask(void *argument)
 
 /* USER CODE BEGIN Header_StartTask02 */
 /**
-* @brief Function implementing the MAXtask thread.
-* @param argument: Not used
-* @retval None
+* @brief 实现 MAXtask 线程的函数。
+* @param argument: 未使用
+* @retval 无
 */
 /* USER CODE END Header_StartTask02 */
 void StartTask02(void *argument)
 {
   /* USER CODE BEGIN StartTask02 */
-  /* Infinite loop */
+  static uint8_t  first_run       = 1U;
+  static uint32_t last_wake_tick  = 0U;
+  uint32_t now_tick;
+  uint32_t gap_ms;
+  uint32_t notified;
+  /* 无限循环 */
   for(;;)
   {
     if (app_rtos_state == NULL)
@@ -407,9 +511,37 @@ void StartTask02(void *argument)
       continue;
     }
 
+    /* 调度器已启动，首次执行时闭合 TIM6 100 Hz 调度闭环。
+     * 必须在这里而非 MX_FREERTOS_Init() 中启动 TIM6，
+     * 否则 ISR 可能在 osKernelStart() 之前触发并调用 FreeRTOS API。 */
+    if (first_run != 0U)
+    {
+      first_run = 0U;
+      app_rtos_mark_ready();
+      HAL_TIM_Base_Start_IT(&htim6);
+    }
+
     app_rtos_state->max_task_phase = PHASE_MAX_NOTIFY_WAIT;
-    (void)ulTaskNotifyTake(pdTRUE,
-                           pdMS_TO_TICKS(APP_RTOS_MAX_NOTIFY_TIMEOUT_MS));
+    notified = ulTaskNotifyTake(pdTRUE,
+                                pdMS_TO_TICKS(APP_RTOS_MAX_NOTIFY_TIMEOUT_MS));
+
+    /* 调度可观测性：记录超时唤醒和最大唤醒间隔 */
+    if (notified == 0U)
+    {
+      app_rtos_state->max_task_timeout_count++;
+    }
+
+    now_tick = xTaskGetTickCount();
+    if (last_wake_tick != 0U)
+    {
+      gap_ms = (now_tick - last_wake_tick) * (uint32_t)portTICK_PERIOD_MS;
+      if (gap_ms > app_rtos_state->max_task_gap_ms)
+      {
+        app_rtos_state->max_task_gap_ms = gap_ms;
+      }
+    }
+    last_wake_tick = now_tick;
+
     app_rtos_service_max(app_rtos_state);
     app_rtos_state->max_task_phase = PHASE_MAX_HEARTBEAT;
     app_rtos_state->max_task_heartbeat++;
@@ -419,15 +551,15 @@ void StartTask02(void *argument)
 
 /* USER CODE BEGIN Header_StartTask03 */
 /**
-* @brief Function implementing the watchdogtask thread.
-* @param argument: Not used
-* @retval None
+* @brief 实现 watchdogtask 线程的函数。
+* @param argument: 未使用
+* @retval 无
 */
 /* USER CODE END Header_StartTask03 */
 void StartTask03(void *argument)
 {
   /* USER CODE BEGIN StartTask03 */
-  /* Infinite loop */
+  /* 无限循环 */
   for(;;)
   {
     static uint8_t liveness_div = 0U;
@@ -437,7 +569,7 @@ void StartTask03(void *argument)
     }
     APP_Watchdog_Refresh();
 
-    /* 每 20 轮 (~1s) 保存一次活体快照到 BKP */
+    /* 每 20 拍 (~1s) 保存一次活体快照到 BKP */
     liveness_div++;
     if ((app_rtos_state != NULL) && (liveness_div >= 20U))
     {
@@ -455,9 +587,9 @@ void StartTask03(void *argument)
 
 /* USER CODE BEGIN Header_StartTask04 */
 /**
-* @brief Function implementing the Uitask thread.
-* @param argument: Not used
-* @retval None
+* @brief 实现 Uitask 线程的函数。
+* @param argument: 未使用
+* @retval 无
 */
 /* USER CODE END Header_StartTask04 */
 void StartTask04(void *argument)
@@ -466,7 +598,7 @@ void StartTask04(void *argument)
   uint32_t last_display_tick = 0U;
   uint32_t last_skip_tick = 0U;
 
-  /* Infinite loop */
+  /* 无限循环 */
   for(;;)
   {
     uint32_t now;
@@ -541,7 +673,7 @@ void StartTask04(void *argument)
     app_rtos_state->ui_task_phase = PHASE_UI_REPORT_SEND;
     app_rtos_send_report_if_due(app_rtos_state);
 
-    /* 每 20 轮 (~400ms) 采集一次栈水印 */
+    /* 每 20 拍 (~400ms) 采集一次栈水印 */
     {
       static uint8_t hwm_div = 0U;
       hwm_div++;
@@ -554,7 +686,7 @@ void StartTask04(void *argument)
         app_rtos_state->ui_task_stack_hwm  = hwm_u;
         app_rtos_state->sd_task_stack_hwm  = hwm_s;
         app_rtos_state->wdt_task_stack_hwm = hwm_w;
-        /* 持久化到 BKP — 最小剩余超过 0 则写入，否则保留上次值 */
+        /* 持久化到 BKP ：若最小剩余超过 0 则写入，否则保留上次值 */
         if ((hwm_m > 0U) || (hwm_u > 0U) || (hwm_s > 0U) || (hwm_w > 0U))
         {
           APP_Diag_SaveStackHWMBkp(&hwm_m, &hwm_u, &hwm_s, &hwm_w);
@@ -570,15 +702,15 @@ void StartTask04(void *argument)
 
 /* USER CODE BEGIN Header_StartTask05 */
 /**
-* @brief Function implementing the SDtask thread.
-* @param argument: Not used
-* @retval None
+* @brief 实现 SDtask 线程的函数。
+* @param argument: 未使用
+* @retval 无
 */
 /* USER CODE END Header_StartTask05 */
 void StartTask05(void *argument)
 {
   /* USER CODE BEGIN StartTask05 */
-  /* Infinite loop */
+  /* 无限循环 */
   for(;;)
   {
     if (app_rtos_state == NULL)
@@ -616,7 +748,7 @@ void StartTask05(void *argument)
   /* USER CODE END StartTask05 */
 }
 
-/* Private application code --------------------------------------------------*/
+/* 私有应用程序代码 --------------------------------------------------*/
 /* USER CODE BEGIN Application */
 
 /* USER CODE END Application */

@@ -80,7 +80,7 @@ void HAL_MspInit(void)
 }
 
 /* USER CODE BEGIN 1 */
-/* HAL_SD_MspInit / HAL_SD_MspDeInit are implemented in sdio.c â€? keep
+/* HAL_SD_MspInit / HAL_SD_MspDeInit are implemented in sdio.c â€” keep
  * only one definition to avoid linker multiply-defined errors. */
 
 /* USER CODE END 1 */

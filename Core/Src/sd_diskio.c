@@ -25,6 +25,13 @@ static volatile DSTATUS disk_status_flags = STA_NOINIT;
 /*  FatFs 磁盘 I/O 接口                                                       */
 /* -------------------------------------------------------------------------- */
 
+/**
+ ******************************************************************************
+ * @brief  FatFs disk_initialize：通过 app_sd_card 初始化 SD 卡。
+ * @param  pdrv 物理驱动器号（必须为 0）。
+ * @return 成功返回 0，失败或无效驱动器返回 STA_NOINIT。
+ ******************************************************************************
+ */
 DSTATUS disk_initialize(BYTE pdrv)
 {
     AppSdCardStatus_t ret;
@@ -46,6 +53,13 @@ DSTATUS disk_initialize(BYTE pdrv)
     return STA_NOINIT;
 }
 
+/**
+ ******************************************************************************
+ * @brief  FatFs disk_status：返回当前磁盘状态标志。
+ * @param  pdrv 物理驱动器号（必须为 0）。
+ * @return 当前 DSTATUS 标志（0 = 正常，STA_NOINIT = 未就绪）。
+ ******************************************************************************
+ */
 DSTATUS disk_status(BYTE pdrv)
 {
     if (pdrv != 0)
@@ -55,6 +69,17 @@ DSTATUS disk_status(BYTE pdrv)
     return disk_status_flags;
 }
 
+/**
+ ******************************************************************************
+ * @brief  FatFs disk_read：从 SD 卡读取一个或多个扇区。
+ * @param  pdrv   物理驱动器号（必须为 0）。
+ * @param  buff   目标缓冲（BYTE *）。
+ * @param  sector 起始扇区 LBA。
+ * @param  count  要读取的扇区数。
+ * @return 成功返回 RES_OK，失败返回 RES_ERROR 或 RES_NOTRDY / RES_PARERR。
+ * @note   失败时设置 STA_NOINIT，导致后续 FatFs 调用立即返回 RES_NOTRDY。
+ ******************************************************************************
+ */
 DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
 {
     AppSdCardStatus_t ret;
@@ -85,6 +110,17 @@ DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
     return RES_ERROR;
 }
 
+/**
+ ******************************************************************************
+ * @brief  FatFs disk_write：向 SD 卡写入一个或多个扇区。
+ * @param  pdrv   物理驱动器号（必须为 0）。
+ * @param  buff   源数据缓冲。
+ * @param  sector 起始扇区 LBA。
+ * @param  count  要写入的扇区数。
+ * @return 成功返回 RES_OK，失败返回 RES_ERROR 或 RES_NOTRDY / RES_PARERR。
+ * @note   阻塞调用——返回时数据已在卡上。失败时设置 STA_NOINIT。
+ ******************************************************************************
+ */
 DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
 {
     AppSdCardStatus_t ret;
@@ -115,20 +151,30 @@ DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
     return RES_ERROR;
 }
 
-/*
- * 显式标记磁盘不可用。
- *
- * APP_SD_Card_Deinit() 只在 app_sd_card 层重置 card_initialized，
- * FatFs 层的 disk_status_flags 不会自动同步。此函数由错误恢复路径
- *（close_session_after_error / StopSession）调用，确保 FatFs 感知
- * 到卡已断开，后续 disk_read/disk_write 在 STA_NOINIT 检查时快速返回
- * RES_NOTRDY，不再尝试 HAL_SD I/O，避免在已 Deinit 的卡上二次阻塞。
+/**
+ ******************************************************************************
+ * @brief  将磁盘标记为不可用，使 FatFs 返回 RES_NOTRDY。
+ * @note   APP_SD_Card_Deinit() 后，app_sd_card 层重置其自身的初始化标志，
+ *         但这不会传播到 FatFs 的 disk_status_flags。
+ *         sd_diskio_invalidate() 填补这个空隙，使后续 disk_read / disk_write
+ *         跳过已反初始化卡的 HAL_SD I/O，避免二次阻塞调用。
+ ******************************************************************************
  */
 void sd_diskio_invalidate(void)
 {
     disk_status_flags |= STA_NOINIT;
 }
 
+/**
+ ******************************************************************************
+ * @brief  FatFs disk_ioctl：设备控制命令（CTRL_SYNC、扇区数、
+ *         扇区大小、块大小）。
+ * @param  pdrv 物理驱动器号（必须为 0）。
+ * @param  cmd  命令标识符。
+ * @param  buff 命令特定数据缓冲。
+ * @return RES_OK、RES_ERROR 或 RES_PARERR。
+ ******************************************************************************
+ */
 DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
 {
     uint32_t blk_cnt;
@@ -179,6 +225,14 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
 /* 前置声明来自 rtc.h */
 #include "rtc.h"
 
+/**
+ ******************************************************************************
+ * @brief  FatFs get_fattime：返回 FAT 格式的当前时间戳。
+ * @return 包含位字段的 DWORD：年、月、日、时、分、秒/2。
+ * @note   通过 APP_RTC_GetDateTime 读取 RTC。若 RTC 读取失败，
+ *         回退到 2026-01-01 00:01:02。
+ ******************************************************************************
+ */
 DWORD get_fattime(void)
 {
     APP_RTC_DateTime_t dt;

@@ -62,8 +62,27 @@
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* 推断故障时正在运行的任务及其阶段码。
- * 优先级顺序：MAX > UI > WDT > SD (匹配 FreeRTOS 优先级高低) */
+/* ---- Infer likely culprit task ID and phase from AppState ----
+ *
+ * Crash recording strategy:
+ *   Fault handlers (HardFault, NMI, MemManage, BusFault, UsageFault) run in
+ *   exception context where most FreeRTOS/HAL APIs are unsafe.  To capture
+ *   diagnostics without calling any OS function, the system relies on a
+ *   "liveness snapshot" that the watchdog task periodically writes to RTC
+ *   backup registers (see app_diag.c).  When a fault fires, each handler
+ *   calls fault_get_task_phase() to read the most recently-saved task phases
+ *   from AppState, then passes the result to APP_Diag_CaptureCrash() which
+ *   persists the crash record to BKP SRAM using only direct register writes.
+ *
+ *   This function scans AppState phase fields in priority order
+ *   (MAX > UI > WDT > SD, matching FreeRTOS task priorities).  The first
+ *   task whose phase is not its IDLE value is considered the most likely
+ *   culprit.  If all tasks appear idle, task_id 0 (unknown) is returned.
+ *
+ *   This is a best-effort heuristic: a task may have been preempted between
+ *   its last phase update and the fault, yielding a false negative.  The
+ *   liveness snapshot in BKP registers provides additional post-mortem
+ *   context for offline debugging. */
 static void fault_get_task_phase(uint8_t *task_id, uint8_t *phase)
 {
     AppState_t *s = app_rtos_get_state();
@@ -261,11 +280,14 @@ void DMA2_Stream0_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/* ---- DMA1 Stream5: USART2 RX ---- */
 void DMA1_Stream5_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(huart2.hdmarx);
 }
 
+/* ---- USART2: idle-line detection for DMA RX ---- */
 void USART2_IRQHandler(void)
 {
   if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE) != RESET)
@@ -276,30 +298,34 @@ void USART2_IRQHandler(void)
   HAL_UART_IRQHandler(&huart2);
 }
 
+/* ---- DMA1 Stream0: I2C1 RX ---- */
 void DMA1_Stream0_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(hi2c1.hdmarx);
 }
 
+/* ---- DMA1 Stream6: I2C1 TX ---- */
 void DMA1_Stream6_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(hi2c1.hdmatx);
 }
 
+/* ---- I2C1 Event interrupt ---- */
 void I2C1_EV_IRQHandler(void)
 {
   HAL_I2C_EV_IRQHandler(&hi2c1);
 }
 
+/* ---- I2C1 Error interrupt ---- */
 void I2C1_ER_IRQHandler(void)
 {
   HAL_I2C_ER_IRQHandler(&hi2c1);
 }
 
 /* MAX30102 PPG_RDY 中断（PE5 下降沿）
- * �? PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发�?
- * 系统会�?�过 TIM6 节拍兜底轮询�? */
-/* HAL GPIO EXTI 统一回调，按引脚分发 */
+ * 当 PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发。
+ * 系统会通过 TIM6 节拍兜底轮询。 */
+/* ---- HAL GPIO EXTI callback: dispatch by pin (MAX30102 ready) ---- */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 #if (MAX30102_USE_INT_PIN != 0U)
@@ -312,6 +338,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 #endif
 }
 
+/* ---- SDIO global interrupt ---- */
 void SDIO_IRQHandler(void)
 {
   HAL_SD_IRQHandler(APP_SD_Card_GetHandle());

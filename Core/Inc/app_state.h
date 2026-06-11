@@ -41,6 +41,8 @@ typedef enum
   DBG_SUB_D5_ALGO,
   DBG_SUB_D6_SYS,
   DBG_SUB_D7_SD,
+  DBG_SUB_D8_ECG,
+  DBG_SUB_D9_SCHED,
   DBG_SUB_COUNT
 } DebugSubPage_t;
 
@@ -103,6 +105,8 @@ typedef struct
   uint32_t last_ui_skip_tick;        /* 最近一次 OLED 跳过的时间戳 */
   uint32_t max_task_heartbeat;       /* MAXtask 心跳（每轮递增） */
   uint32_t ui_task_heartbeat;        /* UiTask 心跳（每轮递增） */
+  uint32_t max_task_timeout_count;   /* MAXtask ulTaskNotifyTake 返回 0 的次数（超时唤醒） */
+  uint32_t max_task_gap_ms;          /* MAXtask 连续两次唤醒的最大间隔 (ms) */
   uint8_t raw_signal_present;
   uint8_t signal_quality;
   /*
@@ -161,9 +165,9 @@ typedef struct
   uint16_t hrv_sd2_ms;
   uint16_t hrv_sd1_sd2_x100;
   /*
-   * Short-window frequency HRV estimate from the same 32-beat IBI buffer.
-   * hrv_lf_power_x100 / hrv_hf_power_x100 are band powers in ms^2 x100.
-   * hrv_lf_hf_x100 is LF/HF x100. Non-diagnostic trend display only.
+   * 基于同一 32 拍 IBI 缓冲区的短窗口频域 HRV 估计。
+   * hrv_lf_power_x100 / hrv_hf_power_x100 是以 ms^2 x100 为单位的频带功率。
+   * hrv_lf_hf_x100 是 LF/HF x100。仅供非诊断性趋势显示。
    */
   uint8_t hrv_freq_valid;
   uint32_t hrv_lf_power_x100;

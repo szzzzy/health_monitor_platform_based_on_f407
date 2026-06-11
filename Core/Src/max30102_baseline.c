@@ -8,12 +8,11 @@
 #include "max30102_baseline.h"
 #include "max30102_algo_utils.h"
 
-/*
- * 重置背景基线统计结构体。
- * 初始化后：
- * - ir_sum 用于求平均
- * - ir_min / ir_max 用于评估背景稳定性
- * - sample_count 用于判断是否采够目标样本数
+/**
+ * @brief  将基线统计结构重置为初始状态。
+ * @param  baseline 指向要重置的基线结构的指针。
+ * @note   将 ir_sum、ir_min、ir_max、tracked_ir、noise_ir 以及
+ *         sample_count 设置为其默认（零/反转）值。
  */
 void max30102_baseline_reset(MAX30102_Baseline_t *baseline)
 {
@@ -30,9 +29,12 @@ void max30102_baseline_reset(MAX30102_Baseline_t *baseline)
   baseline->sample_count = 0U;
 }
 
-/*
- * 把一个新的 IR 样本纳入背景统计。
- * 该函数只用于"无手指阶段"的背景采样，不用于运行时的实时滤波。
+/**
+ * @brief  将新的 IR 样本纳入背景基线统计。
+ * @param  baseline 指向基线结构的指针。
+ * @param  ir_value 新的 IR 样本值。
+ * @note   用于手指移开时的背景采集，而非实时滤波。
+ *         更新累加和、最小值、最大值和样本计数。
  */
 void max30102_baseline_add_ir(MAX30102_Baseline_t *baseline, uint32_t ir_value)
 {
@@ -56,7 +58,12 @@ void max30102_baseline_add_ir(MAX30102_Baseline_t *baseline, uint32_t ir_value)
   baseline->sample_count++;
 }
 
-/* 判断背景采样是否已经采够目标数量。 */
+/**
+ * @brief  检查背景采样是否已达到目标数量。
+ * @param  baseline       指向基线结构的指针。
+ * @param  target_samples 期望的样本数。
+ * @return 如果 sample_count >= target_samples 则返回 1，否则返回 0。
+ */
 uint8_t max30102_baseline_is_ready(const MAX30102_Baseline_t *baseline, uint16_t target_samples)
 {
   if (baseline == NULL)
@@ -67,7 +74,11 @@ uint8_t max30102_baseline_is_ready(const MAX30102_Baseline_t *baseline, uint16_t
   return (baseline->sample_count >= target_samples) ? 1U : 0U;
 }
 
-/* 计算背景平均 IR。若尚无样本，则返回 0。 */
+/**
+ * @brief  获取背景采样中的平均 IR 值。
+ * @param  baseline 指向基线结构的指针。
+ * @return 平均 IR 值；如果未采集到样本则返回 0。
+ */
 uint32_t max30102_baseline_get_average_ir(const MAX30102_Baseline_t *baseline)
 {
   if ((baseline == NULL) || (baseline->sample_count == 0U))
@@ -78,7 +89,11 @@ uint32_t max30102_baseline_get_average_ir(const MAX30102_Baseline_t *baseline)
   return (baseline->ir_sum / baseline->sample_count);
 }
 
-/* 计算背景阶段的波动范围。若尚无样本，则返回 0。 */
+/**
+ * @brief  获取背景采样期间的 IR 范围（最大值 - 最小值）。
+ * @param  baseline 指向基线结构的指针。
+ * @return 范围值；如果未采集到样本则返回 0。
+ */
 uint32_t max30102_baseline_get_range_ir(const MAX30102_Baseline_t *baseline)
 {
   if ((baseline == NULL) || (baseline->sample_count == 0U))
@@ -89,9 +104,12 @@ uint32_t max30102_baseline_get_range_ir(const MAX30102_Baseline_t *baseline)
   return (baseline->ir_max - baseline->ir_min);
 }
 
-/*
- * 判断背景采样阶段是否足够稳定。
- * 这里使用"最大值 - 最小值"的简单波动范围判断，优点是实现轻量、直观。
+/**
+ * @brief  检查背景噪声是否在可接受的稳定范围内。
+ * @param  baseline     指向基线结构的指针。
+ * @param  stable_range 允许的最大峰峰噪声。
+ * @return 如果 (ir_max - ir_min) <= stable_range 则返回 1，否则返回 0。
+ * @note   使用简单的基于范围的噪声检查，实现轻量化。
  */
 uint8_t max30102_baseline_is_stable(const MAX30102_Baseline_t *baseline, uint32_t stable_range)
 {
@@ -103,9 +121,13 @@ uint8_t max30102_baseline_is_stable(const MAX30102_Baseline_t *baseline, uint32_
   return ((baseline->ir_max - baseline->ir_min) <= stable_range) ? 1U : 0U;
 }
 
-/*
- * 用开机背景采样的结果为运行时基线跟踪器设定初值。
- * tracked_ir 表示当前认为的"无手指背景 IR"，noise_ir 表示背景波动量级。
+/**
+ * @brief  用初始值设定运行时基线跟踪器。
+ * @param  baseline    指向基线结构的指针。
+ * @param  baseline_ir 初始跟踪的背景 IR 值。
+ * @param  noise_ir    初始背景噪声估计值。
+ * @note   在启动时背景采样完成后调用。
+ *         noise_ir 被限制至少为 1，以避免除零错误。
  */
 void max30102_baseline_seed_tracking(MAX30102_Baseline_t *baseline,
                                      uint32_t baseline_ir,
@@ -120,10 +142,13 @@ void max30102_baseline_seed_tracking(MAX30102_Baseline_t *baseline,
   baseline->noise_ir = (noise_ir != 0U) ? noise_ir : 1U;
 }
 
-/*
- * 在"当前确认无手指"的阶段，持续跟踪背景 IR。
- * 这样即使环境光、供电或模块温漂导致背景缓慢变化，基线也能慢慢跟上，
- * 不会一直抱着开机那一次采样结果不放。
+/**
+ * @brief  在确认手指移开后持续跟踪背景 IR。
+ * @param  baseline 指向基线结构的指针。
+ * @param  ir_value 当前 IR 样本值。
+ * @note   使用慢跟踪滤波器：tracked_ir 缓慢跟随（shift=4），
+ *         noise_ir 稍快跟随（shift=3）。这使得基线能够
+ *         随环境变化漂移，而不会对短时突发噪声做出反应。
  */
 void max30102_baseline_track_background(MAX30102_Baseline_t *baseline, uint32_t ir_value)
 {
@@ -163,7 +188,11 @@ void max30102_baseline_track_background(MAX30102_Baseline_t *baseline, uint32_t 
   }
 }
 
-/* 获取运行时动态背景基线。 */
+/**
+ * @brief  获取当前运行时动态背景 IR 基线。
+ * @param  baseline 指向基线结构的指针。
+ * @return 跟踪的 IR 基线；如果尚未跟踪则返回平均 IR。
+ */
 uint32_t max30102_baseline_get_tracked_ir(const MAX30102_Baseline_t *baseline)
 {
   if (baseline == NULL)
@@ -179,7 +208,11 @@ uint32_t max30102_baseline_get_tracked_ir(const MAX30102_Baseline_t *baseline)
   return max30102_baseline_get_average_ir(baseline);
 }
 
-/* 获取运行时背景噪声估计值。 */
+/**
+ * @brief  获取当前运行时背景噪声估计值。
+ * @param  baseline 指向基线结构的指针。
+ * @return 噪声 IR 估计值。
+ */
 uint32_t max30102_baseline_get_noise_ir(const MAX30102_Baseline_t *baseline)
 {
   if (baseline == NULL)
@@ -190,11 +223,16 @@ uint32_t max30102_baseline_get_noise_ir(const MAX30102_Baseline_t *baseline)
   return baseline->noise_ir;
 }
 
-/*
- * 用双阈值滞回做手指状态切换，避免临界点附近因为噪声产生反复跳变。
- * current_state 表示调用前的状态：
- * - 0 表示当前认为"无手指"
- * - 1 表示当前认为"有手指"
+/**
+ * @brief  使用双阈值迟滞检测手指存在状态。
+ * @param  ir_value         当前 IR 样本值。
+ * @param  baseline_ir      当前背景 IR 基线。
+ * @param  current_state    前一次手指状态（0 = 移开，1 = 按下）。
+ * @param  finger_on_delta  手指按下的检测阈值增量。
+ * @param  finger_off_delta 手指移开的检测阈值增量。
+ * @return 新手指状态（0 = 移开，1 = 按下）。
+ * @note   迟滞可防止在阈值边界附近因噪声导致
+ *         反复的状态切换。使用独立的按下/移开增量值。
  */
 uint8_t max30102_detect_finger(uint32_t ir_value,
                                uint32_t baseline_ir,

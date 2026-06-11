@@ -23,12 +23,12 @@
  *   - Reset (手指离开/测量重置): 清零 ring buffer + 所有输出。
  *   - Invalidate (信号中断/motion): 只标 valid=0，保留 buffer 与旧值。
  *
- * Frequency HRV:
- *   - Short-window LF/HF estimate from the same 32-beat IBI ring buffer.
- *   - 4 Hz linear resampling, mean removal, Hann window, CMSIS-DSP RFFT.
- *   - LF: 0.04-0.15 Hz, HF: 0.15-0.40 Hz.
- *   - VLF is intentionally not estimated: 32 beats are too short for
- *     useful <0.04 Hz resolution, and this is not standard 5-minute HRV.
+ * 频域 HRV:
+ *   - 基于同一 32 拍 IBI ring buffer 的短窗口 LF/HF 估计。
+ *   - 4 Hz 线性重采样, 去均值, Hann 窗, CMSIS-DSP RFFT。
+ *   - LF: 0.04-0.15 Hz, HF: 0.15-0.40 Hz。
+ *   - VLF 故意不做估计: 32 拍对于有意义的 <0.04 Hz 分辨率太短,
+ *     且这不是标准的 5 分钟 HRV。
  */
 
 #include "app_hrv.h"
@@ -87,6 +87,14 @@ static uint32_t app_hrv_float_to_u32_x100(float32_t value);
 static uint16_t app_hrv_ratio_to_u16_x100(float32_t numerator,
                                           float32_t denominator);
 
+/**
+ ******************************************************************************
+ * @brief  重置所有 HRV 状态: ring buffer, 所有时域/频域输出。
+ * @param  app 指向 AppState 的指针 (可为 NULL)。
+ * @note   在手指离开或测量重置时调用。清零整个 hrv_state 结构体,
+ *         并清除 AppState 中所有 HRV 相关字段。
+ ******************************************************************************
+ */
 void app_hrv_reset(AppState_t *app)
 {
   (void)memset(&hrv_state, 0, sizeof(hrv_state));
@@ -113,6 +121,14 @@ void app_hrv_reset(AppState_t *app)
   app->rhythm_irregular = 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  将 HRV 输出标记为无效, 但不丢弃 ring buffer。
+ * @param  app 指向 AppState 的指针 (可为 NULL)。
+ * @note   在信号中断或运动期间使用; 保留累积的 IBI 数据
+ *         以便恢复后快速继续。仅清除有效标志。
+ ******************************************************************************
+ */
 void app_hrv_invalidate_outputs(AppState_t *app)
 {
   if (app == NULL)
@@ -125,6 +141,15 @@ void app_hrv_invalidate_outputs(AppState_t *app)
   app->hrv_freq_valid = 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  注册一个峰值采样点, 防止重复搏动检测。
+ * @param  peak_sample  检测到的峰值的全局采样索引。
+ * @return 如果峰值是新的 (接受) 返回 1, 如果是重复的 (在窗口内) 返回 0。
+ * @note   重复窗口为 APP_HRV_DUPLICATE_PEAK_WINDOW_SAMPLES 个采样点。
+ *         由 app_ppg_pulse_process_metrics 在记录 IBI 前使用。
+ ******************************************************************************
+ */
 uint8_t app_hrv_mark_peak_seen(uint32_t peak_sample)
 {
   if ((hrv_state.last_peak_valid != 0U) &&
@@ -139,6 +164,15 @@ uint8_t app_hrv_mark_peak_seen(uint32_t peak_sample)
   return 1U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  检查最后注册的峰值是否超过阈值期限。
+ * @param  current_sample  当前全局采样索引。
+ * @param  stale_samples   超过此采样数后峰值被视为过期。
+ * @return 如果过期 (无最近峰值) 返回 1, 否则返回 0。
+ * @note   用于检测有效搏动事件的丢失 (例如手指移开)。
+ ******************************************************************************
+ */
 uint8_t app_hrv_is_peak_stale(uint32_t current_sample, uint32_t stale_samples)
 {
   if ((hrv_state.last_peak_valid != 0U) &&
@@ -150,6 +184,17 @@ uint8_t app_hrv_is_peak_stale(uint32_t current_sample, uint32_t stale_samples)
   return 0U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  接受一个新的 IBI 值到 ring buffer 并重新计算 HRV 指标。
+ * @param  app    指向 AppState 的指针 (可为 NULL)。
+ * @param  ibi_ms 搏动间期, 单位为毫秒。
+ * @return 如果 IBI 被接受返回 1, 如果被跳变过滤器拒绝返回 0。
+ * @note   IBI 在写入 ring buffer 之前通过 app_hrv_accept_ibi
+ *         (范围 + 中位数偏差检查)。接受的 IBI 会触发完整的
+ *         HRV 输出更新 (时域 + 频域)。
+ ******************************************************************************
+ */
 uint8_t app_hrv_add_ibi(AppState_t *app, uint16_t ibi_ms)
 {
   if (app_hrv_accept_ibi(ibi_ms) == 0U)
@@ -178,6 +223,7 @@ uint8_t app_hrv_add_ibi(AppState_t *app, uint16_t ibi_ms)
   return 1U;
 }
 
+/* ---- IBI 跳变过滤器: 范围门禁 + 中位数偏差检查 ---- */
 static uint8_t app_hrv_accept_ibi(uint16_t ibi_ms)
 {
   uint8_t  i;
@@ -241,6 +287,7 @@ static uint8_t app_hrv_accept_ibi(uint16_t ibi_ms)
   return 1U;
 }
 
+/* ---- Ring-buffer 顺序到索引映射 (处理回绕) ---- */
 static uint8_t app_hrv_order_to_index(uint8_t order)
 {
   uint8_t start_index;
@@ -257,6 +304,7 @@ static uint8_t app_hrv_order_to_index(uint8_t order)
   return (uint8_t)((start_index + order) % APP_HRV_IBI_HISTORY_SIZE);
 }
 
+/* ---- 时域 HRV: SDNN, RMSSD, SD1/SD2, rhythm_irregular ---- */
 static void app_hrv_update_outputs(AppState_t *app)
 {
   uint8_t i;
@@ -376,6 +424,7 @@ static void app_hrv_update_outputs(AppState_t *app)
   app_hrv_update_frequency_outputs(app);
 }
 
+/* ---- 频域 HRV: 通过 Hann 窗 RFFT 计算 LF/HF 功率 ---- */
 static void app_hrv_update_frequency_outputs(AppState_t *app)
 {
   uint16_t i;
@@ -403,8 +452,8 @@ static void app_hrv_update_frequency_outputs(AppState_t *app)
   }
 
   /*
-   * Frequency-domain HRV needs the complete 32-beat window. With fewer beats
-   * the LF band is too under-resolved, so only the time-domain fields are valid.
+   * 频域 HRV 需要完整的 32 拍窗口。拍数较少时
+   * LF 波段分辨率过低, 因此仅时域字段有效。
    */
   if (hrv_state.count < APP_HRV_IBI_HISTORY_SIZE)
   {
@@ -412,7 +461,7 @@ static void app_hrv_update_frequency_outputs(AppState_t *app)
     return;
   }
 
-  /* Treat each IBI as the tachogram value at the middle of its beat interval. */
+  /* 将每个 IBI 视为其搏动间隔中点处的 tachogram 值。 */
   cumulative_s = 0.0f;
   for (i = 0U; i < APP_HRV_IBI_HISTORY_SIZE; i++)
   {
@@ -508,6 +557,7 @@ static void app_hrv_update_frequency_outputs(AppState_t *app)
   app->hrv_freq_valid = 1U;
 }
 
+/* ---- 根据 IBI 窗口时长选择 FFT 大小 ---- */
 static uint16_t app_hrv_select_frequency_fft_size(float32_t duration_s)
 {
   uint32_t available_samples;
@@ -536,6 +586,7 @@ static uint16_t app_hrv_select_frequency_fft_size(float32_t duration_s)
   return 0U;
 }
 
+/* ---- 惰性初始化/重配置 CMSIS-DSP RFFT 实例 ---- */
 static uint8_t app_hrv_frequency_ensure_rfft(uint16_t fft_size)
 {
   if (hrv_freq_rfft_size == fft_size)
@@ -553,6 +604,7 @@ static uint8_t app_hrv_frequency_ensure_rfft(uint16_t fft_size)
   return 1U;
 }
 
+/* ---- 非均匀间隔 IBI tachogram 的线性插值 ---- */
 static float32_t app_hrv_interpolate_ibi(float32_t sample_time_s,
                                          uint8_t *segment_index)
 {
@@ -596,6 +648,7 @@ static float32_t app_hrv_interpolate_ibi(float32_t sample_time_s,
          ((hrv_freq_ibi_ms[seg + 1U] - hrv_freq_ibi_ms[seg]) * ratio);
 }
 
+/* ---- 辅助函数: float -> uint32, 100 倍缩放 + 四舍五入 ---- */
 static uint32_t app_hrv_float_to_u32_x100(float32_t value)
 {
   if (value <= 0.0f)
@@ -635,6 +688,7 @@ static uint16_t app_hrv_ratio_to_u16_x100(float32_t numerator,
   return (uint16_t)(ratio_x100 + 0.5f);
 }
 
+/* ---- 辅助函数: 无符号 32 位绝对差 ---- */
 static uint32_t app_hrv_abs_diff_u32(uint32_t lhs, uint32_t rhs)
 {
   if (lhs >= rhs)
@@ -645,6 +699,7 @@ static uint32_t app_hrv_abs_diff_u32(uint32_t lhs, uint32_t rhs)
   return rhs - lhs;
 }
 
+/* ---- 辅助函数: uint64 的整数平方根 (逐位算法) ---- */
 static uint32_t app_hrv_isqrt_u64(uint64_t value)
 {
   uint64_t bit = 1ULL << 62;
