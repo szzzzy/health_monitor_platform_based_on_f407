@@ -500,6 +500,11 @@
               <FilePath>../Core/Src/app_data_log.c</FilePath>
             </File>
             <File>
+              <FileName>app_runtime.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/app_runtime.c</FilePath>
+            </File>
+            <File>
               <FileName>app_diag.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/app_diag.c</FilePath>

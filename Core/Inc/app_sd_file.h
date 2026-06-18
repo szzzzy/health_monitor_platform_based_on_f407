@@ -31,7 +31,7 @@ void              APP_SdFile_StopSession(void);
 bool              APP_SdFile_IsReady(void);
 AppSdFileStatus_t APP_SdFile_WriteBytes(const void *data, uint16_t len);
 AppSdFileStatus_t APP_SdFile_Flush(void);
-uint32_t          APP_SdFile_GetTotalWritten(void);
+uint32_t          APP_SdFile_GetWriteOpCount(void);
 uint32_t          APP_SdFile_GetErrorCount(void);
 
 #endif

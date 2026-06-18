@@ -25,7 +25,7 @@ static bool    volume_mounted  = false;
 static bool    session_active  = false;
 static uint16_t current_file_date;
 
-static uint32_t total_flushes = 0U;
+static uint32_t write_op_count = 0U;
 static uint32_t total_errors  = 0U;
 
 /* ---- 辅助 ---- */
@@ -175,7 +175,7 @@ void APP_SdFile_Init(void)
     (void)memset(&log_file, 0, sizeof(log_file));
     volume_mounted  = false;
     session_active  = false;
-    total_flushes     = 0U;
+    write_op_count     = 0U;
     total_errors      = 0U;
 }
 
@@ -330,7 +330,7 @@ AppSdFileStatus_t APP_SdFile_WriteBytes(const void *data, uint16_t len)
     /* 不 f_sync — 由 StopSession 内部统一 sync。
      * f_sync 可能触发多次 disk_write（文件缓冲 + FAT + 目录），
      * 累计 >100ms，足以在测量期造成 MAX30102 FIFO overflow。 */
-    total_flushes++;
+    write_op_count++;
     return APP_SD_FILE_OK;
 }
 
@@ -356,7 +356,8 @@ AppSdFileStatus_t APP_SdFile_Flush(void)
  * @brief  获取成功 f_write 调用的总次数。
  * @return 自初始化以来的总刷新/写入计数。
  */
-uint32_t APP_SdFile_GetTotalWritten(void) { return total_flushes; }
+/* 返回成功 f_write 调用次数（非 flush 次数、非写入字节/样本数）。 */
+uint32_t APP_SdFile_GetWriteOpCount(void) { return write_op_count; }
 /**
  * @brief  获取遇到的 SD 写入错误总次数。
  * @return 自初始化以来的总错误计数。

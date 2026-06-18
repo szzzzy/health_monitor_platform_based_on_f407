@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "adc.h"
+#include "app_data_log.h"
 #include "app_diag.h"
 #include "app_ecg.h"
 #include "app_measurement.h"
@@ -80,6 +81,8 @@ static void app_display_debug_d6_sys(const AppState_t *app);
 static void app_display_debug_d7_sd(const AppState_t *app);
 static void app_display_debug_d8_ecg(const AppState_t *app);
 static void app_display_debug_d9_sched(const AppState_t *app);
+static void app_display_draw_lines_8(const char line[8][24]);
+static uint32_t app_display_cap_u32(uint32_t value, uint32_t cap);
 static const char *app_get_quality_label(const AppState_t *app);
 static const char *app_get_balance_label(uint8_t balance_status);
 static const char *app_get_regular_label(const AppState_t *app);
@@ -746,6 +749,26 @@ static void app_display_ecg_page(const AppState_t *app)
 /* =========================================================================
  * D1 MAX — MAX30102 传感器健康、I2C、恢复状态
  * ========================================================================= */
+
+static void app_display_draw_lines_8(const char line[8][24])
+{
+  ssd1306_Clear(SSD1306_COLOR_BLACK);
+  ssd1306_DrawString(0, 0,  line[0]);
+  ssd1306_DrawString(0, 8,  line[1]);
+  ssd1306_DrawString(0, 16, line[2]);
+  ssd1306_DrawString(0, 24, line[3]);
+  ssd1306_DrawString(0, 32, line[4]);
+  ssd1306_DrawString(0, 40, line[5]);
+  ssd1306_DrawString(0, 48, line[6]);
+  ssd1306_DrawString(0, 56, line[7]);
+  ssd1306_UpdateScreen();
+}
+
+static uint32_t app_display_cap_u32(uint32_t value, uint32_t cap)
+{
+  return (value > cap) ? cap : value;
+}
+
 static void app_display_debug_d1_max(const AppState_t *app)
 {
   char line[8][24];
@@ -757,7 +780,7 @@ static void app_display_debug_d1_max(const AppState_t *app)
 
   age_s = (app->sensor_last_sample_tick != 0U) ?
           ((HAL_GetTick() - app->sensor_last_sample_tick) / 1000UL) : 0UL;
-  if (age_s > 9999UL) { age_s = 9999UL; }
+  age_s = app_display_cap_u32(age_s, 9999UL);
 
   switch (app->sensor_health)
   {
@@ -795,16 +818,7 @@ static void app_display_debug_d1_max(const AppState_t *app)
                  (unsigned long)(app->sensor_stale_count > 9999UL ?
                                  9999UL : app->sensor_stale_count));
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /**
@@ -836,13 +850,13 @@ static void app_display_debug_d2_fifo(const AppState_t *app)
   default:                        read_str = "E"; break;
   }
 
-  att  = (app->sensor_read_attempt_count > 999999UL) ? 999999UL : app->sensor_read_attempt_count;
-  ok   = (app->sensor_read_ok_count      > 999999UL) ? 999999UL : app->sensor_read_ok_count;
-  busy = (app->sensor_read_busy_count    > 999999UL) ? 999999UL : app->sensor_read_busy_count;
-  err  = (app->sensor_read_error_count   > 999999UL) ? 999999UL : app->sensor_read_error_count;
+  att  = app_display_cap_u32(app->sensor_read_attempt_count, 999999UL);
+  ok   = app_display_cap_u32(app->sensor_read_ok_count,      999999UL);
+  busy = app_display_cap_u32(app->sensor_read_busy_count,    999999UL);
+  err  = app_display_cap_u32(app->sensor_read_error_count,   999999UL);
   last_ok_age = (app->sensor_last_ok_tick != 0U) ?
                 ((HAL_GetTick() - app->sensor_last_ok_tick) / 1000UL) : 0UL;
-  if (last_ok_age > 9999UL) { last_ok_age = 9999UL; }
+  last_ok_age = app_display_cap_u32(last_ok_age, 9999UL);
 
   (void)snprintf(line[0], sizeof(line[0]), "D2 FIFO READ %s", read_str);
   (void)snprintf(line[1], sizeof(line[1]), "ATT %lu", (unsigned long)att);
@@ -859,16 +873,7 @@ static void app_display_debug_d2_fifo(const AppState_t *app)
   (void)snprintf(line[6], sizeof(line[6]), "LASTOK %lus", (unsigned long)last_ok_age);
   (void)snprintf(line[7], sizeof(line[7]), "");
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /**
@@ -888,32 +893,23 @@ static void app_display_debug_d3_ppg_raw(const AppState_t *app)
 
   (void)snprintf(line[0], sizeof(line[0]), "D3 PPG RAW");
   (void)snprintf(line[1], sizeof(line[1]), "RED %lu",
-                 (unsigned long)(app->red_value > 999999UL ? 999999UL : app->red_value));
+                 (unsigned long)app_display_cap_u32(app->red_value, 999999UL));
   (void)snprintf(line[2], sizeof(line[2]), "IR %lu",
-                 (unsigned long)(app->ir_value > 999999UL ? 999999UL : app->ir_value));
+                 (unsigned long)app_display_cap_u32(app->ir_value, 999999UL));
   (void)snprintf(line[3], sizeof(line[3]), "BASE %lu",
-                 (unsigned long)(app->baseline_ir > 999999UL ? 999999UL : app->baseline_ir));
+                 (unsigned long)app_display_cap_u32(app->baseline_ir, 999999UL));
   (void)snprintf(line[4], sizeof(line[4]), "DELTA %lu",
-                 (unsigned long)(app->ir_signal_delta > 999999UL ? 999999UL : app->ir_signal_delta));
+                 (unsigned long)app_display_cap_u32(app->ir_signal_delta, 999999UL));
   (void)snprintf(line[5], sizeof(line[5]), "SPAN I%lu R%lu",
-                 (unsigned long)(app->ir_signal_span > 999999UL ? 999999UL : app->ir_signal_span),
-                 (unsigned long)(app->red_signal_span > 999999UL ? 999999UL : app->red_signal_span));
+                 (unsigned long)app_display_cap_u32(app->ir_signal_span, 999999UL),
+                 (unsigned long)app_display_cap_u32(app->red_signal_span, 999999UL));
   (void)snprintf(line[6], sizeof(line[6]), "F %u RAW %u",
                  (unsigned int)app->finger_present, (unsigned int)app->raw_signal_present);
   (void)snprintf(line[7], sizeof(line[7]), "ON %u OFF %u",
                  (unsigned int)app->finger_on_confirm_count,
                  (unsigned int)app->finger_off_confirm_count);
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /**
@@ -946,26 +942,15 @@ static void app_display_debug_d4_ppg_q(const AppState_t *app)
   (void)snprintf(line[3], sizeof(line[3]), "PI R%u.%u",
                  (unsigned int)(pi_r / 10UL), (unsigned int)(pi_r % 10UL));
   (void)snprintf(line[4], sizeof(line[4]), "AC I%lu R%lu",
-                 (unsigned long)(app->signal_ir_ac_rms > 999999UL ?
-                                 999999UL : app->signal_ir_ac_rms),
-                 (unsigned long)(app->signal_red_ac_rms > 999999UL ?
-                                 999999UL : app->signal_red_ac_rms));
+                 (unsigned long)app_display_cap_u32(app->signal_ir_ac_rms, 999999UL),
+                 (unsigned long)app_display_cap_u32(app->signal_red_ac_rms, 999999UL));
   (void)snprintf(line[5], sizeof(line[5]), "MOT %u SC %u",
                  (unsigned int)app->motion_artifact, (unsigned int)app->motion_score);
   (void)snprintf(line[6], sizeof(line[6]), "RATIO %u",
                  (unsigned int)app->spo2_ratio_x1000);
   (void)snprintf(line[7], sizeof(line[7]), "");
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /**
@@ -999,16 +984,7 @@ static void app_display_debug_d5_algo(const AppState_t *app)
   (void)snprintf(line[7], sizeof(line[7]), "PTT %u V%u",
                  (unsigned int)app->ptt_ms, (unsigned int)app->ptt_valid);
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /**
@@ -1037,13 +1013,7 @@ static void app_display_debug_d6_sys(const AppState_t *app)
   else if (app->rtc_time_valid != 0U) rtc = "SET";
   else                               rtc = "RUN";
 
-  switch (app->sd_state)
-  {
-  case 2U: sd_state_str = "ACTIVE"; break;
-  case 3U: sd_state_str = "BOFF"; break;
-  case 1U: sd_state_str = "TRY"; break;
-  default: sd_state_str = "IDLE"; break;
-  }
+  sd_state_str = APP_DataLog_StateLabel(app->sd_state);
 
   /* 崩溃源名称 */
   switch (app->crash_source)
@@ -1100,16 +1070,7 @@ static void app_display_debug_d6_sys(const AppState_t *app)
                                  999999UL : app->display_refresh_count),
                  (unsigned int)app->fifo_high_watermark);
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /**
@@ -1132,13 +1093,7 @@ static void app_display_debug_d7_sd(const AppState_t *app)
 
   if (app == NULL) { return; }
 
-  switch (app->sd_state)
-  {
-  case 2U: sd_state_str = "ACTIVE"; break;
-  case 3U: sd_state_str = "BOFF";   break;
-  case 1U: sd_state_str = "TRY";    break;
-  default: sd_state_str = "IDLE";   break;
-  }
+  sd_state_str = APP_DataLog_StateLabel(app->sd_state);
 
   switch (APP_SD_Card_GetMode())
   {
@@ -1179,16 +1134,7 @@ static void app_display_debug_d7_sd(const AppState_t *app)
   (void)snprintf(line[7], sizeof(line[7]), "HWM %u",
                  (unsigned int)app->fifo_high_watermark);
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /* =========================================================================
@@ -1272,16 +1218,7 @@ static void app_display_debug_d8_ecg(const AppState_t *app)
                  (unsigned long)(snap.sample_count > 999999UL ?
                                  999999UL : snap.sample_count));
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /* =========================================================================
@@ -1333,13 +1270,7 @@ static void app_display_debug_d9_sched(const AppState_t *app)
     last_tick = now_tick;
   }
 
-  switch (app->sd_state)
-  {
-  case 2U: sd_state_str = "ACTIVE"; break;
-  case 3U: sd_state_str = "BOFF";   break;
-  case 1U: sd_state_str = "TRY";    break;
-  default: sd_state_str = "IDLE";   break;
-  }
+  sd_state_str = APP_DataLog_StateLabel(app->sd_state);
 
   (void)snprintf(line[0], sizeof(line[0]), "D9 SCHED");
   (void)snprintf(line[1], sizeof(line[1]), "T6%4lu/s M%4lu/s",
@@ -1360,16 +1291,7 @@ static void app_display_debug_d9_sched(const AppState_t *app)
   (void)snprintf(line[7], sizeof(line[7]), "HWM%3u",
                  (unsigned int)app->fifo_high_watermark);
 
-  ssd1306_Clear(SSD1306_COLOR_BLACK);
-  ssd1306_DrawString(0, 0, line[0]);
-  ssd1306_DrawString(0, 8, line[1]);
-  ssd1306_DrawString(0, 16, line[2]);
-  ssd1306_DrawString(0, 24, line[3]);
-  ssd1306_DrawString(0, 32, line[4]);
-  ssd1306_DrawString(0, 40, line[5]);
-  ssd1306_DrawString(0, 48, line[6]);
-  ssd1306_DrawString(0, 56, line[7]);
-  ssd1306_UpdateScreen();
+  app_display_draw_lines_8(line);
 }
 
 /*

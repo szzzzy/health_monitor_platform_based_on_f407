@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "app_rtos.h"
+#include "app_runtime.h"
 #include "app_data_log.h"
 #include "app_display.h"
 #include "app_ecg.h"
@@ -52,7 +53,6 @@
 #define APP_RTOS_SD_PERIOD_MS          20U
 #define APP_RTOS_WATCHDOG_PERIOD_MS    50U
 #define APP_DISPLAY_SKIP_THRESHOLD     8U
-#define APP_SD_SAFE_SAMPLE_AGE_MS      25U
 #define APP_DISPLAY_FORCE_REFRESH_MS   1000U
 /* USER CODE END PD */
 
@@ -117,10 +117,6 @@ const osMutexAttr_t i2c1Mutex_attributes = {
 /* USER CODE BEGIN FunctionPrototypes */
 static uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms);
 static void app_rtos_i2c_release(void);
-static void app_rtos_send_report_if_due(AppState_t *app);
-static void app_rtos_refresh_display_if_needed(AppState_t *app);
-static void app_rtos_update_sd_log_status(AppState_t *app);
-static uint8_t app_rtos_sd_service_safe(const AppState_t *app);
 static void app_rtos_service_max(AppState_t *app);
 /* USER CODE END FunctionPrototypes */
 
@@ -217,109 +213,6 @@ static void app_rtos_i2c_release(void)
   {
     (void)osMutexRelease(i2c1MutexHandle);
   }
-}
-
-/**
- ******************************************************************************
- * @brief  若有待发送的 UART 传感器报告则发送之。
- * @param  app 指向应用程序状态的指针
- * @return 无。
- * @note  检查 report_due 标志；发送后清除。若 app 为 NULL 则为空操作。
- ******************************************************************************
- */
-static void app_rtos_send_report_if_due(AppState_t *app)
-{
-  if ((app == NULL) || (app->report_due == 0U))
-  {
-    return;
-  }
-
-  app_protocol_send_sensor_report(app);
-  app->report_due = 0U;
-}
-
-/**
- ******************************************************************************
- * @brief  若有刷新请求则刷新 OLED 显示屏。
- * @param  app 指向应用程序状态的指针
- * @return 无。
- * @note  更新 RTC 快照和显示内容；重置刷新标志和 FIFO 高水位线。
- ******************************************************************************
- */
-static void app_rtos_refresh_display_if_needed(AppState_t *app)
-{
-  if ((app == NULL) || (app->display_refresh_requested == 0U))
-  {
-    return;
-  }
-
-  app_protocol_update_rtc_snapshot(app);
-  app_display_measurement_page(app);
-  app->display_refresh_count++;
-  app->display_last_refresh_tick = HAL_GetTick();
-  app->display_refresh_requested = 0U;
-  app->fifo_high_watermark = 0U;
-}
-
-/**
- ******************************************************************************
- * @brief  将 SD 数据日志状态计数器复制到应用程序状态中。
- * @param  app 指向应用程序状态的指针
- * @return 无。
- * @note  更新缓冲、丢弃、写入、暂停、错误和刷新字段。
- ******************************************************************************
- */
-static void app_rtos_update_sd_log_status(AppState_t *app)
-{
-  DataLogStatus_t st;
-
-  if (app == NULL) { return; }
-
-  APP_DataLog_GetStatus(&st);
-  app->sd_buffered  = st.buffered;
-  app->sd_dropped   = st.dropped;
-  app->sd_written   = st.written;
-  app->sd_paused    = st.paused;
-  app->sd_error     = st.sd_error;
-  app->sd_state     = st.state;
-  app->sd_last_write_ms = st.last_write_ms;
-  app->sd_total_written = (uint32_t)st.written;
-  app->flush_pending = APP_DataLog_IsFlushPending();
-}
-
-/**
- ******************************************************************************
- * @brief  检查执行 SD I/O 是否安全。
- * @param  app 指向应用程序状态的指针
- * @return 安全返回 1，手指存在或传感器忙返回 0。
- * @note  手指存在、接触稳定期间或传感器 FIFO 仍包含新样本时阻止 SD I/O。
- ******************************************************************************
- */
-static uint8_t app_rtos_sd_service_safe(const AppState_t *app)
-{
-  uint32_t now;
-
-  if (app == NULL) { return 0U; }
-  if (app->finger_present != 0U) { return 0U; }
-  if (app->sensor_health != (uint8_t)SENSOR_HEALTH_OK) { return 0U; }
-  if (app->contact_settle_samples > 0U) { return 0U; }
-  /* 原始信号检测器检测到手指时拒绝 SD I/O
-   * （在 8 拍确认窗口期间阻止刷新/写入）。 */
-  if (app->raw_signal_present != 0U) { return 0U; }
-  if (app->finger_on_confirm_count > 0U) { return 0U; }
-  /* 疑似手指接近：ir_signal_delta 达到开启阈值的一半或以上。
-   * 手指接近时阻止 SD I/O 以避免争用。 */
-  if (app->ir_signal_delta >= (app->adaptive_finger_on_delta / 2U)) { return 0U; }
-  if (app->sensor_fifo_available_samples >= 4U) { return 0U; }
-  if (app->sensor_last_sample_tick == 0UL) { return 0U; }
-
-  now = HAL_GetTick();
-  if ((now - app->sensor_last_sample_tick) >= APP_SD_SAFE_SAMPLE_AGE_MS)
-  {
-    return 0U;
-  }
-
-  return 1U;
 }
 
 /**
@@ -653,7 +546,7 @@ void StartTask04(void *argument)
         app_rtos_state->ui_task_phase = PHASE_UI_DISPLAY_REFRESH;
         if (app_rtos_i2c_acquire(0U) != 0U)
         {
-          app_rtos_refresh_display_if_needed(app_rtos_state);
+          app_runtime_refresh_display_if_needed(app_rtos_state);
           app_rtos_i2c_release();
           last_skip_tick = 0U;
         }
@@ -671,7 +564,7 @@ void StartTask04(void *argument)
     }
 
     app_rtos_state->ui_task_phase = PHASE_UI_REPORT_SEND;
-    app_rtos_send_report_if_due(app_rtos_state);
+    app_runtime_send_report_if_due(app_rtos_state);
 
     /* 每 20 拍 (~400ms) 采集一次栈水印 */
     {
@@ -726,7 +619,7 @@ void StartTask05(void *argument)
         (app_rtos_state->sensor_health == (uint8_t)SENSOR_HEALTH_OK));
 
     app_rtos_state->sd_task_phase = PHASE_SD_SAFE_CHECK;
-    if (app_rtos_sd_service_safe(app_rtos_state) != 0U)
+    if (app_runtime_sd_service_safe(app_rtos_state) != 0U)
     {
       if (APP_DataLog_IsFlushPending() != 0U)
       {
@@ -736,12 +629,12 @@ void StartTask05(void *argument)
       else
       {
         app_rtos_state->sd_task_phase = PHASE_SD_SERVICE_BUDGET;
-        (void)APP_DataLog_ServiceBudget(10U, 512U);
+        (void)APP_DataLog_ServiceBudget(10U);
       }
     }
 
     app_rtos_state->sd_task_phase = PHASE_SD_STATUS;
-    app_rtos_update_sd_log_status(app_rtos_state);
+    app_runtime_update_sd_log_status(app_rtos_state);
     app_rtos_state->sd_task_phase = PHASE_SD_DELAY;
     osDelay(APP_RTOS_SD_PERIOD_MS);
   }

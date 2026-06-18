@@ -5,12 +5,12 @@
   *
   * 架构：
   *   实时路径 (100Hz):   PushSample()  → 16 字节 memcpy 入队，O(1)
-  *   后台路径 (主循环):   ServiceBudget(budget_ms, max_bytes) → 格式化 + f_write
+  *   后台路径 (主循环):   ServiceBudget(budget_ms) → 格式化 + f_write
   *   停止路径 (手指离开): OnMeasurementStop() → flush + f_sync
   *
   * 关键约束：
   *   - PushSample 不做任何 snprintf / f_write / f_sync
-  *   - ServiceBudget 每轮至多一次 f_write，至多 budget_ms 时间
+  *   - ServiceBudget 每轮至多一次 f_write (512B chunk)，至多 budget_ms 时间
   *   - 环形缓冲满时覆盖最旧记录（静默丢日志，不破坏采样）
   ******************************************************************************
   */
@@ -47,6 +47,7 @@ typedef struct {
   uint16_t buffered;       /* 环形缓冲中待写入样本数 */
   uint16_t dropped;        /* 累计丢弃样本数（环形缓冲溢出） */
   uint16_t written;        /* 本次 session 已持久化样本数 */
+  uint32_t total_written;  /* 累计持久化样本总数（跨 session） */
   uint8_t  paused;         /* 1 = SD 写入已暂停（慢/满/错误） */
   uint8_t  sd_error;       /* 最后一次 SD 错误码 (AppSdFileStatus_t) */
   uint8_t  state;          /* 内部状态机阶段 (SdLogState_t) */
@@ -66,12 +67,11 @@ void     APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
                                 int16_t ecg, uint8_t flags);
 
 /*
- * 后台路径：按预算写 SD。每轮主循环调用一次。
+ * 后台路径：按预算写 SD。每轮至多写一个 512B chunk。
  *   budget_ms: 本轮允许的最大耗时 (ms)，超出后立即返回
- *   max_bytes: 本轮允许写入的最大字节数
- * 返回实际写入的字节数。
+ * 返回实际写入的字节数（0 或 512）。
  */
-uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms, uint16_t max_bytes);
+uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms);
 
 /* 手指离开 / 测量停止时调用，flush 剩余缓冲并 f_sync。 */
 void     APP_DataLog_OnMeasurementStop(void);
@@ -96,5 +96,8 @@ uint8_t  APP_DataLog_ServiceDeferredStop(void);
 
 /* 查询是否有延迟 flush 待执行。 */
 uint8_t  APP_DataLog_IsFlushPending(void);
+
+/* 返回 SD 状态机阶段的可读标签，供 OLED 显示层使用。 */
+const char *APP_DataLog_StateLabel(uint8_t state);
 
 #endif

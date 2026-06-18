@@ -41,6 +41,7 @@
 #include "app_measurement.h"
 #include "app_protocol.h"
 #include "app_rtos.h"
+#include "app_runtime.h"
 #include "app_sched_diag.h"
 #include "app_sd_card.h"
 #include "iwdg.h"
@@ -60,8 +61,6 @@
 #define APP_SENSOR_DRAIN_BUDGET     24U
 #define APP_SENSOR_BOOT_RETRY_MS    1000U
 #define APP_DISPLAY_SKIP_THRESHOLD  8U
-#define APP_SD_SAFE_SAMPLE_AGE_MS   25U
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -83,11 +82,6 @@ void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 /* 初始化共享状态，并让各模块完成自己的默认配置 */
 static void app_state_init(AppState_t *app);
-/* 若当前轮次需要上报，则发送一帧测量报文 */
-static void app_send_report_if_due(AppState_t *app);
-/* 若当前轮次需要刷新显示，则更新 OLED 画面 */
-static void app_refresh_display_if_needed(AppState_t *app);
-static void app_update_sd_log_status(AppState_t *app);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -105,89 +99,6 @@ static void app_state_init(AppState_t *app)
   app_measurement_init_state(app);
   app_display_init_state(app);
   app_protocol_init();
-}
-
-/* 设置"是否上报"的时序控制收口到一个函数里，避免主循环继续膨胀 */
-/* ---- Send a sensor report frame when report_due is set ---- */
-static void app_send_report_if_due(AppState_t *app)
-{
-  if ((app == NULL) || (app->report_due == 0U))
-  {
-    return;
-  }
-
-  app_protocol_send_sensor_report(app);
-  app->report_due = 0U;
-
-  /* SD PushSample 已在 app_measurement_read_sensor_sample 中完成。
-   *（每次成功 FIFO 读取后调用 APP_DataLog_PushSample）。
-   * 此处不再做任何 SD 相关操作。 */
-}
-
-/* OLED 刷新单独封装，让主循环更像调度器而不是细节堆积 */
-/* ---- Refresh OLED display when display_refresh_requested is set ---- */
-static void app_refresh_display_if_needed(AppState_t *app)
-{
-  if ((app == NULL) || (app->display_refresh_requested == 0U))
-  {
-    return;
-  }
-
-  app_protocol_update_rtc_snapshot(app);
-  app_display_measurement_page(app);
-  app->display_refresh_count++;
-  app->display_last_refresh_tick = HAL_GetTick();
-  app->display_refresh_requested = 0U;
-  app->fifo_high_watermark = 0U;  /* 刷新成功后重置 backlog 门控 */
-}
-
-/* ---- Copy SD card log status fields from DataLog to AppState ---- */
-static void app_update_sd_log_status(AppState_t *app)
-{
-  DataLogStatus_t st;
-
-  if (app == NULL) return;
-
-  APP_DataLog_GetStatus(&st);
-  app->sd_buffered  = st.buffered;
-  app->sd_dropped   = st.dropped;
-  app->sd_written   = st.written;
-  app->sd_paused    = st.paused;
-  app->sd_error     = st.sd_error;
-  app->sd_state     = st.state;
-  app->sd_last_write_ms = st.last_write_ms;
-  app->sd_total_written = (uint32_t)st.written;
-  app->flush_pending = APP_DataLog_IsFlushPending();
-}
-
-/*
- * SD 安全窗口检查：全部满足才返回 1。
- * 核心约束：测量中 finger_present==1 时绝对禁止任何 FatFs/SDIO 操作。
- */
-static uint8_t app_sd_service_safe(const AppState_t *app)
-{
-  uint32_t now;
-
-  if (app == NULL) { return 0U; }
-
-  /* 测量中禁止一切 SD I/O */
-  if (app->finger_present != 0U) { return 0U; }
-
-  /* 传感器状态检查 */
-  if (app->sensor_health != (uint8_t)SENSOR_HEALTH_OK) { return 0U; }
-
-  /* 接触稳定中 */
-  if (app->contact_settle_samples > 0U) { return 0U; }
-
-  /* FIFO 积压检查 */
-  if (app->sensor_fifo_available_samples >= 4U) { return 0U; }
-
-  /* 确保 MAX 样本时间 < 25ms */
-  if (app->sensor_last_sample_tick == 0UL) { return 0U; }
-  now = HAL_GetTick();
-  if ((now - app->sensor_last_sample_tick) >= APP_SD_SAFE_SAMPLE_AGE_MS) { return 0U; }
-
-  return 1U;
 }
 
 /* USER CODE END 0 */
@@ -306,7 +217,7 @@ int main(void)
    * 避免坏卡/无卡在启动阶段阻塞主功能（MAX30102/OLED/RTC/按键/串口）。
    * 此处仅初始化内部静态变量，不执行硬件访问。 */
   APP_DataLog_Init();
-  app_update_sd_log_status(&app);
+  app_runtime_update_sd_log_status(&app);
   APP_Watchdog_Refresh();
 
   /* 上电先采集一段"无手指"背景，建立 IR 基线 */

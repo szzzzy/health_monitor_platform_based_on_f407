@@ -1,6 +1,7 @@
 #include "app_protocol.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -168,7 +169,10 @@ void app_protocol_send_sensor_report(AppState_t *app)
  *         Fields: M,rtc_valid,yyyymmdd,hhmmss,red,ir,...,crash_flag,...,stack_hwm
  */
 /*
- * 紧凑测量报文格式：原有前缀字段保持不变，新诊断字段只追加在尾部。 * 实时报文格式。保持原有前缀字段不变，仅追加新的诊断字段。
+ * 字段顺序兼容旧上位机，不可改变。
+ * 旧上位机可忽略尾部字段继续解析前缀；新上位机应优先使用尾部 SQ/PI/R/BAL
+ * 和传感器/SD/RTC 诊断字段来解释指标可信度。
+ *
  * M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2,
  *   rr_valid,rr,ibi_valid,ibi,hrv_valid,mean_ibi,sdnn,rmssd,
  *   motion_artifact,motion_score,sd1,sd2,sd1_sd2_x100,rhythm_irregular,
@@ -182,147 +186,217 @@ void app_protocol_send_sensor_report(AppState_t *app)
  *   sensor_read_ok_count,sensor_read_busy_count,sensor_read_error_count,sensor_recover_count,
  *   sensor_last_sample_tick,sensor_sample_change_count,sensor_sample_same_count,sensor_last_i2c_error,
  *   rtc_read_ok,uart_rx_message_valid,uart_tx_message_valid,
- *   sd_card_ready,sd_log_active,sd_log_error,sd_total_written,
- *   display_refresh_count,display_last_refresh_tick,debug_mode,current_page
- *
- * 旧上位机可忽略尾部字段继续解析前缀；新上位机应优先使用尾部 SQ/PI/R/BAL
- * 和传感器/SD/RTC 诊断字段来解释指标可信度。 */
+ *   sd_log_active,sd_state,sd_error,sd_total_written,
+ *   display_refresh_count,display_last_refresh_tick,debug_mode,current_page,
+ *   ecg_valid,ecg_hr,ecg_rr_ms,ecg_lead_off,ecg_r_peak_ms,ecg_filtered,ptt_valid,ptt_ms,
+ *   ecg_sample_count,ecg_adc_sat_count,ecg_dma_overflow_count,ecg_lead_off_count,
+ *   ecg_no_r_peak_timeout_count,crash_flag,crash_source,crash_task,crash_phase,
+ *   crash_tick,reboot_count,reset_flags,max_task_phase,ui_task_phase,sd_task_phase,
+ *   wdt_task_phase,max_task_stack_hwm,ui_task_stack_hwm,sd_task_stack_hwm,
+ *   wdt_task_stack_hwm,max_task_heartbeat,ui_task_heartbeat
+ */
+
+/* ---- 小型 CSV 构建器：避免超长 snprintf，逐字段追加 ---- */
+typedef struct {
+  char    *buf;
+  size_t   size;
+  size_t   len;
+  uint8_t  overflow;
+} AppCsvBuilder_t;
+
+static void app_csv_init(AppCsvBuilder_t *b, char *buf, size_t size)
+{
+  if (b == NULL) { return; }
+  b->buf = buf;
+  b->size = size;
+  b->len = 0U;
+  b->overflow = 0U;
+  if ((buf != NULL) && (size > 0U)) { buf[0] = '\0'; }
+}
+
+static void app_csv_appendf(AppCsvBuilder_t *b, const char *fmt, ...)
+{
+  va_list args;
+  int written;
+  size_t remaining;
+
+  if ((b == NULL) || (b->overflow != 0U)) { return; }
+  if ((b->buf == NULL) || (b->size == 0U)) { b->overflow = 1U; return; }
+
+  remaining = b->size - b->len;
+  if (remaining <= 1U) { b->overflow = 1U; return; }
+
+  va_start(args, fmt);
+  written = vsnprintf(b->buf + b->len, remaining, fmt, args);
+  va_end(args);
+
+  if (written < 0) { b->overflow = 1U; return; }
+
+  b->len += (size_t)written;
+  if (b->len >= b->size) {
+    b->len = b->size - 1U;
+    b->buf[b->len] = '\0';
+    b->overflow = 1U;
+  }
+}
 static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t buffer_size)
 {
+  AppCsvBuilder_t b;
   uint16_t year = 0U;
-  uint8_t month = 0U;
-  uint8_t date = 0U;
-  uint8_t hours = 0U;
-  uint8_t minutes = 0U;
-  uint8_t seconds = 0U;
+  uint8_t month = 0U, date = 0U;
+  uint8_t hours = 0U, minutes = 0U, seconds = 0U;
 
-  if ((app == NULL) || (buffer == NULL) || (buffer_size == 0U))
-  {
-    return 0U;
+  if ((app == NULL) || (buffer == NULL) || (buffer_size == 0U)) { return 0U; }
+
+  if (app->rtc_read_ok != 0U) {
+    year = app->rtc_datetime.year;   month = app->rtc_datetime.month;
+    date = app->rtc_datetime.date;   hours = app->rtc_datetime.hours;
+    minutes = app->rtc_datetime.minutes; seconds = app->rtc_datetime.seconds;
   }
 
-  if (app->rtc_read_ok != 0U)
-  {
-    year = app->rtc_datetime.year;
-    month = app->rtc_datetime.month;
-    date = app->rtc_datetime.date;
-    hours = app->rtc_datetime.hours;
-    minutes = app->rtc_datetime.minutes;
-    seconds = app->rtc_datetime.seconds;
-  }
+  app_csv_init(&b, buffer, buffer_size);
 
-  (void)snprintf(buffer,
-                 buffer_size,
-                 "M,%u,%04u%02u%02u,%02u%02u%02u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%u,%u,%lu,%lu,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%lu,%d,%u,%u,%lu,%lu,%lu,%lu,%lu,%u,%u,%u,%u,%lu,%lu,%lu,%u,%u,%u,%u,%u,%u,%u,%u,%lu,%lu",
-                 (unsigned int)app->rtc_time_valid,
-                 (unsigned int)year,
-                 (unsigned int)month,
-                 (unsigned int)date,
-                 (unsigned int)hours,
-                 (unsigned int)minutes,
-                 (unsigned int)seconds,
-                 (unsigned long)app->red_value,
-                 (unsigned long)app->ir_value,
-                 (unsigned long)app->baseline_ir,
-                 (unsigned int)app->finger_present,
-                 (unsigned int)app->bpm_valid,
-                 (unsigned int)app->bpm_value,
-                 (unsigned int)app->spo2_valid,
-                 (unsigned int)app->spo2_value,
-                 (unsigned int)app->rr_valid,
-                 (unsigned int)app->rr_bpm,
-                 (unsigned int)app->ibi_valid,
-                 (unsigned int)app->latest_ibi_ms,
-                 (unsigned int)app->hrv_valid,
-                 (unsigned int)app->hrv_mean_ibi_ms,
-                 (unsigned int)app->hrv_sdnn_ms,
-                 (unsigned int)app->hrv_rmssd_ms,
-                 (unsigned int)app->motion_artifact,
-                 (unsigned int)app->motion_score,
-                 (unsigned int)app->hrv_sd1_ms,
-                 (unsigned int)app->hrv_sd2_ms,
-                 (unsigned int)app->hrv_sd1_sd2_x100,
-                 (unsigned int)app->rhythm_irregular,
-                 (unsigned int)app->hrv_freq_valid,
-                 (unsigned long)app->hrv_lf_power_x100,
-                 (unsigned long)app->hrv_hf_power_x100,
-                 (unsigned int)app->hrv_lf_hf_x100,
-                 (unsigned int)app->signal_quality,
-                 (unsigned int)app->raw_signal_present,
-                 (unsigned int)app->signal_ir_pi_x1000,
-                 (unsigned int)app->signal_red_pi_x1000,
-                 (unsigned long)app->signal_ir_ac_rms,
-                 (unsigned long)app->signal_red_ac_rms,
-                 (unsigned int)app->spo2_ratio_valid,
-                 (unsigned int)app->spo2_ratio_x1000,
-                 (unsigned int)app->spo2_balance_status,
-                 (unsigned long)app->baseline_range_ir,
-                 (unsigned long)app->adaptive_finger_on_delta,
-                 (unsigned long)app->adaptive_finger_off_delta,
-                 (unsigned long)app->ir_signal_delta,
-                 (unsigned long)app->ir_signal_span,
-                 (unsigned long)app->red_signal_span,
-                 (unsigned int)app->finger_on_confirm_count,
-                 (unsigned int)app->finger_off_confirm_count,
-                 (unsigned int)app->sensor_last_read_status,
-                 (unsigned int)app->sensor_error_streak,
-                 (unsigned int)app->sensor_fifo_write_ptr,
-                 (unsigned int)app->sensor_fifo_read_ptr,
-                 (unsigned int)app->sensor_fifo_overflow_count,
-                 (unsigned int)app->sensor_fifo_available_samples,
-                 (unsigned long)app->sensor_read_ok_count,
-                 (unsigned long)app->sensor_read_busy_count,
-                 (unsigned long)app->sensor_read_error_count,
-                 (unsigned long)app->sensor_recover_count,
-                 (unsigned long)app->sensor_last_sample_tick,
-                 (unsigned long)app->sensor_sample_change_count,
-                 (unsigned long)app->sensor_sample_same_count,
-                 (unsigned long)app->sensor_last_i2c_error,
-                 (unsigned int)app->rtc_read_ok,
-                 (unsigned int)app->uart_rx_message_valid,
-                 (unsigned int)app->uart_tx_message_valid,
-                 (unsigned int)(APP_DataLog_IsActive() ? 1U : 0U),
-                 (unsigned int)app->sd_state,
-                 (unsigned int)app->sd_error,
-                 (unsigned long)app->sd_total_written,
-                 (unsigned long)app->display_refresh_count,
-                 (unsigned long)app->display_last_refresh_tick,
-                 (unsigned int)app->debug_mode,
-                 (unsigned int)app->current_page,
-                 /* ECG/PTT 追加字段 — 旧上位机忽略尾部即可 */
-                 (unsigned int)app->ecg_valid,
-                 (unsigned int)app->ecg_hr,
-                 (unsigned int)app->ecg_rr_ms,
-                 (unsigned int)app->ecg_lead_off,
-                 (unsigned long)app->ecg_r_peak_ms,
-                 (int)app->ecg_filtered,
-                 (unsigned int)app->ptt_valid,
-                 (unsigned int)app->ptt_ms,
-                 (unsigned long)app->ecg_sample_count,
-                 (unsigned long)app->ecg_adc_sat_count,
-                 (unsigned long)app->ecg_dma_overflow_count,
-                 (unsigned long)app->ecg_lead_off_count,
-                 (unsigned long)app->ecg_no_r_peak_timeout_count,
-                 /* 诊断字段: 崩溃/阶段码/栈水印 (旧上位机忽略尾部即可) */
-                 (unsigned int)app->crash_flag,
-                 (unsigned int)app->crash_source,
-                 (unsigned int)app->crash_task,
-                 (unsigned int)app->crash_phase,
-                 (unsigned long)app->crash_tick,
-                 (unsigned long)app->reboot_count,
-                 (unsigned long)app->reset_flags,
-                 (unsigned int)app->max_task_phase,
-                 (unsigned int)app->ui_task_phase,
-                 (unsigned int)app->sd_task_phase,
-                 (unsigned int)app->wdt_task_phase,
-                 (unsigned int)app->max_task_stack_hwm,
-                 (unsigned int)app->ui_task_stack_hwm,
-                 (unsigned int)app->sd_task_stack_hwm,
-                 (unsigned int)app->wdt_task_stack_hwm,
-                 (unsigned long)app->max_task_heartbeat,
-                 (unsigned long)app->ui_task_heartbeat);
+  /* 字段顺序必须与注释中声明的一致，旧上位机依赖此顺序解析。 */
+  app_csv_appendf(&b, "M,");
 
-  return (uint16_t)strlen(buffer);
+  /* -- 时间戳 -- */
+  app_csv_appendf(&b, "%u,",        (unsigned int)app->rtc_time_valid);
+  app_csv_appendf(&b, "%04u%02u%02u,", (unsigned int)year, (unsigned int)month, (unsigned int)date);
+  app_csv_appendf(&b, "%02u%02u%02u,", (unsigned int)hours, (unsigned int)minutes, (unsigned int)seconds);
+
+  /* -- PPG 原始值 -- */
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->red_value);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ir_value);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->baseline_ir);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->finger_present);
+
+  /* -- BPM/SpO2/RR -- */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->bpm_valid);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->bpm_value);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->spo2_valid);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->spo2_value);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->rr_valid);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->rr_bpm);
+
+  /* -- IBI/HRV -- */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->ibi_valid);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->latest_ibi_ms);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_valid);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_mean_ibi_ms);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_sdnn_ms);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_rmssd_ms);
+
+  /* -- Motion/SD/Rhythm -- */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->motion_artifact);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->motion_score);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_sd1_ms);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_sd2_ms);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_sd1_sd2_x100);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->rhythm_irregular);
+
+  /* -- HRV freq -- */
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->hrv_freq_valid);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->hrv_lf_power_x100);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->hrv_hf_power_x100);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->hrv_lf_hf_x100);
+
+  /* -- SQ / PI -- */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->signal_quality);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->raw_signal_present);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->signal_ir_pi_x1000);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->signal_red_pi_x1000);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->signal_ir_ac_rms);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->signal_red_ac_rms);
+
+  /* -- SpO2 ratio -- */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->spo2_ratio_valid);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->spo2_ratio_x1000);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->spo2_balance_status);
+
+  /* -- 基线 / 自适应 -- */
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->baseline_range_ir);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->adaptive_finger_on_delta);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->adaptive_finger_off_delta);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ir_signal_delta);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ir_signal_span);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->red_signal_span);
+
+  /* -- 手指确认 -- */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->finger_on_confirm_count);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->finger_off_confirm_count);
+
+  /* -- 传感器统计 -- */
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sensor_last_read_status);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sensor_error_streak);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sensor_fifo_write_ptr);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sensor_fifo_read_ptr);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sensor_fifo_overflow_count);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sensor_fifo_available_samples);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sensor_read_ok_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sensor_read_busy_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sensor_read_error_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sensor_recover_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sensor_last_sample_tick);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sensor_sample_change_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sensor_sample_same_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sensor_last_i2c_error);
+
+  /* -- RTC / UART -- */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->rtc_read_ok);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->uart_rx_message_valid);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->uart_tx_message_valid);
+
+  /* -- SD 日志 -- */
+  app_csv_appendf(&b, "%u,",  (unsigned int)(APP_DataLog_IsActive() ? 1U : 0U));
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sd_state);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sd_error);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sd_total_written);
+
+  /* -- 显示 -- */
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->display_refresh_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->display_last_refresh_tick);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->debug_mode);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->current_page);
+
+  /* -- ECG/PTT (旧上位机忽略尾部即可) -- */
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_valid);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_hr);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_rr_ms);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_lead_off);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_r_peak_ms);
+  app_csv_appendf(&b, "%d,",  (int)app->ecg_filtered);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ptt_valid);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ptt_ms);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_sample_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_adc_sat_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_dma_overflow_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_lead_off_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_no_r_peak_timeout_count);
+
+  /* -- 崩溃诊断 (旧上位机忽略尾部即可) -- */
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->crash_flag);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->crash_source);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->crash_task);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->crash_phase);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->crash_tick);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->reboot_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->reset_flags);
+
+  /* -- 任务阶段码 / 栈水印 / 心跳 -- */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->max_task_phase);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->ui_task_phase);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->sd_task_phase);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->wdt_task_phase);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->max_task_stack_hwm);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->ui_task_stack_hwm);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->sd_task_stack_hwm);
+  app_csv_appendf(&b, "%u,", (unsigned int)app->wdt_task_stack_hwm);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->max_task_heartbeat);
+
+  /* 最后一个字段，不加逗号 */
+  app_csv_appendf(&b, "%lu", (unsigned long)app->ui_task_heartbeat);
+
+  return (uint16_t)b.len;
 }
 
 /**

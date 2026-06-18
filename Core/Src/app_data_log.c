@@ -42,7 +42,6 @@ static uint32_t   backoff_until = 0U;
 static uint32_t   total_dropped = 0U;
 static uint32_t   total_written = 0U;
 static uint8_t    write_seq     = 0U;
-static uint8_t    file_seq      = 0U;
 static uint8_t    sd_paused     = 0U;
 static uint8_t    sd_last_error = 0U;
 static uint32_t   last_write_ms = 0U;
@@ -329,7 +328,6 @@ void APP_DataLog_Init(void)
   total_dropped = 0U;
   total_written = 0U;
   write_seq     = 0U;
-  file_seq      = 0U;
   sd_state     = SD_STATE_IDLE;
   backoff_until = 0U;
   sd_paused     = 0U;
@@ -384,18 +382,17 @@ void APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
  ******************************************************************************
  * @brief  在时间预算内服务 SD 写入路径
  * @param  budget_ms 此服务调用的最大允许时间
- * @param  max_bytes 最大写入字节数（保留，未使用）
- * @return 写入的字节数，如果未写入则返回 0
+ * @return 写入的字节数（0 或 512），如果未写入则返回 0
  * @note  实现 SD 状态机（IDLE, TRY_START, ACTIVE, BACKOFF）。
  *        当 measurement_active 设置时不会发生物理 SD I/O。
+ *        每轮至多写一个 512B chunk（DATA_LOG_CHUNK_SAMPLES 个样本）。
  ******************************************************************************
  */
-uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms, uint16_t max_bytes)
+uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms)
 {
   uint16_t chunk_bytes;
   uint16_t written;
 
-  (void)max_bytes;
   last_backlog = ring_get_count();
 
   /* 测量活跃时禁止一切物理 SD I/O，包括 f_write */
@@ -483,6 +480,7 @@ void APP_DataLog_GetStatus(DataLogStatus_t *status)
   status->buffered      = buffered;
   status->dropped       = (uint16_t)(total_dropped > 0xFFFFU ? 0xFFFFU : total_dropped);
   status->written       = session_written;
+  status->total_written = total_written;
   status->paused        = sd_paused;
   status->sd_error      = sd_last_error;
   status->state         = (uint8_t)sd_state;
@@ -613,7 +611,6 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
   case FLUSH_STATE_DONE:
     flush_pending = 0U;
     flush_deferred_state = FLUSH_STATE_IDLE;
-    file_seq = (file_seq + 1U) % 100U;
     session_written = 0U;
     return 1U;
 
@@ -633,4 +630,16 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
 uint8_t APP_DataLog_IsFlushPending(void)
 {
   return flush_pending;
+}
+
+const char *APP_DataLog_StateLabel(uint8_t state)
+{
+  switch (state)
+  {
+  case SD_STATE_IDLE:      return "IDLE";
+  case SD_STATE_TRY_START: return "TRY";
+  case SD_STATE_ACTIVE:    return "ACTIVE";
+  case SD_STATE_BACKOFF:   return "BOFF";
+  default:                 return "?";
+  }
 }
