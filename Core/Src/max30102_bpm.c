@@ -45,8 +45,8 @@ static arm_rfft_fast_instance_f32 rfft_inst;
 static uint8_t rfft_initialized = 0U;
 
 /**
- * @brief  One-time initialisation of the RFFT instance for autocorrelation.
- * @note   Initialises arm_rfft_fast_instance_f32 for FFT_SIZE (256) points.
+ * @brief  一次性初始化自相关使用的 RFFT 实例。
+ * @note   为 FFT_SIZE（256）点初始化 arm_rfft_fast_instance_f32。
  */
 static void autocorr_ensure_init(void)
 {
@@ -58,12 +58,12 @@ static void autocorr_ensure_init(void)
 }
 
 /**
- * @brief  Estimate heart rate from IR waveform peak detection.
- * @param  spo2_state Pointer to the SpO2 state structure.
- * @param  bpm_value  Output pointer for estimated BPM.
- * @return 1 on success, 0 if insufficient peaks or out-of-range BPM.
- * @note   Convenience wrapper; calls max30102_calculate_bpm_with_pulse
- *         with pulse_info set to NULL.
+ * @brief  通过 IR 波形峰值检测估算心率。
+ * @param  spo2_state SpO2 状态结构体指针。
+ * @param  bpm_value  估算 BPM 的输出指针。
+ * @return 成功返回 1；峰值不足或 BPM 超出范围时返回 0。
+ * @note   便捷包装函数；调用 max30102_calculate_bpm_with_pulse，
+ *         并将 pulse_info 设置为 NULL。
  */
 uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_value)
 {
@@ -71,14 +71,14 @@ uint8_t max30102_calculate_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm_v
 }
 
 /**
- * @brief  Estimate BPM with additional pulse information for cross-validation.
- * @param  spo2_state Pointer to the SpO2 state structure.
- * @param  bpm_value  Output pointer for estimated BPM.
- * @param  pulse_info Output pointer for detailed pulse information (may be NULL).
- * @return 1 on success, 0 if insufficient peaks or out-of-range BPM.
- * @note   Uses smoothed 3-point peak detection with prominence and edge
- *         thresholds. When pulse_info is provided, fills in IBI, amplitude,
- *         and sample timing for upstream streaming pulse detection.
+ * @brief  估算 BPM，并输出用于交叉校验的脉搏信息。
+ * @param  spo2_state SpO2 状态结构体指针。
+ * @param  bpm_value  估算 BPM 的输出指针。
+ * @param  pulse_info 详细脉搏信息输出指针（可为 NULL）。
+ * @return 成功返回 1；峰值不足或 BPM 超出范围时返回 0。
+ * @note   使用平滑后的 3 点峰值检测，并结合显著性和边沿阈值。
+ *         提供 pulse_info 时，填充 IBI、幅度和样本时序，
+ *         供上游流式脉冲检测使用。
  */
 uint8_t max30102_calculate_bpm_with_pulse(const MAX30102_SpO2_t *spo2_state,
                                           uint8_t *bpm_value,
@@ -358,13 +358,13 @@ uint8_t max30102_calculate_bpm_with_pulse(const MAX30102_SpO2_t *spo2_state,
 }
 
 /**
- * @brief  Estimate BPM using FFT-based autocorrelation (Wiener-Khinchin).
- * @param  spo2_state Pointer to the SpO2 state structure.
- * @param  bpm        Output pointer for estimated BPM.
- * @return 1 on success, 0 if insufficient samples or no valid peak found.
- * @note   Uses 256-point RFFT with Hann window. Autocorrelation peak in
- *         the lag range [27, 171] maps to [35, 220] BPM at 100 Hz sample
- *         rate. More robust than peak detection for low-perfusion signals.
+ * @brief  使用基于 FFT 的自相关（Wiener-Khinchin）估算 BPM。
+ * @param  spo2_state SpO2 状态结构体指针。
+ * @param  bpm        估算 BPM 的输出指针。
+ * @return 成功返回 1；样本不足或未找到有效峰时返回 0。
+ * @note   使用 256 点 RFFT 和 Hann 窗。100 Hz 采样率下，
+ *         延迟范围 [27, 171] 的自相关峰对应 [35, 220] BPM。
+ *         对低灌注信号比峰值检测更稳健。
  */
 uint8_t max30102_autocorr_bpm(const MAX30102_SpO2_t *spo2_state, uint8_t *bpm)
 {

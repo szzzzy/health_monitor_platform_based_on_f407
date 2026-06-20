@@ -9,7 +9,7 @@
 #define __MAX30102_BPM_H__
 
 #include <stdint.h>
-#include "max30102_spo2.h"  /* for MAX30102_SpO2_t */
+#include "max30102_spo2.h"  /* 用于 MAX30102_SpO2_t */
 
 #define MAX30102_BPM_MIN_VALID_SAMPLES        40U
 

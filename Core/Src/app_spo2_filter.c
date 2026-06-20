@@ -5,7 +5,7 @@
   *
   * 对原始 SpO2 值施加 EMA（指数移动平均）平滑，减少逐拍抖动。
   *
-  * 关键设计：低 SQ / invalid / motion 时不推进 EMA 状态，
+  * 关键设计：低 SQ / 无效 / 运动时不推进 EMA 状态，
   * 防止无效数据污染平滑结果。旧值保留以供 UI 显示（带"?"标记），
   * 但 spo2_valid 清零。
   ******************************************************************************
@@ -71,7 +71,7 @@ void app_spo2_filter_update_output(AppState_t *app,
   /*
    * 关键语义：raw_spo2_valid==0 时不推进 EMA，不更新 app->spo2_value。
    * 旧值保留以供 UI 显示（带 "?" 标记），但 spo2_valid 清零。
-   * 这防止低 SQ / invalid / motion 污染平滑状态。
+   * 这防止低 SQ / 无效 / 运动污染平滑状态。
    */
   if (raw_spo2_valid == 0U)
   {
@@ -87,7 +87,7 @@ void app_spo2_filter_update_output(AppState_t *app,
   }
   else
   {
-    /* EMA 公式: next = (old * 3 + new + 2) / 4  （约 75% 旧值 + 25% 新值）。 */
+    /* EMA 公式: 下一值 = (旧值 * 3 + 新值 + 2) / 4（约 75% 旧值 + 25% 新值）。 */
     smoothed_value = (uint16_t)(((uint16_t)spo2_smooth_state.value * APP_SPO2_EMA_OLD_WEIGHT) +
                                 (uint16_t)raw_spo2_value + APP_SPO2_EMA_ROUNDING);
     spo2_smooth_state.value = (uint8_t)(smoothed_value / APP_SPO2_EMA_DIVISOR);

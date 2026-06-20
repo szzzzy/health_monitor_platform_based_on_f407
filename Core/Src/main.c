@@ -87,7 +87,7 @@ static void app_state_init(AppState_t *app);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 /* 应用层统一初始化入口，main 中只保留调度 */
-/* ---- Initialize shared AppState and all subsystem defaults ---- */
+/* ---- 初始化共享 AppState 与所有子系统默认值 ---- */
 static void app_state_init(AppState_t *app)
 {
   if (app == NULL)
@@ -225,7 +225,7 @@ int main(void)
   {
     app_protocol_poll_uart_commands(&app);
     app_display_handle_buttons(&app);
-    /* Drain every pending sample so the baseline window stays aligned with the sensor FIFO. */
+    /* 排空所有待处理样本，使基线窗口始终与传感器 FIFO 对齐。 */
     while ((app_measurement_baseline_ready() == 0U) &&
            (app_measurement_collect_baseline_sample(&app) != 0U))
     {
@@ -283,8 +283,8 @@ int main(void)
   app.report_due = 1U;
   app.display_refresh_requested = 1U;
 
-  /* ECG ADC start deferred until after PPG baseline completes,
-     to avoid guaranteed DMA overflow during baseline phase (~5s) with no consumer. */
+  /* ECG ADC 延后到 PPG 基线完成后启动，
+     避免基线阶段约 5 秒无人消费样本时必然产生 DMA 溢出。 */
   app_ecg_adc_start();
   app_rtos_bind_state(&app);
   /* USER CODE END 2 */

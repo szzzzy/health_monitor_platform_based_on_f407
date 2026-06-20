@@ -19,6 +19,9 @@ void app_display_add_ir_sample(int32_t filtered_value);
 void app_display_add_red_sample(int32_t filtered_value);
 /* 在脉搏波形上标记最近检测到的 IR 脉冲峰值。 */
 void app_display_add_ir_pulse_marker(void);
+/* 设置 ECG 波形独立最小 AGC scale，避免低质量信号时噪声被放大。
+ * 上电默认 200，PPG 保持 32。运行时可根据 ecg_signal_quality 动态调高。 */
+void app_display_set_ecg_min_scale(uint32_t min_scale);
 /* 仅清除 ECG 波形缓冲区，PPG 接触变化不得影响 ECG 波形。 */
 void app_display_reset_ecg_waveform(void);
 /* 将一个滤波后的 ECG 样本压入 ECG 波形缓冲区。 */

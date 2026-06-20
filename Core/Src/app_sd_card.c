@@ -1,16 +1,16 @@
 /**
   ******************************************************************************
   * @file    app_sd_card.c
-  * @brief   SDIO 驱动 — 单次尝试 4-bit @ 400 kHz，永久降级
+  * @brief   SDIO 驱动 — 单次尝试 4 位 @ 400 kHz，永久降级
   *
   * 初始化：
-  *   1. 400kHz 1-bit → HAL_SD_Init（卡识别）
-  *   2. 400kHz 1-bit → HAL_SD_ConfigWideBusOperation(4-bit)（仅一次）
-  *   3. 失败 → 保持 1-bit；成功后不升速，直接以 400kHz 4-bit 运行
+  *   1. 400kHz 1 位 → HAL_SD_Init（卡识别）
+  *   2. 400kHz 1 位 → HAL_SD_ConfigWideBusOperation(4 位)（仅一次）
+  *   3. 失败 → 保持 1 位；成功后不升速，直接以 400kHz 4 位运行
   *
   * 运行时：
-  *   - 4-bit 下任何读写/WaitReady 错误 → 本次上电永久禁用 4-bit
-  *   - 后续 Init/backoff 重试仅走 1-bit 路径，不再尝试 4-bit
+  *   - 4 位下任何读写/等待就绪错误 → 本次上电永久禁用 4 位
+  *   - 后续初始化/退避重试仅走 1 位路径，不再尝试 4 位
   ******************************************************************************
   */
 
@@ -54,14 +54,14 @@ static bool                    sdio_4bit_permanently_off = false;
  *   会收到忙响应或被 CRC 错误打断。
  *   必须等卡回到 TRANSFER 状态后才能安全进行下一次访问。
  *
- * 超时策略：超时后立即 Deinit 卡，防止卡在异常状态时被重复访问，
+ * 超时策略：超时后立即反初始化卡，防止卡在异常状态时被重复访问，
  * 让上层调用者感知到 APP_SD_CARD_BUSY 并做重试或上报。 */
 /**
- * @brief  永久禁用本次上电周期的 4-bit SDIO 总线模式。
- * @note  在处于 4-bit 模式时，发生任何卡错误（读/写/WaitReady 超时）后调用。
- *         后续 Init 调用将只尝试 1-bit 模式，直到下次上电复位。
+ * @brief  永久禁用本次上电周期的 4 位 SDIO 总线模式。
+ * @note  在处于 4 位模式时，发生任何卡错误（读/写/等待就绪超时）后调用。
+ *         后续初始化调用将只尝试 1 位模式，直到下次上电复位。
  */
-/* 4-bit 下任何错误 → 本次上电永久禁用 4-bit，后续 Init 只走 1-bit。 */
+/* 4 位下任何错误 → 本次上电永久禁用 4 位，后续初始化只走 1 位。 */
 static void sdio_disable_4bit_permanently(void)
 {
     if (sdio_mode == APP_SD_MODE_4BIT)
@@ -123,16 +123,16 @@ void APP_SD_Card_InitHardware(void)
 /**
  * @brief  初始化 SD 卡硬件（懒启动）。
  * @note  执行两阶段初始化：
- *         1. 通过 HAL_SD_Init 进行 400 kHz / 1-bit 卡识别。
- *         2. 通过 HAL_SD_ConfigWideBusOperation 单次尝试 4-bit 模式。
- *         全程时钟保持在 400 kHz；4-bit 成功后不升速。
- *         如果 4-bit 已被先前的错误永久禁用，则跳过阶段 2。
+ *         1. 通过 HAL_SD_Init 进行 400 kHz / 1 位卡识别。
+ *         2. 通过 HAL_SD_ConfigWideBusOperation 单次尝试 4 位模式。
+ *         全程时钟保持在 400 kHz；4 位成功后不升速。
+ *         如果 4 位已被先前的错误永久禁用，则跳过阶段 2。
  * @return 成功返回 APP_SD_CARD_OK，句柄未设置返回 APP_SD_CARD_NO_INIT，
  *         HAL 错误返回 APP_SD_CARD_INIT_FAILED。
  */
 /*
  * SD 卡硬件初始化（懒启动），每次仅调用一次 HAL_SD_ConfigWideBusOperation。
- * 全程 400kHz；4-bit 失败或已被永久禁用则保持 1-bit。 */
+ * 全程 400kHz；4 位失败或已被永久禁用则保持 1 位。 */
 AppSdCardStatus_t APP_SD_Card_Init(void)
 {
     HAL_StatusTypeDef hal_ret;
@@ -147,7 +147,7 @@ AppSdCardStatus_t APP_SD_Card_Init(void)
         APP_SD_Card_Deinit();
     }
 
-    /* 第一阶段：400kHz / 1-bit 卡识别 */
+    /* 第一阶段：400kHz / 1 位卡识别 */
     hsd.Init.ClockEdge           = SDIO_CLOCK_EDGE_RISING;
     hsd.Init.ClockBypass         = SDIO_CLOCK_BYPASS_DISABLE;
     hsd.Init.ClockPowerSave      = SDIO_CLOCK_POWER_SAVE_DISABLE;
@@ -165,8 +165,8 @@ AppSdCardStatus_t APP_SD_Card_Init(void)
 
     HAL_SD_GetCardInfo(&hsd, &card_info);
 
-    /* 第二阶段：单次尝试 4-bit @ 400kHz。
-     * 若此前 4-bit 下读写已失败则永久跳过。 */
+    /* 第二阶段：单次尝试 4 位 @ 400kHz。
+     * 若此前 4 位下读写已失败则永久跳过。 */
     if (!sdio_4bit_permanently_off)
     {
         SDIO->DTIMER = APP_SD_WIDE_DTIMER;
@@ -229,8 +229,8 @@ void APP_SD_Card_Deinit(void)
  * @param  sector 起始逻辑块地址（LBA）。
  * @param  count 要读取的连续 512 字节扇区数。
  * @return 成功返回 APP_SD_CARD_OK，失败返回 APP_SD_CARD_ERROR / APP_SD_CARD_BUSY。
- *         错误会触发 4-bit 永久降级和卡反初始化。
- * @note  这是一个阻塞调用。发生总线错误时，4-bit 模式在本上电周期内被永久禁用，
+ *         错误会触发 4 位永久降级和卡反初始化。
+ * @note  这是一个阻塞调用。发生总线错误时，4 位模式在本上电周期内被永久禁用，
  *         且卡会被反初始化。
  */
 AppSdCardStatus_t APP_SD_Card_Read(uint8_t *buf, uint32_t sector, uint32_t count)
@@ -249,8 +249,8 @@ AppSdCardStatus_t APP_SD_Card_Read(uint8_t *buf, uint32_t sector, uint32_t count
 
     /*
      * HAL_SD_ReadBlocks 是阻塞调用，含超时参数。
-     * 失败时调用 Deinit，释放 SDIO 资源和卡状态，
-     * 以便上层通过定时重试机制（app_sd_file 60 秒间隔）重新 Init 卡。*/
+     * 失败时调用反初始化，释放 SDIO 资源和卡状态，
+     * 以便上层通过定时重试机制（app_sd_file 60 秒间隔）重新初始化卡。*/
     hal_ret = HAL_SD_ReadBlocks(&hsd, buf, sector, count, APP_SD_TIMEOUT);
     if (hal_ret != HAL_OK)
     {
@@ -269,8 +269,8 @@ AppSdCardStatus_t APP_SD_Card_Read(uint8_t *buf, uint32_t sector, uint32_t count
  * @param  sector 起始逻辑块地址（LBA）。
  * @param  count 要写入的连续 512 字节扇区数。
  * @return 成功返回 APP_SD_CARD_OK，失败返回 APP_SD_CARD_ERROR / APP_SD_CARD_BUSY。
- *         错误会触发 4-bit 永久降级和卡反初始化。
- * @note  这是一个阻塞调用。发生总线错误时，4-bit 模式在本上电周期内被永久禁用，
+ *         错误会触发 4 位永久降级和卡反初始化。
+ * @note  这是一个阻塞调用。发生总线错误时，4 位模式在本上电周期内被永久禁用，
  *         且卡会被反初始化。
  */
 AppSdCardStatus_t APP_SD_Card_Write(const uint8_t *buf, uint32_t sector,
@@ -349,7 +349,7 @@ SD_HandleTypeDef *APP_SD_Card_GetHandle(void)
 
 /**
  * @brief  获取当前 SDIO 总线宽度模式。
- * @return 0 = 1-bit，1 = 4-bit，2 = 4-bit 永久禁用（降级）。
+ * @return 0 = 1 位，1 = 4 位，2 = 4 位永久禁用（降级）。
  */
 uint8_t APP_SD_Card_GetMode(void)
 {

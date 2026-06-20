@@ -1,5 +1,5 @@
 /*
- * RR 模块——RIAV (Respiratory-Induced Amplitude Variation) 呼吸率估计。
+ * RR 模块——RIAV（呼吸诱导幅度变化）呼吸率估计。
  *
  * 原理: 呼吸会调节胸腔压力→每搏输出量→PPG 脉搏幅度。
  *       对逐拍幅值序列做包络检测，提取呼吸频率。
@@ -7,16 +7,16 @@
  * 门控条件（比 IBI/HRV 更慢更严格）:
  *   - SQ >= 25 (与 BPM 一致; 弱但稳定的 PPG 仍可累积包络)
  *   - >= 8 个心搏 (vs HRV 的 >=3)
- *   - >= 600 samples = 6 秒时间窗口
+ *   - >= 600 个样本 = 6 秒时间窗口
  *   - 脉搏幅度调制深度 >= amplitude_mean/25 且 >=4 (排除噪声引起的假调制)
- *   - 输出范围 [8, 30] breaths/min
+ *   - 输出范围 [8, 30] 次/分钟
  *
  * 历史管理:
- *   - Reset (手指离开/测量重置): 清零 amplitude buffer + rr_bpm。
- *   - SQ 不足/motion: 只标 valid=0，不清 buffer。
- *   - Motion artifact: app_measurement 层冻结，不清 RR 历史。
+ *   - 重置（手指离开/测量重置）：清零振幅缓冲 + rr_bpm。
+ *   - SQ 不足/运动：只将有效标志置 0，不清缓冲。
+ *   - 运动伪影：app_measurement 层冻结，不清 RR 历史。
  *
- * 未实现: RIFV (Respiratory-Induced Frequency Variation)、RIIDV。
+ * 未实现: RIFV（呼吸诱导频率变化）、RIIDV。
  */
 
 #include "app_rr.h"
@@ -124,7 +124,7 @@ void app_rr_update_output(AppState_t *app)
     return;
   }
 
-  /* 门控 1：amplitude ring buffer 中的最低拍数。 */
+  /* 门控 1：振幅环形缓冲中的最低拍数。 */
   if (rr_state.count < APP_RR_MIN_BEAT_COUNT)
   {
     return;

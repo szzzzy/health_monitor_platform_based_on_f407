@@ -146,8 +146,8 @@ void max30102_baseline_seed_tracking(MAX30102_Baseline_t *baseline,
  * @brief  在确认手指移开后持续跟踪背景 IR。
  * @param  baseline 指向基线结构的指针。
  * @param  ir_value 当前 IR 样本值。
- * @note   使用慢跟踪滤波器：tracked_ir 缓慢跟随（shift=4），
- *         noise_ir 稍快跟随（shift=3）。这使得基线能够
+ * @note   使用慢跟踪滤波器：tracked_ir 缓慢跟随（右移 4 位），
+ *         noise_ir 稍快跟随（右移 3 位）。这使得基线能够
  *         随环境变化漂移，而不会对短时突发噪声做出反应。
  */
 void max30102_baseline_track_background(MAX30102_Baseline_t *baseline, uint32_t ir_value)

@@ -24,12 +24,12 @@
 #include <string.h>
 
 /* --------------------------------------------------------------------------
- * USART2 DMA circular receive buffer
+ * USART2 DMA 循环接收缓冲区
  *
- * DMA1_Stream5_Channel4 -> CIRCULAR mode continuous receive,
- * IDLE interrupt detects frame gaps.
- * uart_dma_last_pos tracks the position consumed by the protocol layer.
- * uart_dma_idle_flag is set by ISR, polled and cleared by protocol layer.
+ * DMA1_Stream5_Channel4 -> CIRCULAR 循环模式连续接收。
+ * IDLE 中断用于检测帧间隔。
+ * uart_dma_last_pos 记录协议层已消费的位置。
+ * uart_dma_idle_flag 由中断置位，由协议层轮询并清除。
  * -------------------------------------------------------------------------- */
 static DMA_HandleTypeDef hdma_usart2_rx;
 static uint8_t  uart_dma_rx_buf[UART_DMA_RX_BUF_SIZE];

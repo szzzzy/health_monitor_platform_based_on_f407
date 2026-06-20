@@ -23,7 +23,7 @@ uint32_t max30102_calculate_centered_rms(uint64_t sum, uint64_t square_sum, uint
  * arm_bitreversal_32 的纯 C 替代实现。
  *
  * CMSIS-DSP 原版使用汇编（GAS 语法），ARMCLANG v6 / armasm 无法汇编。
- * 本函数提供等效功能：对交错的复数缓冲区进行 in-place 位逆序重排。
+ * 本函数提供等效功能：对交错的复数缓冲区进行原地位逆序重排。
  */
 void arm_bitreversal_32(uint32_t *pSrc, const uint16_t bitRevLength, const uint16_t *pBitRevTable);
 

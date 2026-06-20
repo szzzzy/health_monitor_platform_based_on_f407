@@ -1,22 +1,22 @@
 /*
- * PPG-only motion artifact 检测——无加速度计，纯从 PPG 信号推断。
+ * 仅基于 PPG 的运动伪影检测——无加速度计，纯从 PPG 信号推断。
  *
  * 三条检测信号及其贡献分：
- *   1. AC RMS 尖峰 (25分/通道): IR 或 RED 当前 RMS ≥ baseline × 3.0 且增量 ≥ 80。
- *   2. RED/IR 平衡异常 (25分): AC ratio x1000 落在 [350, 2800] 以外，或 R/BAL 已偏。
+ *   1. AC RMS 尖峰 (25分/通道): IR 或 RED 当前 RMS ≥ 基线 × 3.0 且增量 ≥ 80。
+ *   2. RED/IR 平衡异常 (25分): AC 比值 x1000 落在 [350, 2800] 以外，或 R/BAL 已偏。
  *   3. SQ 骤降 (35分): raw_quality 从 ≥45 的前值骤降 ≥25 点。
  *   总分截断至 100。
  *
  * 迟滞状态机 (防止边界抖动):
- *   - 进入: score ≥ 60 连续 5 拍确认 → motion_artifact = 1。
- *   - 退出: score ≤ 30 连续 30 拍确认 → motion_artifact = 0。
- *   - Motion 期间 AC RMS baseline 冻结（防止污染 baseline）。
- *   - 非 motion 期间 baseline 慢速跟踪 (shift=6)，维持自适应能力。
+ *   - 进入: 评分 ≥ 60 连续 5 拍确认 → motion_artifact = 1。
+ *   - 退出: 评分 ≤ 30 连续 30 拍确认 → motion_artifact = 0。
+ *   - 运动期间 AC RMS 基线冻结（防止污染基线）。
+ *   - 非运动期间基线慢速跟踪 (右移 6 位)，维持自适应能力。
  *
- * Motion 对测量的影响 (由 app_measurement 层执行):
- *   - HR/SpO2/RR/IBI/HRV valid 清零，旧值保留（UI 显示旧值+"?"）。
- *   - HRV/IBI ring buffer 不清——motion 结束可立即恢复。
- *   - 流式脉冲检测状态重置（防止跨 motion 的假 IBI）。
+ * 运动对测量的影响（由 app_measurement 层执行）：
+ *   - HR/SpO2/RR/IBI/HRV 的有效标志清零，旧值保留（UI 显示旧值+"?"）。
+ *   - HRV/IBI 环形缓冲不清——运动结束可立即恢复。
+ *   - 流式脉冲检测状态重置（防止跨运动的假 IBI）。
  */
 
 #include "app_motion.h"
@@ -25,7 +25,7 @@
 
 #define APP_MOTION_RMS_BASE_SHIFT      6U
 #define APP_MOTION_MIN_BASELINE_RMS    8U
-/* RMS 尖峰：当前值 >= baseline × 4.0 且增量 >= 120。 */
+/* RMS 尖峰：当前值 >= 基线 × 4.0 且增量 >= 120。 */
 #define APP_MOTION_RMS_SPIKE_X100      400U
 #define APP_MOTION_RMS_SPIKE_MIN_DELTA 120U
 #define APP_MOTION_RMS_SPIKE_SCORE     25U
@@ -37,7 +37,7 @@
 #define APP_MOTION_SQ_DROP_MIN_PREV    45U
 #define APP_MOTION_SQ_DROP_DELTA       30U
 #define APP_MOTION_SQ_DROP_SCORE       25U
-/* 迟滞阈值与确认计数。进入更严格：score≥75 连续 20 拍。 */
+/* 迟滞阈值与确认计数。进入更严格：评分 ≥75 连续 20 拍。 */
 #define APP_MOTION_SCORE_ON            75U
 #define APP_MOTION_SCORE_OFF           30U
 #define APP_MOTION_ON_CONFIRM_SAMPLES  20U
@@ -50,7 +50,7 @@ static struct
   uint8_t last_raw_quality;
   uint8_t on_count;
   uint8_t off_count;
-  /* AC RMS 慢速跟踪基线——motion 期间冻结。 */
+  /* AC RMS 慢速跟踪基线——运动期间冻结。 */
   uint32_t ir_ac_rms_baseline;
   uint32_t red_ac_rms_baseline;
 } motion_state;
@@ -86,8 +86,8 @@ void app_motion_reset(AppState_t *app)
  * @param  metrics     当前传感器信号指标（IR/RED AC RMS、DC）。
  * @param  raw_quality 传感器驱动的原始信号质量评分。
  * @note   来自三个检测器的评分：AC RMS 尖峰、RED/IR 平衡异常
- *         和 SQ 骤降。使用迟滞（score>=75 连续 20 拍进入，
- *         score<=30 连续 30 拍退出）。运动期间 AC RMS 基线冻结
+ *         和 SQ 骤降。使用迟滞（评分 >=75 连续 20 拍进入，
+ *         评分 <=30 连续 30 拍退出）。运动期间 AC RMS 基线冻结
  *         以避免污染。
  ******************************************************************************
  */
@@ -180,8 +180,8 @@ void app_motion_update_artifact(AppState_t *app,
   app->motion_score = score;
 
   /*
-   * 迟滞：进入需 score >= 60 连续 5 拍确认；
-   * 退出需 score <= 30 连续 30 拍确认。
+   * 迟滞：进入需评分 >= 60 连续 5 拍确认；
+   * 退出需评分 <= 30 连续 30 拍确认。
    * 任何不符合的拍都会重置确认计数。
    */
   if (app->motion_artifact != 0U)
@@ -228,8 +228,8 @@ void app_motion_update_artifact(AppState_t *app,
   }
 
   /*
-   * AC RMS baseline 在 motion 期间冻结（artifact RMS 会污染它）。
-   * 仅当不在 motion 且 score 低于 ON 阈值时才更新。
+   * AC RMS 基线在运动期间冻结（伪影 RMS 会污染它）。
+   * 仅当不在运动状态且评分低于进入阈值时才更新。
    */
   if ((app->motion_artifact == 0U) && (score < APP_MOTION_SCORE_ON))
   {
@@ -264,7 +264,7 @@ static uint8_t app_motion_ac_rms_spike(uint32_t current_rms, uint32_t baseline_r
   return 0U;
 }
 
-/* ---- 慢跟随：当前值每步以 1/2^shift 向目标值移动 ---- */
+/* ---- 慢跟随：当前值每步以 1/2^右移位数 向目标值移动 ---- */
 static uint32_t app_motion_slow_follow_u32(uint32_t current, uint32_t target, uint8_t shift)
 {
   uint32_t delta;

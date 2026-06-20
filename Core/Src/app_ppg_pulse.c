@@ -4,20 +4,20 @@
   * @brief   PPG 脉搏波峰检测与 IBI 提取（状态机型）
   *
   * 在带通滤波后的 PPG 信号上做状态机驱动的逐点峰/谷检测，
-  * 提取逐拍间隔 (IBI) 与 peak-to-trough 幅度，推送至 HRV 和 RR 模块。
+  * 提取逐拍间隔 (IBI) 与峰谷幅度，推送至 HRV 和 RR 模块。
   *
   * 检测算法（状态机）：
   *   1. IDLE — 跟踪初始信号摆动，积累足够幅值后进入 RISING
-  *   2. RISING — 更新 local_max；信号从 local_max 回落 >= hysteresis → 确认峰
-  *   3. FALLING — 更新 local_min；信号从 local_min 回升 >= hysteresis → 确认谷
-  *   4. 每次确认峰时用 peak-to-trough 幅度更新 beat_amp_ema
+  *   2. RISING — 更新局部最大值；信号回落达到迟滞值 → 确认峰
+  *   3. FALLING — 更新局部最小值；信号回升达到迟滞值 → 确认谷
+  *   4. 每次确认峰时用峰谷幅度更新 beat_amp_ema
   *   5. 同极性峰间隔 (IBI) 必须在 [300ms, 2000ms] 范围内
-  *   6. hysteresis = max(2, beat_amp_ema / 4)，初始用噪声门限
+  *   6. 迟滞值 = max(2, beat_amp_ema / 4)，初始用噪声门限
   *
-  * 相比旧版 3 点相邻 prominence：
+  * 相比旧版 3 点相邻突出度：
   *   - 不受 PPG 峰顶圆滑导致的相邻点差过小问题影响
-  *   - beat_amplitude 是真正的 peak-to-trough，适合 RR/PI 模块
-  *   - 自适应 hysteresis 随信号强度自动调节
+  *   - beat_amplitude 是真正的峰谷幅度，适合 RR/PI 模块
+  *   - 自适应迟滞值随信号强度自动调节
   ******************************************************************************
   */
 
@@ -44,16 +44,16 @@
 #define BEAT_STATE_RISING   1U
 #define BEAT_STATE_FALLING  2U
 
-/* 流式 beat 检测器内部状态 */
+/* 流式搏动检测器内部状态 */
 static struct
 {
   int32_t  local_max;           /* 当前上升段局部最大值 */
   uint32_t local_max_sample;    /* local_max 的全局样本编号 */
   int32_t  local_min;           /* 当前下降段局部最小值 */
   uint32_t local_min_sample;    /* local_min 的全局样本编号 */
-  int32_t  prev_trough;         /* 上一个已确认谷值（用于 peak-to-trough 幅度） */
+  int32_t  prev_trough;         /* 上一个已确认谷值（用于峰谷幅度） */
   uint32_t prev_peak_sample;    /* 上一个已确认峰的全局样本编号 */
-  uint32_t beat_amp_ema;        /* peak-to-trough 幅度的 EMA */
+  uint32_t beat_amp_ema;        /* 峰谷幅度的 EMA */
   uint8_t  beat_amp_ema_valid;  /* EMA 已初始化 */
   uint8_t  state;               /* 当前状态机状态 */
   uint8_t  sample_count;        /* 已接收样本计数（初始化用） */
@@ -119,7 +119,7 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
     beat.sample_count++;
     if (beat.sample_count >= 2U)
     {
-      /* 用前两个样本初始化 local_min/local_max */
+      /* 用前两个样本初始化局部最小值/最大值 */
       beat.local_min = (beat.sample_buf[0] < beat.sample_buf[1]) ?
                         beat.sample_buf[0] : beat.sample_buf[1];
       beat.local_max = (beat.sample_buf[0] > beat.sample_buf[1]) ?
@@ -193,13 +193,13 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
     }
     else if ((beat.local_max - filtered_sample) >= (int32_t)beat.hysteresis)
     {
-      /* 峰确认：信号从 local_max 回落 >= hysteresis */
+      /* 峰确认：信号从局部最大值回落达到迟滞值 */
       beat_amplitude = (uint32_t)(beat.local_max - beat.prev_trough);
 
       /* 仅当幅度超过噪声门限才接受 */
       if (beat_amplitude >= noise_floor)
       {
-        /* 更新 peak-to-trough 幅度的 EMA */
+        /* 更新峰谷幅度的 EMA */
         if (beat.beat_amp_ema_valid != 0U)
         {
           beat.beat_amp_ema = ((beat.beat_amp_ema * APP_BEAT_EMA_OLD_WEIGHT) +
@@ -250,7 +250,7 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
     }
     else if ((filtered_sample - beat.local_min) >= (int32_t)beat.hysteresis)
     {
-      /* 谷确认：信号从 local_min 回升 >= hysteresis */
+      /* 谷确认：信号从局部最小值回升达到迟滞值 */
       beat.prev_trough = beat.local_min;
 
       /* 切换到上升跟踪 */
@@ -295,7 +295,7 @@ void app_ppg_pulse_process_metrics(AppState_t *app,
     return;
   }
 
-  /* 更新 beat-based PI EMA（每个 accepted beat 更新一次） */
+  /* 更新基于搏动的 PI EMA（每个已接受搏动更新一次） */
   if (pulse_info->beat_amplitude != 0U)
   {
     if (app->ir_pi_ac_ema_valid != 0U)

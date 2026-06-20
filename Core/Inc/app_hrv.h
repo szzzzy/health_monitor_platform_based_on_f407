@@ -2,16 +2,16 @@
  * HRV 模块——时域与 Poincare 短窗口指标。
  *
  * 历史管理策略：
- * - app_hrv_reset():     清零 IBI ring buffer 与所有输出（手指离开/测量重置）。
- * - app_hrv_invalidate_outputs(): 只标 valid=0，保留数值（信号短暂中断）。
- * - Motion artifact 期间进 invalidate，不清 buffer。
+ * - app_hrv_reset():     清零 IBI 环形缓冲与所有输出（手指离开/测量重置）。
+ * - app_hrv_invalidate_outputs(): 只将有效标志置 0，保留数值（信号短暂中断）。
+ * - 运动伪影期间进入失效标记路径，不清缓冲。
  *
  * IBI 接受规则：
  * - 绝对范围：300–2000 ms。
  * - 相对跳变：相对已有 >=4 个 IBI 均值的偏差 ≤50%。
  *
  * 输出门控：
- * - hrv_valid=1 要求 >=3 个已接受的 IBI；>=4 个后再启用跳变过滤。
+ * - hrv_valid 为 1 要求 >=3 个已接受的 IBI；>=4 个后再启用跳变过滤。
  * - SD1 = RMSSD / sqrt(2)   (Poincare 短轴)。
  * - SD2 = sqrt(2*SDNN^2 - SD1^2)  (Poincare 长轴)。
  * - SD1/SD2 x100 为短/长期变异性比值。
@@ -35,13 +35,13 @@ extern "C" {
 
 /* 清零所有 IBI 历史和输出值——手指离开/测量重置时调用。 */
 void app_hrv_reset(AppState_t *app);
-/* 只标 valid=0 保留旧值——信号短暂中断/motion 时调用。不清 ring buffer。 */
+/* 只将有效标志置 0 并保留旧值——信号短暂中断/运动时调用。不清环形缓冲。 */
 void app_hrv_invalidate_outputs(AppState_t *app);
 /* 去重检查：同采样编号不重复触发。返回 1 表示新峰。 */
 uint8_t app_hrv_mark_peak_seen(uint32_t peak_sample);
 /* 陈旧性检查：上次峰距今是否超过 stale_samples。返回 1 表示陈旧。 */
 uint8_t app_hrv_is_peak_stale(uint32_t current_sample, uint32_t stale_samples);
-/* IBI 接受 + 压入 ring buffer + 触发输出更新。返回 1 表示被接受。 */
+/* IBI 接受 + 压入环形缓冲 + 触发输出更新。返回 1 表示被接受。 */
 uint8_t app_hrv_add_ibi(AppState_t *app, uint16_t ibi_ms);
 
 #ifdef __cplusplus

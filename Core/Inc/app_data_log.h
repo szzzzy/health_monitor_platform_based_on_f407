@@ -6,11 +6,11 @@
   * 架构：
   *   实时路径 (100Hz):   PushSample()  → 16 字节 memcpy 入队，O(1)
   *   后台路径 (主循环):   ServiceBudget(budget_ms) → 格式化 + f_write
-  *   停止路径 (手指离开): OnMeasurementStop() → flush + f_sync
+  *   停止路径 (手指离开): OnMeasurementStop() → 排空 + f_sync
   *
   * 关键约束：
   *   - PushSample 不做任何 snprintf / f_write / f_sync
-  *   - ServiceBudget 每轮至多一次 f_write (512B chunk)，至多 budget_ms 时间
+  *   - ServiceBudget 每轮至多一次 f_write (512B 分片)，至多 budget_ms 时间
   *   - 环形缓冲满时覆盖最旧记录（静默丢日志，不破坏采样）
   ******************************************************************************
   */
@@ -29,11 +29,11 @@ typedef struct __attribute__((packed)) {
   uint32_t red;
   uint32_t ir;
   int16_t  ecg;
-  uint8_t  flags;    /* bit0:finger_present, bit1:contact_settle, bit2:fifo_ovf */
+  uint8_t  flags;    /* 位0:手指就位, 位1:接触稳定, 位2:FIFO 溢出 */
   uint8_t  seq;
 } DataLogRawSample_t;
 
-/* 二进制文件头 (32 字节)，每个 session 文件开头写入一次 */
+/* 二进制文件头 (32 字节)，每个会话文件开头写入一次 */
 typedef struct __attribute__((packed)) {
   uint8_t  magic[4];      /* "BMLG" */
   uint16_t version;       /* 1 */
@@ -46,8 +46,8 @@ typedef struct __attribute__((packed)) {
 typedef struct {
   uint16_t buffered;       /* 环形缓冲中待写入样本数 */
   uint16_t dropped;        /* 累计丢弃样本数（环形缓冲溢出） */
-  uint16_t written;        /* 本次 session 已持久化样本数 */
-  uint32_t total_written;  /* 累计持久化样本总数（跨 session） */
+  uint16_t written;        /* 本次会话已持久化样本数 */
+  uint32_t total_written;  /* 累计持久化样本总数（跨会话） */
   uint8_t  paused;         /* 1 = SD 写入已暂停（慢/满/错误） */
   uint8_t  sd_error;       /* 最后一次 SD 错误码 (AppSdFileStatus_t) */
   uint8_t  state;          /* 内部状态机阶段 (SdLogState_t) */
@@ -55,7 +55,7 @@ typedef struct {
   uint32_t last_backlog;   /* 最近一次观测到的堆积量 */
 } DataLogStatus_t;
 
-/* ---- API ---- */
+/* ---- 公共 API ---- */
 
 void     APP_DataLog_Init(void);
 
@@ -67,13 +67,13 @@ void     APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
                                 int16_t ecg, uint8_t flags);
 
 /*
- * 后台路径：按预算写 SD。每轮至多写一个 512B chunk。
+ * 后台路径：按预算写 SD。每轮至多写一个 512B 分片。
  *   budget_ms: 本轮允许的最大耗时 (ms)，超出后立即返回
  * 返回实际写入的字节数（0 或 512）。
  */
 uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms);
 
-/* 手指离开 / 测量停止时调用，flush 剩余缓冲并 f_sync。 */
+/* 手指离开 / 测量停止时调用，排空剩余缓冲并 f_sync。 */
 void     APP_DataLog_OnMeasurementStop(void);
 
 /* 查询运行时状态。 */
@@ -89,12 +89,12 @@ uint8_t  APP_DataLog_IsActive(void);
 void     APP_DataLog_SetMeasurementActive(uint8_t active);
 
 /*
- * 分片执行延迟 flush：每轮至多 1 chunk drain 或 1 次 f_sync/f_close。
- * 返回 1 = flush 已完成，0 = 仍在进行中或无 pending。
+ * 分片执行延迟排空：每轮至多排空 1 个分片或执行 1 次 f_sync/f_close。
+ * 返回 1 = 排空已完成，0 = 仍在进行中或无待处理任务。
  */
 uint8_t  APP_DataLog_ServiceDeferredStop(void);
 
-/* 查询是否有延迟 flush 待执行。 */
+/* 查询是否有延迟排空待执行。 */
 uint8_t  APP_DataLog_IsFlushPending(void);
 
 /* 返回 SD 状态机阶段的可读标签，供 OLED 显示层使用。 */

@@ -21,11 +21,11 @@ extern "C" {
 #define DIAG_CRASH_ERROR_HANDLER 9U
 
 /* BKP 寄存器布局（RTC 备份域，热复位后保持）：
- * DR1 = crash magic 0xCA7A570F（仅在崩溃时设置）
- * DR2 = crash_source | (task_id << 8) | (phase << 16)
- * DR3 = crash tick（崩溃时滴答）
+ * DR1 = 崩溃魔数 0xCA7A570F（仅在崩溃时设置）
+ * DR2 = 崩溃源 | (任务 ID << 8) | (阶段码 << 16)
+ * DR3 = 崩溃滴答（崩溃时滴答）
  * DR4 = reboot_count（共享崩溃+活跃计数）
- * DR5 = liveness magic 0x11FE5AFE
+ * DR5 = 活跃快照魔数 0x11FE5AFE
  * DR6 = max_phase[7:0] | max_hb_lsb[15:8]
  * DR7 = ui_phase[7:0] | sd_phase[15:8]
  * DR8 = wdt_phase[7:0] | wdt_refresh_tick_lsb[15:8]
@@ -35,14 +35,14 @@ extern "C" {
 #define APP_DIAG_BKP_MAGIC_CRASH    0xCA7A570FUL
 #define APP_DIAG_BKP_MAGIC_LIVENESS 0x11FE5AFEUL
 
-/* ---- Public API ---- */
+/* ---- 公共 API ---- */
 void APP_Diag_Init(void);
 void APP_Diag_CaptureCrash(uint8_t source, uint8_t task_id, uint8_t phase);
 void APP_Diag_ClearCrash(void);
 uint8_t APP_Diag_HasCrashRecord(void);
 void APP_Diag_ReadCrashToAppState(AppState_t *app);
 
-/* 周期性活跃快照（每约 1 秒由 watchdogtask 调用） */
+/* 周期性活跃快照（每约 1 秒由看门狗任务调用） */
 void APP_Diag_SaveLiveness(const AppState_t *app);
 
 /* 栈高水位快照（由 UiTask 调用） */

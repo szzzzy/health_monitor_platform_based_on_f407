@@ -39,9 +39,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* 故障 handler 从 AppState 推断"最可能正在运行的任务"及其阶段码。
- * 因为 fault handler 在 exception context 中执行，不能调用 FreeRTOS API。
- * 策略：非零 phase 的任务 = 最可能是肇事者（优先级高的优先）。 */
+/* 故障处理函数从 AppState 推断“最可能正在运行的任务”及其阶段码。
+ * 因为故障处理函数在异常上下文中执行，不能调用 FreeRTOS API。
+ * 策略：阶段码非零的任务 = 最可能是肇事者（优先级高的优先）。 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -62,27 +62,23 @@
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* ---- Infer likely culprit task ID and phase from AppState ----
+/* ---- 从 AppState 推断最可能的故障任务与阶段 ----
  *
- * Crash recording strategy:
- *   Fault handlers (HardFault, NMI, MemManage, BusFault, UsageFault) run in
- *   exception context where most FreeRTOS/HAL APIs are unsafe.  To capture
- *   diagnostics without calling any OS function, the system relies on a
- *   "liveness snapshot" that the watchdog task periodically writes to RTC
- *   backup registers (see app_diag.c).  When a fault fires, each handler
- *   calls fault_get_task_phase() to read the most recently-saved task phases
- *   from AppState, then passes the result to APP_Diag_CaptureCrash() which
- *   persists the crash record to BKP SRAM using only direct register writes.
+ * 崩溃记录策略：
+ *   故障处理函数 (HardFault、NMI、MemManage、BusFault、UsageFault) 运行在
+ *   异常上下文，大多数 FreeRTOS/HAL API 都不安全。为了在不调用 OS 函数的
+ *   前提下保留诊断信息，系统依赖看门狗任务周期性写入 RTC 备份寄存器的
+ *   “活体快照”（见 app_diag.c）。故障发生时，各处理函数调用
+ *   fault_get_task_phase() 读取 AppState 中最近保存的任务阶段，再传给
+ *   APP_Diag_CaptureCrash()；后者仅用直接寄存器写入把崩溃记录持久化到 BKP SRAM。
  *
- *   This function scans AppState phase fields in priority order
- *   (MAX > UI > WDT > SD, matching FreeRTOS task priorities).  The first
- *   task whose phase is not its IDLE value is considered the most likely
- *   culprit.  If all tasks appear idle, task_id 0 (unknown) is returned.
+ *   本函数按优先级顺序扫描 AppState 的阶段字段
+ *   (MAX > UI > WDT > SD，与 FreeRTOS 任务优先级一致)。第一个阶段码
+ *   不是 IDLE 的任务被视为最可能的故障来源。若所有任务看起来都空闲，
+ *   返回任务 ID 0（未知）。
  *
- *   This is a best-effort heuristic: a task may have been preempted between
- *   its last phase update and the fault, yielding a false negative.  The
- *   liveness snapshot in BKP registers provides additional post-mortem
- *   context for offline debugging. */
+ *   这是尽力而为的启发式判断：任务可能在最后一次阶段码更新后到故障发生前
+ *   被抢占，从而产生漏判。BKP 寄存器里的活体快照会为离线分析提供额外上下文。 */
 static void fault_get_task_phase(uint8_t *task_id, uint8_t *phase)
 {
     AppState_t *s = app_rtos_get_state();
@@ -281,13 +277,13 @@ void DMA2_Stream0_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
-/* ---- DMA1 Stream5: USART2 RX ---- */
+/* ---- DMA1 Stream5：USART2 接收 ---- */
 void DMA1_Stream5_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(huart2.hdmarx);
 }
 
-/* ---- USART2: idle-line detection for DMA RX ---- */
+/* ---- USART2：DMA 接收空闲线检测 ---- */
 void USART2_IRQHandler(void)
 {
   if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE) != RESET)
@@ -298,25 +294,25 @@ void USART2_IRQHandler(void)
   HAL_UART_IRQHandler(&huart2);
 }
 
-/* ---- DMA1 Stream0: I2C1 RX ---- */
+/* ---- DMA1 Stream0：I2C1 接收 ---- */
 void DMA1_Stream0_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(hi2c1.hdmarx);
 }
 
-/* ---- DMA1 Stream6: I2C1 TX ---- */
+/* ---- DMA1 Stream6：I2C1 发送 ---- */
 void DMA1_Stream6_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(hi2c1.hdmatx);
 }
 
-/* ---- I2C1 Event interrupt ---- */
+/* ---- I2C1 事件中断 ---- */
 void I2C1_EV_IRQHandler(void)
 {
   HAL_I2C_EV_IRQHandler(&hi2c1);
 }
 
-/* ---- I2C1 Error interrupt ---- */
+/* ---- I2C1 错误中断 ---- */
 void I2C1_ER_IRQHandler(void)
 {
   HAL_I2C_ER_IRQHandler(&hi2c1);
@@ -325,7 +321,7 @@ void I2C1_ER_IRQHandler(void)
 /* MAX30102 PPG_RDY 中断（PE5 下降沿）
  * 当 PE5 未连接到 MAX30102 INT 引脚，此 ISR 永远不会触发。
  * 系统会通过 TIM6 节拍兜底轮询。 */
-/* ---- HAL GPIO EXTI callback: dispatch by pin (MAX30102 ready) ---- */
+/* ---- HAL GPIO EXTI 回调：按引脚分发（MAX30102 数据就绪） ---- */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
 #if (MAX30102_USE_INT_PIN != 0U)
@@ -338,7 +334,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 #endif
 }
 
-/* ---- SDIO global interrupt ---- */
+/* ---- SDIO 全局中断 ---- */
 void SDIO_IRQHandler(void)
 {
   HAL_SD_IRQHandler(APP_SD_Card_GetHandle());

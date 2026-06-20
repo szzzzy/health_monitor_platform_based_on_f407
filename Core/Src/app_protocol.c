@@ -9,7 +9,7 @@
 #include "usart.h"
 
 /* 串口上报与接收缓冲长度，足够覆盖当前文本协议。 */
-#define JSON_PAYLOAD_SIZE     1024U
+#define JSON_PAYLOAD_SIZE     1280U
 #define UART_RX_LINE_SIZE     64U
 #define STM32_UART_TIMEOUT_MS 100U
 
@@ -28,9 +28,9 @@ static void app_send_rtc_set_response(AppState_t *app, uint8_t success, const ch
 static bool app_process_uart_line(AppState_t *app, const char *line);
 
 /**
- * @brief  Initialize the UART command-line protocol module.
- * @note   Resets the internal UART RX line buffer length to zero.
- *         Must be called once at system startup before any UART communication.
+ * @brief  初始化 UART 命令行协议模块。
+ * @note   将内部 UART RX 行缓冲长度清零。
+ *         必须在系统启动且任何 UART 通信开始前调用一次。
  */
 /* 初始化串口接收行缓冲。 */
 void app_protocol_init(void)
@@ -39,12 +39,11 @@ void app_protocol_init(void)
 }
 
 /**
- * @brief  Read the current RTC date/time snapshot into the application state.
- * @param  app Pointer to the application state (rtc_datetime field is updated).
- * @note   Updates rtc_read_ok and rtc_time_valid flags based on RTC status.
- *         On read failure, the rtc_datetime structure is zeroed out.
- *         This snapshot is used by both display and serial report functions
- *         to ensure consistent timestamps within a single refresh cycle.
+ * @brief  将当前 RTC 日期/时间快照读入应用状态。
+ * @param  app 应用状态指针（更新 rtc_datetime 字段）。
+ * @note   根据 RTC 状态更新 rtc_read_ok 和 rtc_time_valid 标志。
+ *         读取失败时清零 rtc_datetime 结构体。
+ *         显示和串口上报都会使用该快照，保证单次刷新周期内时间戳一致。
  */
 /* 读取 RTC 当前快照，供显示与上报统一使用。 */
 void app_protocol_update_rtc_snapshot(AppState_t *app)
@@ -68,13 +67,13 @@ void app_protocol_update_rtc_snapshot(AppState_t *app)
 }
 
 /**
- * @brief  Poll the USART2 DMA circular buffer for incoming command lines.
- * @param  app Pointer to the application state (updated on valid commands).
- * @note   Processes received bytes from the DMA idle-line interrupt.
- *         Lines are delimited by '\n'; '\r' characters are skipped.
- *         Recognized commands: TIME (query) and SETTIME (set RTC).
- *         On a valid SETTIME command, the RTC is updated and a response is sent.
- *         If a line exceeds UART_RX_LINE_SIZE, the buffer is reset.
+ * @brief  轮询 USART2 DMA 环形缓冲，接收命令行。
+ * @param  app 应用状态指针（收到有效命令时更新）。
+ * @note   处理 DMA 空闲行中断后累计的接收字节。
+ *         行以 '\n' 分隔，'\r' 字符会被跳过。
+ *         识别命令：TIME（查询）和 SETTIME（设置 RTC）。
+ *         收到有效 SETTIME 命令时更新 RTC 并发送响应。
+ *         若单行超过 UART_RX_LINE_SIZE，则重置缓冲。
  */
 /* 轮询 USART2 DMA 缓冲区，按”单行命令”协议接收 TIME / SETTIME。 */
 void app_protocol_poll_uart_commands(AppState_t *app)
@@ -136,11 +135,10 @@ void app_protocol_poll_uart_commands(AppState_t *app)
 }
 
 /**
- * @brief  Build and transmit the current sensor measurement report over UART.
- * @param  app Pointer to the application state (reads all measurement fields).
- * @note   Updates the RTC snapshot before building the packet, then sends the
- *         formatted line via USART2. The report is built by build_sensor_packet()
- *         and transmitted by send_uart_line().
+ * @brief  组装当前传感器测量上报，并通过 UART 发送。
+ * @param  app 应用状态指针（读取全部测量字段）。
+ * @note   组包前先更新 RTC 快照，再通过 USART2 发送格式化文本行。
+ *         报文由 build_sensor_packet() 构建，并由 send_uart_line() 发送。
  */
 /* 组装当前测量报文并通过串口发送。 */
 void app_protocol_send_sensor_report(AppState_t *app)
@@ -158,15 +156,15 @@ void app_protocol_send_sensor_report(AppState_t *app)
 }
 
 /**
- * @brief  Build the comma-separated sensor measurement report packet.
- * @param  app         Pointer to the application state struct.
- * @param  buffer      Output buffer for the formatted packet string.
- * @param  buffer_size Size of the output buffer.
- * @return The length of the formatted packet string in bytes, or 0 on error.
- * @note   The report format is backward-compatible: legacy host software can
- *         parse the leading fields while newer hosts use the appended diagnostic
- *         fields (SQ, PI, R/BAL, sensor/SD/RTC diagnostics) for confidence.
- *         Fields: M,rtc_valid,yyyymmdd,hhmmss,red,ir,...,crash_flag,...,stack_hwm
+ * @brief  构建逗号分隔的传感器测量上报报文。
+ * @param  app         应用状态结构体指针。
+ * @param  buffer      格式化报文字符串输出缓冲。
+ * @param  buffer_size 输出缓冲大小。
+ * @return 格式化报文字符串长度（字节），出错时返回 0。
+ * @note   上报格式向后兼容：旧版上位机可解析前缀字段，
+ *         新版上位机使用追加的诊断字段（SQ、PI、R/BAL、
+ *         传感器/SD/RTC 诊断）判断可信度。
+ *         字段：M,rtc_valid,yyyymmdd,hhmmss,red,ir,...,crash_flag,...,stack_hwm
  */
 /*
  * 字段顺序兼容旧上位机，不可改变。
@@ -193,7 +191,9 @@ void app_protocol_send_sensor_report(AppState_t *app)
  *   ecg_no_r_peak_timeout_count,crash_flag,crash_source,crash_task,crash_phase,
  *   crash_tick,reboot_count,reset_flags,max_task_phase,ui_task_phase,sd_task_phase,
  *   wdt_task_phase,max_task_stack_hwm,ui_task_stack_hwm,sd_task_stack_hwm,
- *   wdt_task_stack_hwm,max_task_heartbeat,ui_task_heartbeat
+ *   wdt_task_stack_hwm,max_task_heartbeat,ui_task_heartbeat,
+ *   ecg_signal_quality,ecg_invalid_reason,ecg_raw_span,ecg_filtered_span,
+ *   ecg_noise_level,ecg_qrs_threshold,ecg_peak_snr_x100,ecg_dma_available_high_watermark
  */
 
 /* ---- 小型 CSV 构建器：避免超长 snprintf，逐字段追加 ---- */
@@ -286,7 +286,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_sdnn_ms);
   app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_rmssd_ms);
 
-  /* -- Motion/SD/Rhythm -- */
+  /* -- 运动/SD/节律 -- */
   app_csv_appendf(&b, "%u,", (unsigned int)app->motion_artifact);
   app_csv_appendf(&b, "%u,", (unsigned int)app->motion_score);
   app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_sd1_ms);
@@ -294,7 +294,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%u,", (unsigned int)app->hrv_sd1_sd2_x100);
   app_csv_appendf(&b, "%u,", (unsigned int)app->rhythm_irregular);
 
-  /* -- HRV freq -- */
+  /* -- HRV 频域 -- */
   app_csv_appendf(&b, "%u,",  (unsigned int)app->hrv_freq_valid);
   app_csv_appendf(&b, "%lu,", (unsigned long)app->hrv_lf_power_x100);
   app_csv_appendf(&b, "%lu,", (unsigned long)app->hrv_hf_power_x100);
@@ -308,7 +308,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%lu,", (unsigned long)app->signal_ir_ac_rms);
   app_csv_appendf(&b, "%lu,", (unsigned long)app->signal_red_ac_rms);
 
-  /* -- SpO2 ratio -- */
+  /* -- SpO2 比率 -- */
   app_csv_appendf(&b, "%u,", (unsigned int)app->spo2_ratio_valid);
   app_csv_appendf(&b, "%u,", (unsigned int)app->spo2_ratio_x1000);
   app_csv_appendf(&b, "%u,", (unsigned int)app->spo2_balance_status);
@@ -391,23 +391,35 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%u,", (unsigned int)app->ui_task_stack_hwm);
   app_csv_appendf(&b, "%u,", (unsigned int)app->sd_task_stack_hwm);
   app_csv_appendf(&b, "%u,", (unsigned int)app->wdt_task_stack_hwm);
+
+  /* 任务心跳 (100-101) */
   app_csv_appendf(&b, "%lu,", (unsigned long)app->max_task_heartbeat);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ui_task_heartbeat);
+
+  /* ECG 质量与诊断 (102-109) */
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_signal_quality);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_invalid_reason);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_raw_span);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_filtered_span);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_noise_level);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_qrs_threshold);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_peak_snr_x100);
 
   /* 最后一个字段，不加逗号 */
-  app_csv_appendf(&b, "%lu", (unsigned long)app->ui_task_heartbeat);
+  app_csv_appendf(&b, "%u", (unsigned int)app->ecg_dma_available_high_watermark);
 
   return (uint16_t)b.len;
 }
 
 /**
- * @brief  Send a text line over USART2 with CRLF termination.
- * @param  app          Pointer to the application state (used for flags).
- * @param  payload      The string to transmit (no CRLF appended yet).
- * @param  payload_len  Length of the payload string.
- * @return true if both payload and CRLF were transmitted successfully,
- *         false otherwise (app->uart_tx_message_valid is updated).
- * @note   Uses a blocking HAL_UART_Transmit with a 100 ms timeout per segment.
- *         A static CRLF byte sequence is appended automatically.
+ * @brief  通过 USART2 发送带 CRLF 结尾的文本行。
+ * @param  app          应用状态指针（用于更新标志位）。
+ * @param  payload      待发送字符串（尚未附加 CRLF）。
+ * @param  payload_len  payload 字符串长度。
+ * @return payload 和 CRLF 均发送成功时返回 true，
+ *         否则返回 false（同时更新 app->uart_tx_message_valid）。
+ * @note   每段发送使用阻塞式 HAL_UART_Transmit，超时 100 ms。
+ *         静态 CRLF 字节序列会自动附加到末尾。
  */
 /* 通过 USART2 发送一行文本，并在末尾补充 CRLF。 */
 static bool send_uart_line(AppState_t *app, const char *payload, uint16_t payload_len)
@@ -444,9 +456,9 @@ static bool send_uart_line(AppState_t *app, const char *payload, uint16_t payloa
 }
 
 /**
- * @brief  Skip leading whitespace characters (spaces and tabs) in a string.
- * @param  text Pointer to the input string.
- * @return Pointer to the first non-whitespace character, or NULL if text is NULL.
+ * @brief  跳过字符串开头的空白字符（空格和制表符）。
+ * @param  text 输入字符串指针。
+ * @return 指向第一个非空白字符的指针；若 text 为 NULL 则返回 NULL。
  */
 /* 跳过命令字符串前导空格。 */
 static const char *app_skip_spaces(const char *text)

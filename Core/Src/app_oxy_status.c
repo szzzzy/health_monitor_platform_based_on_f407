@@ -25,15 +25,15 @@
 #define APP_OXY_BAL_HIGH_RATIO_X1000    2000U  /* 高于此值 → 偏高 */
 #define APP_OXY_RATIO_MIN_AC_RMS        2U     /* AC RMS 最小有效值 */
 
-/* 信号质量平滑右移位数（步长 = delta / 4） */
+/* 信号质量平滑右移位数（步长 = 差值 / 4） */
 #define APP_SIGNAL_QUALITY_SMOOTH_SHIFT 2U
 
 static void app_oxy_status_update_balance(AppState_t *app, const MAX30102_SignalMetrics_t *metrics);
 
 /**
  ******************************************************************************
- * @brief  Reset all signal-quality and SpO2-ratio fields to zero/unknown.
- * @param  app Pointer to AppState (may be NULL).
+ * @brief  将所有信号质量和 SpO2 比率字段重置为零/未知。
+ * @param  app AppState 指针（可为 NULL）。
  ******************************************************************************
  */
 void app_oxy_status_reset(AppState_t *app)
@@ -55,8 +55,8 @@ void app_oxy_status_reset(AppState_t *app)
 
 /**
  ******************************************************************************
- * @brief  Instant clear of all signal-quality fields (same as reset).
- * @param  app Pointer to AppState.
+ * @brief  立即清空所有信号质量字段（等同重置）。
+ * @param  app AppState 指针。
  ******************************************************************************
  */
 void app_oxy_status_clear_instant(AppState_t *app)
@@ -66,12 +66,12 @@ void app_oxy_status_clear_instant(AppState_t *app)
 
 /**
  ******************************************************************************
- * @brief  Update all signal-quality and SpO2 fields from sensor metrics.
- * @param  app         Pointer to AppState (may be NULL; cleared on NULL).
- * @param  metrics     Sensor metrics containing AC RMS, DC, PI values.
- * @param  raw_quality Raw signal quality score from the sensor driver.
- * @note  Copies IR/RED AC RMS, PI, updates quality smoothed value, and
- *        recomputes SpO2 ratio and balance status.
+ * @brief  根据传感器指标更新全部信号质量和 SpO2 字段。
+ * @param  app         AppState 指针（可为 NULL；为 NULL 时执行清空路径）。
+ * @param  metrics     传感器指标，包含 AC RMS、DC、PI 等值。
+ * @param  raw_quality 传感器驱动输出的原始信号质量评分。
+ * @note   复制 IR/RED AC RMS 与 PI，更新质量平滑值，
+ *         并重新计算 SpO2 比率和平衡状态。
  ******************************************************************************
  */
 void app_oxy_status_update_from_metrics(AppState_t *app,
@@ -94,11 +94,11 @@ void app_oxy_status_update_from_metrics(AppState_t *app,
 
 /**
  ******************************************************************************
- * @brief  Smooth signal quality using asymmetric step tracking.
- * @param  app         Pointer to AppState (may be NULL).
- * @param  raw_quality Raw quality score to track towards.
- * @note   Step = delta/4 (min 1) for both rising and falling quality.
- *         Prevents brief noise dips from collapsing the quality score.
+ * @brief  使用步进跟踪平滑信号质量。
+ * @param  app         AppState 指针（可为 NULL）。
+ * @param  raw_quality 要跟踪的原始质量评分。
+ * @note   上升和下降均使用步长 = 差值 / 4（最小 1）。
+ *         防止短暂噪声下陷把质量评分瞬间拉低。
  ******************************************************************************
  */
 void app_oxy_status_update_quality(AppState_t *app, uint8_t raw_quality)
@@ -143,7 +143,7 @@ void app_oxy_status_update_quality(AppState_t *app, uint8_t raw_quality)
   app->signal_quality = (uint8_t)(current_quality - step);
 }
 
-/* ---- SpO2 ratio computation + RED/IR balance status classification ---- */
+/* ---- SpO2 比率计算 + RED/IR 平衡状态分类 ---- */
 static void app_oxy_status_update_balance(AppState_t *app, const MAX30102_SignalMetrics_t *metrics)
 {
   uint32_t ratio_x1000;

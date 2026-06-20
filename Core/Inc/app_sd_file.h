@@ -15,7 +15,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define APP_SD_FILE_BUF_SIZE  1024U   /* 1KB — 每 2 chunk 物理写入一次，防止突发 */
+#define APP_SD_FILE_BUF_SIZE  1024U   /* 1KB — 每 2 个分片物理写入一次，防止突发 */
 
 typedef enum {
     APP_SD_FILE_OK          = 0,

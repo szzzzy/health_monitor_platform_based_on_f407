@@ -19,7 +19,7 @@ extern "C" {
 #include "app_state.h"
 
 /* === ECG 调试显示模式 ====================================================== */
-/* 设为 1 以在 OLED 上直接显示 raw ADC 波形 (raw_value - 2048)，绕过所有显示滤波。
+/* 设为 1 以在 OLED 上直接显示原始 ADC 波形 (raw_value - 2048)，绕过所有显示滤波。
  * 仅用于验证 AD8232 模拟前端输出是否正常到达 ADC。默认为 0（关闭）。 */
 #define APP_ECG_DEBUG_DISPLAY_RAW      0U
 /* 设为 1 以在 OLED 上显示滤波后的 ECG 波形 (app->ecg_filtered)，绕过显示端
@@ -28,6 +28,13 @@ extern "C" {
 /* 设为 1 以使用独立视觉优化滤波链 (ecg_visual) 驱动 OLED 波形显示。
  * 仅在 RAW=0 且 FILTERED=0 时生效。默认开启，关闭则回退到原始 NORMAL 显示链路。 */
 #define APP_ECG_DEBUG_DISPLAY_VISUAL   1U
+/* 设为 1 以启用 DSP 预处理：50 Hz 陷波 + 10-20 Hz 带通 biquad 级联。
+ * 使用单精度浮点 Direct Form I，充分利用 Cortex-M4F 硬件 FPU（单周期乘加）。
+ * STM32F103 算力有限难以在 250 Hz 实时运行二阶 IIR 级联，
+ * 但 F407 FPU/DSP 余量充足，可同时并行 MAX30102/HCI/OLED 任务。
+ * 设为 0 则回退到纯整数一阶 DC+LP 链路（兼容 F103 级别实现）。 */
+#define APP_ECG_DSP_PREPROCESS         1U
+
 /* 设为 1 以每 250 个 ECG 样本通过 huart2 输出一次调试统计行。
  * 注意：这会占用 UART2 约 4 ms/次，可能与串口协议帧冲突。默认为 0。 */
 #define APP_ECG_DEBUG_PRINTF           0U
@@ -55,8 +62,19 @@ typedef struct
   uint8_t  hr_bpm;
 } AppEcgUpdate_t;
 
-/* ECG debug snapshot for D8 OLED page — read-only, no side effects.
- * Includes PPG fields for ECG-vs-PPG comparison on a single screen. */
+/* 二阶 IIR Biquad Direct Form I 结构（单精度浮点，Cortex-M4F FPU 优化）。
+ * 差分方程：y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2
+ * 接口与 CMSIS-DSP arm_biquad_casd_df1_inst_f32 兼容，方便未来替换。 */
+typedef struct
+{
+  float b0, b1, b2;   /* 前馈系数（已归一化，a0=1 隐含） */
+  float a1, a2;        /* 反馈系数（标准符号，差分方程中系 -a1*y1 - a2*y2） */
+  float x1, x2;        /* 输入延迟线 x[n-1], x[n-2] */
+  float y1, y2;        /* 输出延迟线 y[n-1], y[n-2] */
+} EcgBiquad_t;
+
+/* D8 OLED 页面使用的 ECG 调试快照：只读、无副作用。
+ * 包含 PPG 字段，便于在同一屏比较 ECG 与 PPG。 */
 typedef struct
 {
   uint16_t raw_min;
@@ -69,12 +87,21 @@ typedef struct
   uint16_t ecg_rr_ms;
   uint8_t  ppg_valid;
   uint8_t  ppg_bpm;
-  int16_t  hr_diff;    /* ecg_hr - ppg_bpm, valid only when both ecg_valid && ppg_valid */
+  int16_t  hr_diff;    /* ecg_hr - ppg_bpm，仅在 ecg_valid && ppg_valid 时有效 */
   uint32_t sample_count;
   uint32_t dma_overflow_count;
   uint32_t adc_sat_count;
   uint32_t lead_off_count;
   uint32_t no_r_peak_timeout_count;
+  /* ECG 质量快照字段 */
+  uint8_t  signal_quality;
+  uint8_t  invalid_reason;
+  uint16_t raw_span;
+  uint16_t filtered_span;
+  uint32_t noise_level;
+  uint32_t qrs_threshold;
+  uint16_t peak_snr_x100;
+  uint16_t dma_available_high_watermark;
 } AppEcgDebugSnapshot_t;
 
 /* 重置 ECG 检测器内部状态与 AppState ECG 字段 */
@@ -84,7 +111,7 @@ void app_ecg_reset(AppState_t *app);
 uint8_t app_ecg_read_lead_off(void);
 uint8_t app_ecg_read_lead_off_raw(void);
 
-/* 填充 ECG 调试快照，供 OLED debug 页面只读展示。
+/* 填充 ECG 调试快照，供 OLED 调试页面只读展示。
  * out 不可为 NULL。不阻塞，不 printf，不访问硬件寄存器。 */
 void app_ecg_get_debug_snapshot(const AppState_t *app,
                                 AppEcgDebugSnapshot_t *out);
@@ -93,6 +120,10 @@ void app_ecg_get_debug_snapshot(const AppState_t *app,
  * 应在主循环每 10 ms 节拍调用一次。
  * 返回非零表示本轮检测到至少一个有效 R 峰。 */
 uint8_t app_ecg_process_samples(AppState_t *app);
+
+/* 更新 AppState ECG quality 字段，基于当前检测器状态和调试统计。
+ * 在每个 process 批次末尾调用一次。 */
+void app_ecg_update_quality(AppState_t *app);
 
 #ifdef __cplusplus
 }

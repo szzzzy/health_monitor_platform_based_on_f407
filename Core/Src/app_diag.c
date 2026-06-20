@@ -3,17 +3,17 @@
   * @file    app_diag.c
   * @brief   崩溃诊断 — RTC BKP 持久化 + 周期性存活快照
   *
-  * BKP 寄存器映射 (20 x 32-bit, warm / IWDG 复位后保持):
-  *   DR1  crash magic     — 0xCA7A570F = 有效崩溃记录
-  *   DR2  crash info      — source[7:0] | task[15:8] | phase[23:16]
-  *   DR3  crash tick      — uwTick 快照 (0 = 不可用)
+  * BKP 寄存器映射 (20 个 32 位寄存器，热复位 / IWDG 复位后保持):
+  *   DR1  崩溃魔法值     — 0xCA7A570F = 有效崩溃记录
+  *   DR2  崩溃信息       — 崩溃源[7:0] | 任务[15:8] | 阶段码[23:16]
+  *   DR3  崩溃滴答       — uwTick 快照 (0 = 不可用)
   *   DR4  reboot_count    — 共享计数器
-  *   DR5  liveness magic  — 0x11FE5AFE = 有效存活快照
-  *   DR6  max_phase + max_hb[15:0] LSB
+  *   DR5  存活魔法值     — 0x11FE5AFE = 有效存活快照
+  *   DR6  max_phase + max_hb[15:0] 低位
   *   DR7  ui_phase  + sd_phase
-  *   DR8  wdt_phase + wdt_last_refresh_tick LSB
-  *   DR9  ui_hb[15:0] LSB + max_hb[31:16] high
-  *   DR10 min_stack_hwm   — 所有任务中最小的空闲栈 (words)
+  *   DR8  wdt_phase + wdt_last_refresh_tick 低位
+  *   DR9  ui_hb[15:0] 低位 + max_hb[31:16] 高位
+  *   DR10 min_stack_hwm   — 所有任务中最小的空闲栈 (字)
   *
   * 存活快照策略:
   *   看门狗任务 (~1 秒间隔) 调用 APP_Diag_SaveLiveness(),
@@ -28,12 +28,12 @@
   * 崩溃捕获策略:
   *   stm32f4xx_it.c 中的 fault_get_task_phase() 通过按优先级
   *   (MAX > UI > WDT > SD) 扫描 AppState 阶段字段来推断可疑任务。
-  *   然后调用 APP_Diag_CaptureCrash(), 传入 source, task_id 和 phase,
+  *   然后调用 APP_Diag_CaptureCrash(), 传入崩溃源、任务 ID 和阶段码,
   *   将打包的崩溃记录写入 BKP DR1–DR4, 并在 DR4 中递增重启计数器。
   *   所有写入使用直接寄存器访问, 因此函数可在 HardFault/NMI 上下文中安全调用。
   *
   * 所有写 BKP 的操作均使用直接寄存器访问，不调用 HAL。
-  * 崩溃捕获可在 fault handler / assert / HardFault 中安全调用。
+  * 崩溃捕获可在故障处理器 / 断言 / HardFault 中安全调用。
   ******************************************************************************
   */
 
@@ -74,7 +74,7 @@ void APP_Diag_Init(void)
  * @param  phase   崩溃时的任务阶段码。
  * @note   仅使用直接寄存器写入 — 无 HAL, 无 printf, 无 malloc。
  *         可在 HardFault、NMI、MemManage、BusFault、UsageFault 中安全调用。
- *         将 source/task/phase 写入 BKP2R, uwTick 快照写入 BKP3R,
+ *         将崩溃源/任务/阶段码写入 BKP2R, uwTick 快照写入 BKP3R,
  *         递增 BKP4R 中的重启计数器, 并在 BKP1R 中设置崩溃魔法值。
  ******************************************************************************
  */
@@ -91,7 +91,7 @@ void APP_Diag_CaptureCrash(uint8_t source, uint8_t task_id, uint8_t phase)
         tick = uwTick;
     }
 
-    /* 确保备份域可写 (fault handler 可能在 PWR 未初始化时触发) */
+    /* 确保备份域可写 (故障处理器可能在 PWR 未初始化时触发) */
     if ((PWR->CR & PWR_CR_DBP) == 0U)
     {
         PWR->CR |= PWR_CR_DBP;
@@ -142,7 +142,7 @@ void APP_Diag_ClearCrash(void)
  * @brief  将崩溃记录和存活快照读取到 AppState。
  * @param  app 指向 AppState 的指针 (可为 NULL)。
  * @note   从 RCC->CSR 读取复位标志, 从 BKP4R 读取重启计数。
- *         如果存在崩溃魔法值, 将 source/task/phase/tick 从
+ *         如果存在崩溃魔法值, 将崩溃源/任务/阶段码/滴答从
  *         BKP1R-BKP3R 解包到 AppState 的崩溃字段中, 并清除记录。
  *         如果存在存活魔法值, 将 DR6-DR9 解包到任务阶段
  *         和心跳字段中, 然后清除存活魔法值。
@@ -206,7 +206,7 @@ void APP_Diag_ReadCrashToAppState(AppState_t *app)
  ******************************************************************************
  * @brief  将所有任务阶段的周期性存活快照保存到 BKP DR5-DR9。
  * @param  app 指向 AppState 的指针, 提供阶段码和心跳。
- * @note   由 watchdogtask 以 ~1 秒间隔调用。将 MAX/UI/SD/WDT
+ * @note   由看门狗任务以 ~1 秒间隔调用。将 MAX/UI/SD/WDT
  *         的阶段码和心跳打包到 BKP 寄存器。在 DR5 中设置存活
  *         魔法值 (0x11FE5AFE), 以便下次启动时识别有效快照。
  *         崩溃时, 这些寄存器保留最后已知的任务状态用于事后分析。
@@ -241,10 +241,10 @@ void APP_Diag_SaveLiveness(const AppState_t *app)
 /**
  ******************************************************************************
  * @brief  采样所有四个任务的栈高水位标记。
- * @param  hwm_max  输出: MAX 任务空闲栈 (words)。可为 NULL。
- * @param  hwm_ui   输出: UI 任务空闲栈 (words)。可为 NULL。
- * @param  hwm_sd   输出: SD 任务空闲栈 (words)。可为 NULL。
- * @param  hwm_wdt  输出: WDT 任务空闲栈 (words)。可为 NULL。
+ * @param  hwm_max  输出: MAX 任务空闲栈 (字)。可为 NULL。
+ * @param  hwm_ui   输出: UI 任务空闲栈 (字)。可为 NULL。
+ * @param  hwm_sd   输出: SD 任务空闲栈 (字)。可为 NULL。
+ * @param  hwm_wdt  输出: WDT 任务空闲栈 (字)。可为 NULL。
  * @return 已采样的任务数 (始终为 4)。
  * @note   对每个任务句柄调用 uxTaskGetStackHighWaterMark。
  *         任何输出指针可为 NULL 以跳过该任务。

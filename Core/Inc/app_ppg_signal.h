@@ -21,7 +21,7 @@ extern "C" {
 /* 手指状态确认计数阈值 */
 #define APP_PPG_SIGNAL_FINGER_ON_CONFIRM_COUNT  8U    /* 就位需连续确认 8 拍 */
 #define APP_PPG_SIGNAL_FINGER_OFF_CONFIRM_COUNT 75U   /* 离开需连续确认 75 拍 (750ms) */
-#define APP_PPG_SIGNAL_REACQUIRE_NOISE_IR       1000UL /* 重捕获噪声种子；保持 finger-on 阈值不高于默认 6000 */
+#define APP_PPG_SIGNAL_REACQUIRE_NOISE_IR       1000UL /* 重捕获噪声种子；保持手指就位阈值不高于默认 6000 */
 
 /* 初始化自适应手指检测阈值为默认值 */
 void app_ppg_signal_init_state(AppState_t *app);
@@ -29,10 +29,10 @@ void app_ppg_signal_init_state(AppState_t *app);
 /* 重置信号包络（手指状态切换时调用） */
 void app_ppg_signal_reset_envelope(void);
 
-/* 更新 IR/RED 通道包络与活动指标 (delta, span) */
+/* 更新 IR/RED 通道包络与活动指标（增量、跨度） */
 void app_ppg_signal_update_activity(AppState_t *app);
 
-/* 基于背景噪声动态更新手指检测 on/off 阈值 */
+/* 基于背景噪声动态更新手指就位/离开阈值 */
 void app_ppg_signal_update_adaptive_thresholds(AppState_t *app,
                                                const MAX30102_Baseline_t *baseline);
 

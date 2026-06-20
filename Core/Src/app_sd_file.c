@@ -52,9 +52,9 @@ static uint32_t total_errors  = 0U;
  *      尝试挂载/写入。 */
 static void close_session_after_error(void)
 {
-    /* 无论 session_active 是否置位，始终清零 FIL 对象。
+    /* 无论会话激活标志是否置位，始终清零 FIL 对象。
      * 覆盖中间态：f_open 已成功但 f_lseek 失败，或 f_write 已调用
-     * 但 f_sync 失败 — 此时文件已打开但 session_active 可能尚未置 true。
+     * 但 f_sync 失败 — 此时文件已打开但会话激活标志可能尚未置 true。
      * memset 直接丢弃所有未写入数据，O(1) 无 I/O。 */
     (void)memset(&log_file, 0, sizeof(log_file));
     session_active = false;
@@ -110,7 +110,7 @@ static void make_date_prefix(const APP_RTC_DateTime_t *dt, char *out, size_t siz
  * @param  prefix "YYYYMMDD" 格式的日期字符串。
  * @return 使用公式 ((Y-2000)*372 + M*31 + D) 打包的日期值，
  *         若字符串无法解析则返回 0。
- * @note   用于在不解析完整 struct tm 的情况下比较文件日期。
+ * @note   用于在不解析完整日期结构的情况下比较文件日期。
  */
 static uint16_t pack_date(const char *prefix)
 {
@@ -193,11 +193,11 @@ void APP_SdFile_Init(void)
  * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 BIN → 定位到文件末尾。
  *
  * 限频重试：若上次尝试失败，须等待 RETRY_INTERVAL_MS 后才允许重试，
- * 避免在坏卡/无卡场景下每个 report 周期（200ms）都阻塞在 init/mount。
+ * 避免在坏卡/无卡场景下每个上报周期（200ms）都阻塞在初始化/挂载。
  * last_retry_tick == 0 表示从未尝试过，允许首次调用直接尝试。
  *
  * 所有失败路径统一调用 close_session_after_error() 做级联清理：
- * 丢弃半打开文件、卸载卷、Deinit 卡、同步 STA_NOINIT、设置退避时间戳。
+ * 丢弃半打开文件、卸载卷、反初始化卡、同步 STA_NOINIT、设置退避时间戳。
  */
 /*
  * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 BIN → 定位到文件末尾。
@@ -327,9 +327,9 @@ AppSdFileStatus_t APP_SdFile_WriteBytes(const void *data, uint16_t len)
         return APP_SD_FILE_WRITE_ERROR;
     }
 
-    /* 不 f_sync — 由 StopSession 内部统一 sync。
+    /* 不 f_sync — 由停止会话流程内部统一同步。
      * f_sync 可能触发多次 disk_write（文件缓冲 + FAT + 目录），
-     * 累计 >100ms，足以在测量期造成 MAX30102 FIFO overflow。 */
+     * 累计 >100ms，足以在测量期造成 MAX30102 FIFO 溢出。 */
     write_op_count++;
     return APP_SD_FILE_OK;
 }
@@ -356,7 +356,7 @@ AppSdFileStatus_t APP_SdFile_Flush(void)
  * @brief  获取成功 f_write 调用的总次数。
  * @return 自初始化以来的总刷新/写入计数。
  */
-/* 返回成功 f_write 调用次数（非 flush 次数、非写入字节/样本数）。 */
+/* 返回成功 f_write 调用次数（非刷新次数、非写入字节/样本数）。 */
 uint32_t APP_SdFile_GetWriteOpCount(void) { return write_op_count; }
 /**
  * @brief  获取遇到的 SD 写入错误总次数。

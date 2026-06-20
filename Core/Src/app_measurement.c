@@ -7,7 +7,7 @@
   *   1. MAX30102 FIFO 读取与原始数据解析
   *   2. 背景基线采集（上电无手指阶段）
   *   3. 手指就位/离开检测（滞回状态机 + 自适应阈值）
-  *   4. 测量处理流水线调度（SpO2 窗口 → 信号质量 → motion → BPM）
+  *   4. 测量处理流水线调度（SpO2 窗口 → 信号质量 → 运动检测 → BPM）
   *   5. 传感器恢复（连续 I2C 错误超阈值后重建初始化）
   *   6. 200ms 周期上报/刷新标志管理
   *
@@ -48,7 +48,7 @@
 #define APP_ADVANCED_PULSE_STALE_SAMPLES  (MAX30102_ALGO_SAMPLE_RATE_HZ * 8U)
 /* 手指接触稳定倒计数：避免接触瞬态污染检测器 */
 #define APP_CONTACT_SETTLE_SAMPLES        200U
-/* 基于 beat 的 PI 超时：无新 beat 超过此窗口则标无效 */
+/* 基于搏动的 PI 超时：无新搏动超过此窗口则标无效 */
 #define APP_PI_STALE_SAMPLES              (MAX30102_ALGO_SAMPLE_RATE_HZ * 5U)
 #define APP_SENSOR_STALE_TIMEOUT_MS       3000U
 #define APP_SENSOR_STALE_CONFIRM_INTERVAL_MS 1000U
@@ -291,8 +291,8 @@ uint8_t app_measurement_baseline_is_stable(void)
 }
 
 /*
- * 共享后处理：对已解析的单个样本执行 change tracking、基线更新、
- * PushSample 入队和传感器健康标记。由单样本路径和批量路径共用。
+ * 共享后处理：对已解析的单个样本执行变化追踪、基线更新、
+ * 日志样本入队和传感器健康标记。由单样本路径和批量路径共用。
  */
 static void app_measurement_process_parsed_sample(AppState_t *app,
                                                    uint32_t red_val,
@@ -334,7 +334,7 @@ static void app_measurement_process_parsed_sample(AppState_t *app,
   app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
 
   /* 实时路径只记录测量相关样本；无手指背景不入日志，避免插卡后
-   * idle 状态自动触发 FatFs mount/open。 */
+   * 空闲状态自动触发 FatFs 挂载/打开。 */
   if ((app->finger_present != 0U) || (app->contact_settle_samples > 0U))
   {
     uint8_t log_flags = 0U;
@@ -433,7 +433,7 @@ AppMeasurementReadStatus_t app_measurement_read_sensor_sample(AppState_t *app)
  * @return 无。
  * @note   委托给 app_ppg_signal_update_adaptive_thresholds，
  *         该函数根据测量的背景 IR 噪声水平调整
- *         手指就位/离开 delta 阈值。
+ *         手指就位/离开差值阈值。
  ******************************************************************************
  */
 void app_measurement_update_adaptive_thresholds(AppState_t *app)
@@ -556,9 +556,9 @@ void app_measurement_update_finger_state(AppState_t *app)
  *   1. 接触稳定倒计数（warm-up 到期时重置全部高级算法状态）
  *   2. SpO2 窗口更新 → 获取滤波后波形样本 → 送入 OLED 波形缓冲
  *   3. 信号质量 + PI 指标计算 (max30102_get_signal_metrics)
- *   4. Motion artifact 检测 (app_motion_update_artifact)
- *   5. Motion 期间冻结 BPM/SpO2/RR/HRV 输出
- *   6. Beat-based PI 更新（从已接受 beat 的 peak-to-trough 幅度计算）
+ *   4. 运动伪影检测 (app_motion_update_artifact)
+ *   5. 运动期间冻结 BPM/SpO2/RR/HRV 输出
+ *   6. 基于搏动的 PI 更新（从已接受搏动的峰谷幅度计算）
  *   7. PPGA 脉搏脉冲检测 (app_ppg_pulse_update) → IBI → HRV
  *   8. SpO2 原始值计算 → 滤波器平滑 → 写 AppState
  *   9. BPM 抽头评估 → 时域峰值检测 + 自相关交叉验证 → 滤波器平滑
@@ -675,8 +675,8 @@ void app_measurement_process(AppState_t *app)
       app_invalidate_advanced_outputs(app);
     }
 
-    /* 基于 beat 的 PI：从已接受 beat 的峰谷幅度 EMA 计算。
-     * 无新 beat 时保持最近值，超过阈值标无效。 */
+    /* 基于搏动的 PI：从已接受搏动的峰谷幅度 EMA 计算。
+     * 无新搏动时保持最近值，超过阈值标无效。 */
     if (app->ir_pi_ac_ema_valid != 0U)
     {
       uint32_t ir_dc = (uint32_t)(spo2_state.ir_sum / spo2_state.sample_count);
@@ -789,8 +789,8 @@ void app_measurement_update_periodic_flags(AppState_t *app)
 }
 
 /*
- * 批量 FIFO drain — 替代原 main.c 中 while(budget--) 单样本循环。
- * 一次 I2C burst 读所有可用样本，逐个送入测量管道。
+ * 批量排空 FIFO — 替代原 main.c 中 while(budget--) 单样本循环。
+ * 一次 I2C 突发读所有可用样本，逐个送入测量管道。
  *
  * 返回处理的样本数。调用方（main.c）用返回值决定是否跳过 OLED/SD。
  */
@@ -913,8 +913,8 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
 }
 
 /*
- * OLED 刷新门控：仅在 FIFO backlog 很高时短暂让路。
- * sensor_health/contact_settle 不再阻止刷新——状态页、debug 页、按钮切页
+ * OLED 刷新门控：仅在 FIFO 积压很高时短暂让路。
+ * sensor_health/contact_settle 不再阻止刷新——状态页、调试页、按钮切页
  * 仍需要 OLED 正常工作。连续跳过超过 1000ms 由 UiTask 强制刷新。
  */
 uint8_t app_measurement_should_skip_display(const AppState_t *app)
@@ -938,7 +938,7 @@ uint8_t app_measurement_should_skip_display(const AppState_t *app)
  * 失败 → 保持 error_streak 在阈值，由上层在下个周期重新触发。
  *
  * 同时被 ERROR 路径 (app_measurement_recover_sensor) 和
- * stale 看门狗 (app_measurement_service_sensor_watchdog) 调用。
+ * 样本陈旧看门狗 (app_measurement_service_sensor_watchdog) 调用。
  */
 static void app_measurement_do_recovery(AppState_t *app)
 {
@@ -989,7 +989,7 @@ static void app_measurement_do_recovery(AppState_t *app)
   sensor_last_stale_probe_tick = 0UL;
   sensor_stale_probe_count = 0U;
   sample_debug_state.initialized = 0U;
-  /* 进入短时重新采集：如果手指就位，设置 contact_settle 以
+  /* 进入短时重新采集：如果手指就位，设置接触稳定倒计数以
    * 在重新稳定期间抑制算法输出。如果手指不在，
    * 保持 PLACE FINGER — 不进入稳定。 */
   if (app->finger_present != 0U)
@@ -1047,7 +1047,7 @@ void app_measurement_recover_sensor(AppState_t *app)
  *
  * - >1s 无样本：置 SENSOR_HEALTH_STALE，OLED 可显示 WAIT 状态
  * - >3s 无样本：确认持久停顿后触发限频恢复
- * - recovery 失败：置 SENSOR_HEALTH_INIT_FAIL
+ * - 恢复失败：置 SENSOR_HEALTH_INIT_FAIL
  */
 void app_measurement_service_sensor_watchdog(AppState_t *app)
 {

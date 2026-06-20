@@ -1,84 +1,121 @@
 # BME
 
-基于 `STM32F407ZGTx` 的 `MAX30102 + SSD1306 + RTC + USART2` 生理信号采集工程。  
-当前版本在 100 Hz 精确采样节拍、CMSIS-DSP 带通滤波、自相关 BPM、I2C DMA、独立看门狗和 SD 卡日志的基础上，完成了心率、血氧、波形显示、串口上报与 CSV 落盘的主链路，适合作为后续继续扩展更强滤波、异常检测、`RTOS` 等功能的基础版本。
+基于 `STM32F407ZGTx` 的生理信号采集工程，主链路为 `MAX30102 PPG + AD8232 ECG + SSD1306 OLED + RTC + USART2 + SD/FatFs`。当前源码已经不是裸机主循环模型，而是 FreeRTOS 任务驱动模型：高优先级 `MAXtask` 负责 PPG FIFO drain 与 ECG DMA 样本消费，`Uitask` 负责按键、OLED 与串口报告，`SDtask` 在安全窗口后台写 SD，`watchdogtask` 负责 IWDG 与活体快照。
 
-This project is a physiological signal acquisition firmware based on `STM32F407ZGTx`, using `MAX30102 + SSD1306 + RTC + USART2`.  
-The current version builds on a 100 Hz precise sampling tick, CMSIS-DSP bandpass filtering, autocorrelation BPM, I2C DMA transfers, independent watchdog, and SD-card CSV logging. It covers the main pipeline of heart-rate estimation, SpO2 estimation, waveform display, UART reporting, and data logging, and is suitable as a base for future extensions such as stronger filtering, anomaly detection, and `RTOS`.
+This project is an STM32F407ZGTx physiological-signal acquisition firmware. The current implementation is FreeRTOS based: `MAXtask` handles MAX30102 and ECG sample consumption, `Uitask` handles UI/UART, `SDtask` performs background SD logging in safe windows, and `watchdogtask` refreshes IWDG and stores liveness diagnostics.
+
+## 当前状态 / Current Status
+
+- MCU / 工具链：`STM32F407ZGTx`, CubeMX `6.3.0`, STM32Cube FW_F4 `V1.26.2`, Keil MDK-ARM `V5.32`, ARMCLANG `V6.24`.
+  MCU / toolchain: `STM32F407ZGTx`, CubeMX `6.3.0`, STM32Cube FW_F4 `V1.26.2`, Keil MDK-ARM `V5.32`, ARMCLANG `V6.24`.
+- PPG：`TIM6` 100 Hz 调度节拍，`MAX30102_ALGO_SAMPLE_RATE_HZ = 100U`。
+  PPG: `TIM6` 100 Hz scheduling tick, `MAX30102_ALGO_SAMPLE_RATE_HZ = 100U`.
+- ECG：`TIM2` 250 Hz TRGO 触发 `ADC1` DMA circular buffer，任务侧消费样本并执行 QRS/HR/RR/PTT 更新。
+  ECG: `TIM2` 250 Hz TRGO triggers `ADC1` DMA circular buffer; the task consumes samples and performs QRS/HR/RR/PTT updates.
+- 调度：`StartTask02()` 首次运行时调用 `app_rtos_mark_ready()` 并启动 `HAL_TIM_Base_Start_IT(&htim6)`，避免调度器启动前 ISR 调用 FreeRTOS API。
+  Scheduling: `StartTask02()` calls `app_rtos_mark_ready()` and `HAL_TIM_Base_Start_IT(&htim6)` on its first iteration, preventing ISR calls to FreeRTOS API before the scheduler starts.
+- 显示：SSD1306 仍是阻塞式 I2C 全屏刷新，但 `Uitask` 只用 `try-lock` 获取 I2C mutex，并在 FIFO 积压或强信号窗口时跳过/延迟刷新。
+  Display: SSD1306 still uses blocking I2C full-screen refresh, but `Uitask` acquires the I2C mutex with try-lock only, and skips/defers refresh under FIFO pressure or strong signal windows.
+- 串口：`USART2` 使用 DMA circular RX + IDLE 接收命令；TX 仍通过 `HAL_UART_Transmit()` 阻塞发送，单段超时 `100 ms`。
+  UART: `USART2` uses DMA circular RX + IDLE for command reception; TX still uses blocking `HAL_UART_Transmit()`, single-segment timeout `100 ms`.
+- SD 日志：当前是二进制日志，不是 CSV。实时路径只 `APP_DataLog_PushSample()` 写 16B 样本到 RAM ring；物理 `f_write/f_sync/f_close` 只在 `SDtask` 安全窗口执行。
+  SD logging: currently binary, not CSV. The real-time path only calls `APP_DataLog_PushSample()` to write 16B records into a RAM ring; physical `f_write/f_sync/f_close` only happens in the `SDtask` safe window.
+
+## 系统架构 / Architecture
+
+```text
+MAX30102 FIFO
+  -> TIM6 100 Hz ISR
+  -> MAXtask notification
+  -> app_ecg_process_samples()
+  -> max30102_should_service_fifo()
+  -> app_measurement_drain_fifo_batch()
+  -> PPG/BPM/SpO2/HRV/RR/PTT/state update
+  -> APP_DataLog_PushSample() RAM ring
+
+AD8232 analog output
+  -> TIM2 TRGO 250 Hz
+  -> ADC1 DMA circular buffer
+  -> MAXtask consumes DMA samples
+  -> ECG filter/QRS/HR/RR/PTT/quality update
+
+AppState + waveform buffers
+  -> Uitask
+  -> OLED pages + USART2 M/T frames
+
+DataLog RAM ring
+  -> SDtask safe-window check
+  -> APP_DataLog_ServiceBudget() / APP_DataLog_ServiceDeferredStop()
+  -> APP_SdFile_WriteBytes()
+  -> FatFs
+  -> APP_SD_Card_Write()
+  -> HAL_SD_WriteBlocks()
+```
+
+### FreeRTOS Tasks / 任务列表
+
+| Task / 任务 | Priority / 优先级 | Main responsibility / 主要职责 |
+| --- | --- | --- |
+| `MAXtask` | `osPriorityHigh` | 100 Hz wake-up, ECG DMA consumption, MAX30102 FIFO drain, sensor recovery/watchdog / 100 Hz 唤醒，ECG DMA 消费，MAX30102 FIFO 排空，传感器恢复与看门狗 |
+| `watchdogtask` | `osPriorityAboveNormal` | `APP_Watchdog_Refresh()` every 50 ms, BKP liveness snapshots about every 1 s / 每 50 ms 喂狗，约每秒保存 BKP 活体快照 |
+| `Uitask` | `osPriorityNormal` | UART command polling, button handling, OLED refresh, periodic UART report, stack HWM sampling / UART 命令轮询、按键处理、OLED 刷新、周期上报、栈高水位采样 |
+| `SDtask` | `osPriorityLow` | SD safe-window gating, binary log write/flush, SD status sync / SD 安全窗口门控、二进制日志写入与同步 |
+| `defaultTask` | `osPriorityNormal` | Idle placeholder / 空闲占位 |
 
 ## 当前功能 / Current Features
 
-- `MAX30102` 红光 / 红外采样，LED 驱动电流约 25.6 mA  
-  `MAX30102` RED / IR sampling, LED drive current about 25.6 mA
-- `TIM6` 100 Hz 精确采样节拍 + `WFI` 低功耗等待  
-  `TIM6` 100 Hz precise sampling tick with `WFI` power-saving idle
-- `MAX30102 INT` 引脚可选，当前默认禁用并使用 TIM6 轮询  
-  `MAX30102 INT` pin is optional; current default uses TIM6 polling
-- `I2C DMA` 传输 FIFO 数据，主循环不阻塞  
-  `I2C DMA` FIFO data transfer, non-blocking main loop
-- `CMSIS-DSP` 4 阶 Butterworth 带通滤波 (0.5–5 Hz)  
-  `CMSIS-DSP` 4th-order Butterworth bandpass filter (0.5–5 Hz)
-- 自相关 `BPM` + 时域 `SpO2` 双算法  
-  Autocorrelation `BPM` + time-domain `SpO2` dual algorithm
-- `OLED (SSD1306)` 实时页面显示  
-  Real-time page rendering on `OLED (SSD1306)`
-- 开机 `5s` 无手指基线采集  
-  `5s` no-finger baseline acquisition after boot
-- 自适应手指检测与测量状态切换  
-  Adaptive finger detection and measurement-state switching
-- `RTC` 时间维护与串口校时  
-  `RTC` time keeping and UART-based time synchronization
-- `USART2` 文本协议上报，便于上位机直接解析  
-  `USART2` text protocol reporting for direct host-side parsing
-- `IWDG` 独立看门狗，长循环和主循环路径必须持续喂狗  
-  `IWDG` independent watchdog; long loops and main-loop paths must refresh it
-- `FatFs + SDIO` CSV 日志，通过可失败、可重试路径初始化 SD 卡  
-  `FatFs + SDIO` CSV logging with a fail-tolerant, retryable SD-card initialization path
-- 调试页显示 `FIFO`、读数状态、`SQ (signal quality)`、`PI`  
-  Debug page showing `FIFO`, read status, `SQ (signal quality)`, and `PI`
-
-## 采样架构 / Sampling Architecture
-
-系统采用 `TIM6` 产生 100 Hz 精确采样节拍（周期 10 ms），主循环在每个节拍内执行以下流程：
-
-The system uses `TIM6` to generate a precise 100 Hz sampling tick (10 ms period). The main loop runs the following flow on each tick:
-
-1. 轮询串口命令（USART2 DMA + IDLE 接收）  
-   Poll UART commands (USART2 DMA + IDLE reception)
-2. 处理按键（软件消抖）  
-   Handle buttons (software debounce)
-3. `max30102_should_service_fifo()` 门控判断是否需要读传感器  
-   `max30102_should_service_fifo()` gate to decide whether to read the sensor
-4. 推进 BPM / SpO2 算法 + 波形显示  
-   Advance BPM / SpO2 algorithms + waveform display
-5. 200 ms 周期上报 + OLED 刷新  
-   200 ms periodic report + OLED refresh
-6. 刷新独立看门狗  
-   Refresh the independent watchdog
-
-节拍间通过 `__WFI()` 进入低功耗等待，TIM6 中断唤醒。  
-Between ticks the CPU enters low-power wait via `__WFI()`, woken by the TIM6 interrupt.
-
-`MAX30102 INT` 引脚当前定义为 `PE5`，通过 `MAX30102_USE_INT_PIN` 控制是否启用。当前默认值为 `0U`，也就是纯 `TIM6` 轮询模式；若硬件确认连接了 INT 引脚，可改为 `1U` 后再启用 EXTI 数据就绪路径。
-
-The `MAX30102 INT` pin is currently defined as `PE5` and controlled by `MAX30102_USE_INT_PIN`. The default is `0U`, meaning pure `TIM6` polling mode. Set it to `1U` only after the hardware INT line is confirmed.
+- `MAX30102` RED/IR sampling, default LED current about `25.6 mA`.
+  `MAX30102` 红光/红外采样，默认 LED 驱动电流约 `25.6 mA`。
+- `TIM6` 100 Hz PPG service tick and `TIM2` 250 Hz ECG ADC trigger.
+  `TIM6` 100 Hz PPG 调度节拍 + `TIM2` 250 Hz ECG ADC 触发。
+- `MAX30102 INT` is intentionally disabled: `MAX30102_USE_INT_PIN = 0U`.
+  `MAX30102 INT` 引脚有意禁用：`MAX30102_USE_INT_PIN = 0U`。
+- `PE5` is reserved for `AD8232 LO-`; do not reuse it as MAX30102 INT.
+  `PE5` 保留给 `AD8232 LO-`，不可复用为 MAX30102 INT。
+- PPG algorithms include BPM, SpO2 ratio/balance, PI, SQ, motion hint, IBI, HRV time-domain/frequency-domain short-window metrics, and RR estimate.
+  PPG 算法：BPM、SpO2 比率/平衡、PI、SQ、运动提示、IBI、HRV 时域/频域短窗口指标、RR 估计。
+- ECG path includes DC removal, lowpass, 50 Hz notch, 10-20 Hz bandpass, derivative energy, 120 ms MWI, adaptive QRS threshold, ECG HR/RR/PTT, lead-off detection, and ECG quality scoring.
+  ECG 链路：DC 去漂、低通、50 Hz 陷波、10-20 Hz 带通、差分能量、120 ms MWI、自适应 QRS 阈值、ECG HR/RR/PTT、导联脱落检测、ECG 质量评分。
+- OLED pages: `PULSE`, `OXY`, `VITALS`, `ECG`, `ECG Q`, and debug pages `D1-D10`.
+  OLED 页面：`PULSE`、`OXY`、`VITALS`、`ECG`、`ECG Q`，以及调试页 `D1-D10`。
+- UART protocol supports periodic `M` measurement frames and `T` RTC set acknowledgements.
+  串口协议支持周期性 `M` 测量帧和 `T` RTC 设置应答帧。
+- SD logging uses a 2048-sample RAM ring and 512B background write chunks.
+  SD 日志使用 2048 样本 RAM 环形缓冲，512B 后台写入块。
+- Crash/liveness diagnostics are stored through backup registers and reported through UART/OLED diagnostic pages.
+  崩溃/活体诊断通过备份寄存器存储，并通过串口/OLED 诊断页上报。
 
 ## 硬件与引脚 / Hardware and Pinout
 
-| 项目 / Item | 内容 / Value |
+| Item | Value |
 | --- | --- |
 | MCU | `STM32F407ZGTx` |
-| 传感器 / Sensor | `MAX30102` |
-| 显示 / Display | `SSD1306 128x64 I2C OLED` |
-| 时钟 / Clock | `HSE 8MHz`, `LSE 32.768kHz` |
+| PPG sensor | `MAX30102` |
+| ECG front-end | `AD8232` |
+| Display | `SSD1306 128x64 I2C OLED` |
+| Clock | `HSE 8 MHz`, `LSE 32.768 kHz`, `PLLQ = 7`, 48 MHz domain enabled |
 
-### `I2C1`
+### I2C1
 
-- `PB8` -> `SCL`
-- `PB9` -> `SDA`
-- `PE5` -> `MAX30102 INT`（可选，当前默认禁用 / optional, disabled by default）
+- `PB8` -> `I2C1_SCL`
+- `PB9` -> `I2C1_SDA`
+- MAX30102 and SSD1306 share this bus. / MAX30102 和 SSD1306 共享此总线。
+- I2C1 is configured as Fast mode; board-level external pull-ups are required. / I2C1 配置为 Fast 模式，板上需外接上拉电阻。
 
-### `SDIO`
+### MAX30102
+
+- Uses I2C1 register/FIFO access. / 通过 I2C1 访问寄存器/FIFO。
+- `MAX30102_USE_INT_PIN` must remain `0U` unless a dedicated EXTI pin is added in hardware and software. / `MAX30102_USE_INT_PIN` 必须保持 `0U`，除非硬件和软件同步增加专用 EXTI 引脚。
+- Current firmware relies on `TIM6` polling/notification, not the MAX30102 INT pin. / 当前固件依赖 `TIM6` 轮询/通知，不使用 MAX30102 INT 引脚。
+
+### AD8232 / ADC1
+
+- `PA5` -> `ADC1_IN5`, AD8232 analog output. / AD8232 模拟输出。
+- `PE5` -> `AD8232 LO-`, red electrode lead-off detection. / 红色电极脱落检测。
+- `PE6` -> `AD8232 LO+`, green electrode lead-off detection. / 绿色电极脱落检测。
+- `TIM2` triggers ADC1 DMA at 250 Hz. / `TIM2` 以 250 Hz 触发 ADC1 DMA。
+
+### SDIO
 
 - `PC8` -> `SDIO_D0`
 - `PC9` -> `SDIO_D1`
@@ -87,208 +124,203 @@ The `MAX30102 INT` pin is currently defined as `PE5` and controlled by `MAX30102
 - `PC12` -> `SDIO_CK`
 - `PD2` -> `SDIO_CMD`
 
-### `USART2`
+Current SDIO policy: initialize/card-identify at about 400 kHz, try 4-bit once at 400 kHz, and stay at 400 kHz. Any 4-bit read/write/wait error disables 4-bit for the current power cycle.
+当前 SDIO 策略：约 400 kHz 低速初始化与卡识别，尝试一次 4-bit 总线（400 kHz），失败后保持 400 kHz。任何 4-bit 读写/等待错误会在本次上电周期禁用 4-bit。
 
-- `PA2` -> `TX`
-- `PA3` -> `RX`
+### USART2
 
-### 按键 / Buttons
+- `PA2` -> `USART2_TX`
+- `PA3` -> `USART2_RX`
+- Default protocol is line-oriented text ending with `CRLF`. / 默认协议为行文本，以 `CRLF` 结尾。
 
-- `PE2` -> 亮度切换 / Brightness switch
-- `PE3` -> 上一页 / Previous page
-- `PE4` -> 下一页 / Next page
+### Buttons / 按键
 
-## 页面说明 / UI Pages
+- `PE2` -> brightness switch / 亮度切换
+- `PE3` -> previous page / 上一页
+- `PE4` -> next page / 下一页
 
-- `PULSE` page: IR waveform, HR, latest IBI, rhythm state, motion flag, and pulse markers.
-- `OXY` page: smoothed SpO2, PI, R ratio, RED/IR balance, motion flag, and stacked IR/RED waveforms.
-- `VITALS` page: HR, RR, SQ, motion flag, IBI, SDNN, RMSSD, PI, and full RTC date/time.
+## SD 二进制日志 / SD Binary Log
 
-- `DEBUG` 页：显示传感器原始值、`FIFO`、读写计数、错误恢复、`SQ/PI`  
-  `DEBUG` page: shows raw sensor values, `FIFO`, read/write counters, recovery status, and `SQ/PI`
+README 旧版本写过 CSV 落盘；当前源码已经改为二进制日志。
+Earlier README versions described CSV logging; the current source has been changed to binary logging.
 
-## Metric Availability
+### File Naming / 文件命名
 
-- `SQ`: based on IR/RED PI, AC RMS, channel balance, and window length; it is smoothed before display.
-- `R/BAL`: requires non-zero RED/IR DC and small but measurable RED/IR AC RMS. If the current frame is too weak, the last ratio may stay visible with `?`.
-- `MotionArtifact`: PPG-only motion hint from AC RMS spikes, RED/IR imbalance, and sudden SQ drops. During motion, HR/SpO2/RR are held as old values with valid flags cleared.
-- `IBI/REG`: requires two accepted pulse extrema with an interval from 300 ms to 2000 ms. `REG` shows after a valid `IBI`; high short-term variation is shown as `VAR`, and the short-window irregular hint is shown as `IRR`.
-- `SDNN/RMSSD/SD1/SD2`: requires at least 4 accepted `IBI` samples, so it appears several beats after `IBI`. SD1/SD2 are short-window Poincare descriptors, not diagnostic labels.
-- `LF/HF`: short-window frequency HRV estimate from the 32-beat IBI buffer. It uses 4 Hz linear resampling, mean removal, Hann windowing, CMSIS-DSP RFFT, LF `0.04-0.15 Hz`, and HF `0.15-0.40 Hz`. `VLF` is not reported because a 32-beat window is too short for useful `<0.04 Hz` resolution. This is for engineering demonstration and trend observation only; it is not diagnostic and not standard 5-minute HRV spectral analysis.
-- `RR`: requires `SQ >= 35`, at least 10 accepted beats, an 8 s or longer beat window, and visible pulse-amplitude modulation.
-
-## 串口协议 / UART Protocol
-
-默认通过 `USART2` 按行发送文本，便于上位机直接用串口助手、Python 脚本或现有界面程序解析。  
-By default, the firmware sends line-based text messages through `USART2`, making it easy to parse from a serial terminal, Python script, or PC application.
-
-周期上报格式 / Periodic report format:
+`APP_SdFile_StartSession()` uses RTC date plus sequence: / 使用 RTC 日期加序号：
 
 ```text
-M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2,rr_valid,rr,ibi_valid,ibi,hrv_valid,mean_ibi,sdnn,rmssd,motion_artifact,motion_score,sd1,sd2,sd1_sd2_x100,rhythm_irregular,hrv_freq_valid,lf_power_x100,hf_power_x100,lf_hf_x100,signal_quality,raw_signal_present,signal_ir_pi_x1000,signal_red_pi_x1000,signal_ir_ac_rms,signal_red_ac_rms,spo2_ratio_valid,spo2_ratio_x1000,spo2_balance_status,baseline_range_ir,adaptive_finger_on_delta,adaptive_finger_off_delta,ir_signal_delta,ir_signal_span,red_signal_span,finger_on_confirm_count,finger_off_confirm_count,sensor_last_read_status,sensor_error_streak,sensor_fifo_write_ptr,sensor_fifo_read_ptr,sensor_fifo_overflow_count,sensor_fifo_available_samples,sensor_read_ok_count,sensor_read_busy_count,sensor_read_error_count,sensor_recover_count,sensor_last_sample_tick,sensor_sample_change_count,sensor_sample_same_count,sensor_last_i2c_error,rtc_read_ok,uart_rx_message_valid,uart_tx_message_valid,sd_card_ready,sd_log_active,sd_log_error,sd_total_written,display_refresh_count,display_last_refresh_tick,display_brightness_index,current_page
+YYYYMMDD_NN.BIN
 ```
 
-示例 / Example:
+If RTC date is not valid, the prefix falls back to `00000000`. / 若 RTC 日期无效，前缀回退为 `00000000`。
+
+### File Format / 文件格式
+
+Each file starts with a 32-byte header: / 每个文件以 32 字节头开始：
+
+```c
+typedef struct __attribute__((packed)) {
+  uint8_t  magic[4];      /* "BMLG" */
+  uint16_t version;       /* 1 */
+  uint16_t sample_rate_hz;
+  uint32_t start_tick;
+  uint8_t  reserved[20];
+} DataLogFileHeader_t;
+```
+
+Then repeated 16-byte raw samples: / 之后重复 16 字节原始样本：
+
+```c
+typedef struct __attribute__((packed)) {
+  uint32_t tick;
+  uint32_t red;
+  uint32_t ir;
+  int16_t  ecg;
+  uint8_t  flags;    /* bit0: finger, bit1: contact stable, bit2: FIFO overflow */
+  uint8_t  seq;
+} DataLogRawSample_t;
+```
+
+Runtime constraints: / 运行时约束：
+
+- `APP_DataLog_PushSample()` is the only real-time logging entry; it only copies one 16B record into RAM. / `APP_DataLog_PushSample()` 是唯一实时日志入口，仅将一条 16B 记录拷贝到 RAM。
+- Ring size is `2048` samples, about 20 s at 100 Hz. / 环形缓冲区大小为 `2048` 样本，100 Hz 下约 20 秒。
+- Write chunk is `32` samples = `512 B`. / 写入块为 `32` 样本 = `512 B`。
+- Ring full means oldest samples are overwritten and `dropped` is incremented; sampling must not wait for SD. / 缓冲区满时最旧样本被覆盖，`dropped` 递增；采样不得等待 SD。
+- `measurement_active != 0` blocks all physical SD I/O. / `measurement_active != 0` 时阻塞所有物理 SD I/O。
+- `APP_DataLog_ServiceDeferredStop()` drains and syncs after the finger leaves / measurement stops. / `APP_DataLog_ServiceDeferredStop()` 在手指离开/测量停止后排空并同步。
+
+## USART2 Protocol / 串口协议
+
+### Measurement Frame / 测量帧
+
+STM32 currently emits a `110`-field `M` frame: / STM32 当前输出 `110` 字段 `M` 帧：
 
 ```text
-M,1,20260416,203015,53210,64892,41200,1,1,76,1,98,1,16,1,789,1,790,35,42,0,0,30,38,79,0,1,12500,9800,128,65,1,123,98,245,210,1,1200,1,3000,8000,4000,11892,12500,8300,2,0,1,0,5,4,0,3,12345,0,0,1,123456,85,12,0,1,1,1,1,1,0,1200,45,67890,1,0
+M,rtc_valid,yyyymmdd,hhmmss,red,ir,baseline_ir,finger,bpm_valid,bpm,spo2_valid,spo2,rr_valid,rr,ibi_valid,ibi,hrv_valid,mean_ibi,sdnn,rmssd,motion_artifact,motion_score,sd1,sd2,sd1_sd2_x100,rhythm_irregular,hrv_freq_valid,lf_power_x100,hf_power_x100,lf_hf_x100,signal_quality,raw_signal_present,signal_ir_pi_x1000,signal_red_pi_x1000,signal_ir_ac_rms,signal_red_ac_rms,spo2_ratio_valid,spo2_ratio_x1000,spo2_balance_status,baseline_range_ir,adaptive_finger_on_delta,adaptive_finger_off_delta,ir_signal_delta,ir_signal_span,red_signal_span,finger_on_confirm_count,finger_off_confirm_count,sensor_last_read_status,sensor_error_streak,sensor_fifo_write_ptr,sensor_fifo_read_ptr,sensor_fifo_overflow_count,sensor_fifo_available_samples,sensor_read_ok_count,sensor_read_busy_count,sensor_read_error_count,sensor_recover_count,sensor_last_sample_tick,sensor_sample_change_count,sensor_sample_same_count,sensor_last_i2c_error,rtc_read_ok,uart_rx_message_valid,uart_tx_message_valid,sd_log_active,sd_state,sd_error,sd_total_written,display_refresh_count,display_last_refresh_tick,debug_mode,current_page,ecg_valid,ecg_hr,ecg_rr_ms,ecg_lead_off,ecg_r_peak_ms,ecg_filtered,ptt_valid,ptt_ms,ecg_sample_count,ecg_adc_sat_count,ecg_dma_overflow_count,ecg_lead_off_count,ecg_no_r_peak_timeout_count,crash_flag,crash_source,crash_task,crash_phase,crash_tick,reboot_count,reset_flags,max_task_phase,ui_task_phase,sd_task_phase,wdt_task_phase,max_task_stack_hwm,ui_task_stack_hwm,sd_task_stack_hwm,wdt_task_stack_hwm,max_task_heartbeat,ui_task_heartbeat,ecg_signal_quality,ecg_invalid_reason,ecg_raw_span,ecg_filtered_span,ecg_noise_level,ecg_qrs_threshold,ecg_peak_snr_x100,ecg_dma_available_high_watermark
 ```
 
-For appended metrics, `*_valid == 0` means the numeric value should be treated as invalid; transient invalid states may retain the last value for display/log context. `lf_power_x100` and `hf_power_x100` are short-window band powers in `ms^2 x100`; `lf_hf_x100` is `LF/HF x100`. `signal_quality` is the realtime SQ score used by the OLED. `signal_ir_pi_x1000` and `signal_red_pi_x1000` store `(AC/DC) x1000`, equivalent to `PI% x10`, so display `123` as `12.3%`. `spo2_ratio_x1000` displays as `R/1000`; `spo2_balance_status` is `0=unknown, 1=OK, 2=LOW, 3=HIGH`.
+Important appended ECG quality fields: / 尾部追加的 ECG 质量字段说明：
 
-校时命令 / Time-sync commands:
+| Col / 列 | Field / 字段 | Meaning / 含义 |
+| --- | --- | --- |
+| 102 | `ecg_signal_quality` | 0-100 composite ECG quality / 0-100 ECG 综合质量评分 |
+| 103 | `ecg_invalid_reason` | `0=OK, 1=LEAD_OFF, 2=ADC_SAT, 3=DMA_OVERFLOW, 4=NO_R_PEAK, 5=LOW_AMPLITUDE, 6=NOISY, 7=RAW_FLATLINE` |
+| 104 | `ecg_raw_span` | Raw ECG min/max span / ECG 原始值跨度 |
+| 105 | `ecg_filtered_span` | Filtered ECG min/max span / 滤波后 ECG 值跨度 |
+| 106 | `ecg_noise_level` | Adaptive QRS noise baseline / QRS 自适应噪声基线 |
+| 107 | `ecg_qrs_threshold` | Dynamic QRS threshold / 动态 QRS 阈值 |
+| 108 | `ecg_peak_snr_x100` | Latest R-peak SNR x100 / 最新 R 峰信噪比 ×100 |
+| 109 | `ecg_dma_available_high_watermark` | ADC DMA backlog high watermark / ADC DMA 积压高水位 |
+
+### RTC Commands / RTC 校时命令
+
+Accepted commands: / 接受的命令：
 
 ```text
 SETTIME 2026-04-16 20:30:15
 TIME=2026-04-16 20:30:15
+TIME 2026-04-16 20:30:15
 ```
 
-返回格式 / Response format:
+Response: / 应答：
 
 ```text
 T,success,rtc_valid,yyyymmdd,hhmmss,reason
 ```
 
-说明 / Notes:
+`success=1` means the RTC was set successfully. Every response line ends with `CRLF`. / `success=1` 表示 RTC 设置成功。每条应答行以 `CRLF` 结尾。
 
-- `TIME` 和 `SETTIME` 当前都用于设置 `RTC`  
-  Both `TIME` and `SETTIME` are currently accepted as RTC set commands.
-- 时间格式固定为 `yyyy-mm-dd hh:mm:ss`  
-  The accepted time format is `yyyy-mm-dd hh:mm:ss`.
-- `success=1` 表示设置成功，`success=0` 表示失败  
-  `success=1` means success, and `success=0` means failure.
-- 每条消息末尾带 `CRLF`  
-  Each message ends with `CRLF`.
+## Metric Availability / 指标有效性说明
 
-## 关键集成约定 / Critical Integration Rules
-
-这一节是为了避免“只改注释或只对齐局部文件，却把运行链路拆散”的问题。修改代码前请先按这些约定检查。
-
-### `IWDG` 看门狗
-
-- `Core/Inc/stm32f4xx_hal_conf.h` 必须启用 `HAL_IWDG_MODULE_ENABLED`，否则 `IWDG_HandleTypeDef`、`HAL_IWDG_Init()`、`HAL_IWDG_Refresh()` 不可见。
-- `Core/Src/main.c` 必须包含 `iwdg.h`，并在 `MX_IWDG_Init()` 后立即调用一次 `APP_Watchdog_Refresh()`。
-- `MX_IWDG_Init()` 会真正启动硬件看门狗；启动后软件无法关闭，只能周期性喂狗或等待复位。
-- `APP_Watchdog_Refresh()` 是唯一应用层喂狗入口。所有可能超过数百毫秒的路径都必须喂狗，包括：
-  - `MAX30102` 初始化失败后的错误显示循环；
-  - 开机无手指基线采集循环；
-  - FIFO 密集补采样循环；
-  - 主循环每轮调度末尾。
-- `Error_Handler()` 中不要喂狗，保留致命错误后由看门狗复位的恢复策略。
-
-### SD 卡与 FatFs
-
-- 不要在 `main()` 开机阶段调用 `MX_SDIO_SD_Init()` 去初始化物理 SD 卡。无卡时它会把启动流程变成 `Error_Handler()`。
-- `Core/Src/sdio.c` 中的 `MX_SDIO_SD_Init()` 只保留为 CubeMX 兼容的安全占位，不应直接调用 `HAL_SD_Init()`。
-- SD 卡真实初始化由 `APP_DataLog_StartSession()` → `APP_SdFile_StartSession()` → `APP_SD_Card_InitHardware()` / `APP_SD_Card_Init()` 负责。这条链路允许失败并由上层重试，不能改成硬失败。
-- `APP_SD_Card_Init()` 的职责是：
-  - 以 48 MHz SDIOCLK、`APP_SD_INIT_CLK_DIV=118` 进入约 400 kHz 低速初始化；
-  - 调用 `HAL_SD_Init()` 完成 HAL 层 SDIO 初始化和卡识别；
-  - 获取卡信息；
-  - 设置 `APP_SD_FAST_CLK_DIV=2`，通过 `HAL_SD_ConfigWideBusOperation()` 切换到 4-bit 与约 12 MHz 传输时钟；
-  - 如果 4-bit 切换失败，清 `hsd.ErrorCode` 后回退 1-bit；若 1-bit 也失败，则返回 `APP_SD_CARD_ERROR`。
-- `APP_SD_Card_Deinit()` 必须能清理初始化中途失败后的 SDIO/GPIO/NVIC 状态，不要只在 `card_initialized == true` 时才调用 `HAL_SD_DeInit()`。
-- `Middlewares/Third_Party/FatFs/src/option/syscall.c` 当前只是 `_FS_REENTRANT == 0` 的占位文件；如果以后启用 RTOS/FatFs 重入，必须真正实现互斥钩子。
-
-### 时钟与采样率
-
-- `BME.ioc` 中 `PLLQ=7`，`RCC.PLLQCLKFreq_Value=48000000`。`main.c` 里的 `RCC_OscInitStruct.PLL.PLLQ` 必须保持为 `7`，否则 SDIO 时钟和 USB/48 MHz 域都会偏离配置。
-- `TIM6` 当前是 100 Hz 调度节拍，算法常量 `MAX30102_ALGO_SAMPLE_RATE_HZ` 也是 100 Hz。不要把 README、TIM6、算法常量改成互相不一致的值。
-- 主循环通过 `tim6_tick_flag` 和 `__WFI()` 等待 10 ms tick；不要在主循环里加入长阻塞任务。OLED、SD、I2C 异常路径都要保持可恢复。
-
-### `main.c` 内部函数职责
-
-- `app_state_init(AppState_t *app)`：清零 `AppState_t`，初始化测量状态、显示状态和串口协议状态。
-- `app_send_report_if_due(AppState_t *app)`：当 `report_due` 置位时发送 USART2 测量报文，调用 `APP_DataLog_WriteRecord()` 写 CSV，并通过 `app_update_sd_log_status()` 同步 SD 日志状态。
-- `app_refresh_display_if_needed(AppState_t *app)`：当 `display_refresh_requested` 置位时更新 RTC 快照、刷新 OLED 测量页，并记录刷新计数和 tick。
-- `app_schedule_periodic_refresh(AppState_t *app)`：每 200 ms 置位 `report_due` 和 `display_refresh_requested`。
-- `app_update_sd_log_status(AppState_t *app, AppDataLogStatus_t status)`：把 SD 文件会话状态同步到 `AppState_t`，包括 `sd_log_active`、`sd_card_ready`、`sd_log_error` 和 `sd_total_written`。
-
-### SD/FatFs 函数职责
-
-- `APP_DataLog_Init()`：初始化数据日志模块和底层 SD 文件模块状态。
-- `APP_DataLog_StartSession()`：启动一次 CSV 文件会话，必要时挂载 FatFs、创建/追加当天文件并写入表头。
-- `APP_DataLog_WriteRecord(const AppState_t *app)`：把当前测量状态写成多行 CSV 字段。失败时立即返回错误码，由 `main.c` 同步到 `AppState_t`。
-- `APP_DataLog_IsReady()`：返回文件会话是否活跃，用于 UI/状态同步。
-- `APP_DataLog_GetTotalWritten()`：返回累计落盘/flush 统计，用于状态显示和诊断。
-- `APP_SdFile_StartSession()`：挂载卷、选择文件名、打开文件并定位到末尾，是 SD 文件会话的核心入口。
-- `APP_SdFile_Write()`：写入缓冲区；无会话时按重试间隔尝试重新启动 session。
-- `APP_SdFile_Flush()`：把缓冲写入 FatFs 并同步介质，失败时关闭会话。
-- `APP_SD_Card_InitHardware()`：清零并准备静态 `SD_HandleTypeDef`，不访问物理卡。
-- `APP_SD_Card_Init()`：执行 SDIO/SD 卡低速初始化、卡识别、总线宽度和高速分频切换。
-- `APP_SD_Card_Read()` / `APP_SD_Card_Write()`：执行阻塞读写，失败或超时时 deinit，并等待卡回到 `HAL_SD_CARD_TRANSFER` 后才返回成功。
-- `APP_SD_Card_GetHandle()`：给 `SDIO_IRQHandler()` 提供当前应用层持有的 SD handle。
-
-## 给维护 Agent 的提示词 / Prompt for Maintenance Agents
-
-下面这段可以直接复制给另一个代码 agent，用来约束它在本工程里的修改方式：
-
-```text
-你正在维护 STM32F407ZGTx 的 BME 工程，目录为 D:\CUBEMX\template\BME。请先阅读 README.md 的“关键集成约定 / Critical Integration Rules”，再改代码。你的目标是保持功能链路一致，不要为了注释、格式或局部编译而破坏运行时初始化顺序。
-
-必须遵守：
-1. 工程使用 Keil ARMCLANG，主工程是 MDK-ARM/BME.uvprojx。修改后必须运行 uVision rebuild，并确认 BME\BME.axf 为 0 Error(s), 0 Warning(s)。
-2. IWDG 已启用：Core/Inc/stm32f4xx_hal_conf.h 必须保留 HAL_IWDG_MODULE_ENABLED。main.c 必须 include "iwdg.h"。MX_IWDG_Init() 启动硬件看门狗后必须立即 APP_Watchdog_Refresh()。所有长循环必须喂狗：MAX30102 错误循环、基线采集循环、FIFO 密集采样循环、主循环末尾。不要在 Error_Handler() 里喂狗。
-3. SD 卡不能在 main() 开机阶段硬初始化。不要调用 MX_SDIO_SD_Init() 来探测物理卡；无卡不能导致 Error_Handler()。SD 日志只能通过 APP_DataLog_StartSession() -> APP_SdFile_StartSession() -> APP_SD_Card_InitHardware()/APP_SD_Card_Init() 的可失败、可重试路径启动。
-4. Core/Src/sdio.c 的 MX_SDIO_SD_Init() 是 CubeMX 安全占位，只设置 handle 默认字段，不应调用 HAL_SD_Init() 或 HAL_SD_ConfigWideBusOperation()。
-5. SDIO 时钟域必须保持 48 MHz：main.c 的 RCC_OscInitStruct.PLL.PLLQ 必须是 7，并与 BME.ioc 的 RCC.PLLQ=7 对齐。不要改成 4。
-6. APP_SD_Card_Init() 的职责是：用 APP_SD_INIT_CLK_DIV=118 在 48 MHz SDIOCLK 下约 400 kHz 低速初始化；HAL_SD_Init() 完成卡识别；HAL_SD_GetCardInfo() 读取卡信息；把 hsd.Init.ClockDiv 改成 APP_SD_FAST_CLK_DIV=2；用 HAL_SD_ConfigWideBusOperation() 切 4-bit 和高速时钟；4-bit 失败时清 hsd.ErrorCode 并回退 1-bit；仍失败则返回 APP_SD_CARD_ERROR。不要再额外调用 HAL_SD_InitCard()，也不要在切 4-bit 后再调用 HAL_SD_Init()。
-7. APP_SD_Card_Deinit() 必须能清理初始化中途失败后的 SDIO 状态。不要只在 card_initialized 为 true 时才调用 HAL_SD_DeInit()。
-8. main.c 的函数职责不能混淆：
-   - app_state_init：清零 AppState_t，并初始化 measurement/display/protocol 状态。
-   - app_schedule_periodic_refresh：每 200 ms 置位 report_due 和 display_refresh_requested。
-   - app_send_report_if_due：发送串口测量报文，调用 APP_DataLog_WriteRecord 写 CSV，并调用 app_update_sd_log_status 同步 SD 状态。
-   - app_refresh_display_if_needed：更新 RTC 快照、刷新 OLED 页面、记录刷新计数和 tick。
-   - app_update_sd_log_status：同步 sd_log_active、sd_card_ready、sd_log_error、sd_total_written。
-9. 采样节拍是 TIM6 100 Hz，MAX30102_ALGO_SAMPLE_RATE_HZ 也是 100 Hz。README、代码和 .ioc 不能写成 50 Hz 或 20 ms。
-10. MAX30102 INT 当前定义为 PE5，MAX30102_USE_INT_PIN 默认为 0U，即 TIM6 轮询模式。不要写成 PA0，也不要默认启用 EXTI，除非硬件确认并同步修改 main.h/gpio/it。
-11. FatFs 的 Middlewares/Third_Party/FatFs/src/option/syscall.c 当前只是 _FS_REENTRANT == 0 的占位文件；不要删除它，因为 Keil 工程引用它。若启用 RTOS/FatFs 重入，必须实现真正的互斥钩子。
-12. 如果只改注释，仍要确认注释与当前代码一致，尤其是频率、引脚、初始化顺序、看门狗策略和 SD 错误策略。不要把 UTF-8 中文注释转成乱码，也不要生成 .utf8/.bak 临时文件留在工程目录。
-
-修改建议流程：
-1. 先用 rg 搜索相关符号和工程引用，不要凭记忆改。
-2. 修改前确认 README.md 与代码是否一致。
-3. 改完运行 uVision rebuild。
-4. 报告改动时说明是否影响 IWDG、SD/FatFs、时钟、TIM6 采样、MAX30102 INT。
-```
+- `SQ`: PPG signal quality based on PI, AC RMS, RED/IR balance, and window length; smoothed before display. / 基于 PI、AC RMS、RED/IR 平衡和窗口长度的 PPG 信号质量，显示前经平滑。
+- `PI`: stored as `(AC/DC) x1000`, equivalent to PI percent x10. For example `123` displays as `12.3%`. / 存储为 `(AC/DC) ×1000`，等效 PI%×10。例如 `123` 显示为 `12.3%`。
+- `R/BAL`: SpO2 ratio/balance requires non-zero RED/IR DC and measurable AC RMS. / SpO2 比率/平衡需非零 RED/IR DC 和可测量的 AC RMS。
+- `MotionArtifact`: PPG-only motion hint. During motion, HR/SpO2/RR valid flags are cleared while old values may remain visible for context. / 纯 PPG 运动提示。运动期间 HR/SpO2/RR 有效标志清零，旧值可能保留以供参考。
+- `IBI/REG`: requires accepted pulse intervals in the 300-2000 ms physiological window. / 需在 300-2000 ms 生理窗口内接受的心搏间隔。
+- `SDNN/RMSSD/SD1/SD2`: require enough accepted IBI samples; SD1/SD2 are short-window Poincare descriptors, not diagnostic labels. / 需足够的已接受 IBI 样本。SD1/SD2 为短窗口 Poincare 描述符，不是诊断标签。
+- `LF/HF`: short-window HRV estimate from the 32-beat IBI buffer using 4 Hz resampling, mean removal, Hann windowing, CMSIS-DSP RFFT, LF `0.04-0.15 Hz`, HF `0.15-0.40 Hz`. It is for engineering trend observation only, not standard 5-minute HRV spectral analysis. / 基于 32 拍 IBI 缓冲的短窗口 HRV 估计，工程趋势观察用，不是标准 5 分钟 HRV 频谱分析。
+- `RR`: requires sufficient SQ, accepted beats, window length, and pulse-amplitude modulation. / 需足够的 SQ、已接受搏动数、窗口长度和脉搏幅度调制。
+- `ECG HR/RR`: requires at least two valid R-peaks in the 300-2000 ms range. / 需在 300-2000 ms 范围内至少两个有效 R 峰。
+- `PTT`: computed from ECG R-peak to IR PPG pulse peak; it is not a blood-pressure estimate. / 由 ECG R 峰到 IR PPG 脉搏峰计算；不是血压估计值。
 
 ## 工程结构 / Project Structure
 
-- `Core/`：应用逻辑、驱动封装、状态管理  
-  `Core/`: application logic, driver wrappers, and state management
-- `Drivers/`：HAL / CMSIS 相关依赖  
-  `Drivers/`: HAL / CMSIS dependencies
-- `MDK-ARM/BME.uvprojx`：主工程  
-  `MDK-ARM/BME.uvprojx`: main project
-- `MDK-ARM/MAX30102_Simple_Test.uvprojx`：传感器最小验证工程  
-  `MDK-ARM/MAX30102_Simple_Test.uvprojx`: minimal verification project for the sensor
-- `BME.ioc`：CubeMX 工程文件  
-  `BME.ioc`: CubeMX project file
+```text
+Core/
+  Inc/                      Application headers
+  Src/                      STM32 application, drivers, RTOS tasks
+Drivers/                    STM32 HAL, CMSIS, CMSIS-DSP
+Middlewares/Third_Party/    FatFs and FreeRTOS middleware
+MDK-ARM/BME.uvprojx         Main Keil project
+BME.ioc                     STM32CubeMX project file
+docs/                       STM32 architecture notes and maintenance prompts
+```
 
-## 编译环境 / Build Environment
+Only `MDK-ARM/BME.uvprojx` exists as the Keil project in this workspace. Do not rely on older README references to a `MAX30102_Simple_Test.uvprojx` file.
 
-- `STM32CubeMX 6.3.0`
-- `STM32Cube FW_F4 V1.26.2`
-- `Keil MDK-ARM 5.32`
-- 编译器 / Compiler: `ARMCLANG`
+## Build / 编译
 
-## 上手流程 / Quick Start
+用 Keil uVision 打开 `MDK-ARM/BME.uvprojx` 并重建目标 `BME`。
+Open `MDK-ARM/BME.uvprojx` in Keil uVision and rebuild target `BME`.
 
-1. 用 `Keil` 打开 `MDK-ARM/BME.uvprojx`  
-   Open `MDK-ARM/BME.uvprojx` with `Keil`.
-2. 连接 `MAX30102`、`SSD1306`、串口和按键  
-   Connect `MAX30102`, `SSD1306`, UART, and buttons.
-3. 下载程序后上电  
-   Flash the firmware and power on the board.
-4. 按提示先保持 `5s` 不放手指，完成基线采集  
-   Keep the sensor untouched for `5s` to finish baseline acquisition.
-5. 基线完成后进入测量页，再把手指放到 `MAX30102`  
-   After baseline acquisition, enter the measurement page and place a finger on the `MAX30102`.
-6. 上位机读取 `USART2` 输出即可显示或存档  
-   Read `USART2` output on the host side for display or logging.
+本机 CLI 重建示例 / CLI rebuild example on this machine:
 
-## 当前状态 / Current Status
+```powershell
+cd D:\CUBEMX\template\BME\MDK-ARM
+& 'D:\Keil_v5\UV4\UV4.exe' -b BME.uvprojx -t BME -o build.log
+```
 
-这一版已经完成了 TIM6 100 Hz 精确节拍、MAX30102 轮询采样、I2C DMA 传输、CMSIS-DSP Butterworth 带通滤波、自相关 BPM、IWDG 看门狗和 SD 卡 CSV 日志的集成。系统以 10 ms 为周期运行，主循环在 `__WFI()` 低功耗等待中度过大部分时间。适合作为继续往更强滤波、异常检测、`RTOS` 等方向扩展的基线。
+Expected result for a clean firmware build is `0 Error(s), 0 Warning(s)` in the generated log. / 干净固件构建的预期结果是生成日志中 `0 Error(s), 0 Warning(s)`。
 
-This version integrates a TIM6 100 Hz precise tick, MAX30102 polling-based sampling, I2C DMA transfers, CMSIS-DSP Butterworth bandpass filtering, autocorrelation BPM, IWDG watchdog, and SD-card CSV logging. The system runs on a 10 ms cycle, with the main loop spending most of its time in `__WFI()` low-power wait. It serves as a solid baseline for extensions into stronger filtering, anomaly detection, or `RTOS`.
+## Quick Start / 快速上手
+
+1. Connect MAX30102, AD8232, SSD1306, USART2, buttons, and optional SD card according to the pinout above. / 按上述引脚连接 MAX30102、AD8232、SSD1306、USART2、按键和（可选）SD 卡。
+2. Build and flash `MDK-ARM/BME.uvprojx`. / 编译并烧录 `MDK-ARM/BME.uvprojx`。
+3. Power on without a finger on MAX30102; the boot sequence collects the no-finger baseline. / 上电时不要将手指放在 MAX30102 上；启动流程先采集无手指基线。
+4. After the baseline page reports ready, place a finger on MAX30102. / 基线页显示就绪后，将手指放在 MAX30102 上。
+5. Read `USART2` directly for `M` measurement frames. / 直接读取 `USART2` 获取 `M` 测量帧。
+6. For SD logging, remember that `.BIN` files are raw binary logs with `BMLG` headers, not human-readable CSV files. / SD 日志方面，注意 `.BIN` 文件是带 `BMLG` 头的原始二进制日志，不是可读的 CSV 文件。
+
+## Critical Integration Rules / 关键集成约定
+
+### TIM6 / RTOS Scheduling / RTOS 调度
+
+- Keep `TIM6` at 100 Hz and `MAX30102_ALGO_SAMPLE_RATE_HZ` at `100U`. / 保持 `TIM6` 100 Hz，`MAX30102_ALGO_SAMPLE_RATE_HZ` 为 `100U`。
+- Do not start TIM6 interrupts in `main()` or `MX_FREERTOS_Init()`. / 不要在 `main()` 或 `MX_FREERTOS_Init()` 中启动 TIM6 中断。
+- `StartTask02()` must remain the place that calls `app_rtos_mark_ready()` and `HAL_TIM_Base_Start_IT(&htim6)` after the scheduler is running. / `StartTask02()` 必须是调用 `app_rtos_mark_ready()` 和 `HAL_TIM_Base_Start_IT(&htim6)` 的唯一位置，在调度器运行之后执行。
+- `HAL_TIM_PeriodElapsedCallback()` for TIM6 must remain short: increment diagnostics, set the MAX30102 data-ready flag, and notify `MAXtask`. / TIM6 的 `HAL_TIM_PeriodElapsedCallback()` 必须保持简短：递增诊断计数器、置位 MAX30102 数据就绪标志、通知 `MAXtask`。
+
+### I2C1 Sharing / I2C1 共享
+
+- MAX30102 and SSD1306 share I2C1. / MAX30102 和 SSD1306 共享 I2C1。
+- `MAXtask` may wait briefly for the I2C mutex (`APP_RTOS_MAX_I2C_TIMEOUT_MS = 8U`). / `MAXtask` 可短暂等待 I2C 互斥锁。
+- `Uitask` must not block waiting for I2C; OLED refresh uses a zero-timeout try-lock and may skip frames. / `Uitask` 不得阻塞等待 I2C；OLED 刷新使用零超时 try-lock，可跳过帧。
+- Do not add OLED, printf, SD, or long HAL delays to the MAX/ECG real-time path. / 不要在 MAX/ECG 实时路径中加入 OLED、printf、SD 或长 HAL 延迟。
+
+### SD / FatFs / SD 卡与 FatFs
+
+- `MX_SDIO_SD_Init()` is a CubeMX compatibility placeholder. It must not probe the physical SD card or call `HAL_SD_Init()`. / `MX_SDIO_SD_Init()` 是 CubeMX 兼容占位，不得探测物理 SD 卡或调用 `HAL_SD_Init()`。
+- Real SD initialization is lazy: `APP_DataLog_ServiceBudget()` -> `APP_SdFile_StartSession()` -> `APP_SD_Card_InitHardware()` / `APP_SD_Card_Init()`. / 真实 SD 初始化为延迟启动。
+- No physical SD I/O is allowed while measurement is active. / 测量活跃期间禁止物理 SD I/O。
+- Current SDIO policy is all-400 kHz with one 4-bit attempt, not a 12 MHz fast-mode switch. / 当前 SDIO 策略为全程 400 kHz，仅尝试一次 4-bit。
+- On write/sync failure, the file layer intentionally drops/invalidates the session instead of blocking on repeated `f_sync` attempts. / 写入/同步失败时文件层有意丢弃会话，而非阻塞重试。
+- If logging changes, preserve the invariant that sampling never waits for SD. / 修改日志时保持"采样不等待 SD"这一不变式。
+
+### IWDG / Diagnostics / IWDG 与诊断
+
+- `MX_IWDG_Init()` starts the hardware watchdog during boot. / `MX_IWDG_Init()` 在启动期间启动硬件看门狗。
+- `watchdogtask` refreshes IWDG; fault hooks and `Error_Handler()` intentionally do not refresh it. / `watchdogtask` 喂狗；故障钩子和 `Error_Handler()` 有意不喂狗。
+- Diagnostic phase fields (`max_task_phase`, `ui_task_phase`, `sd_task_phase`, `wdt_task_phase`) are part of the crash/liveness story; keep them updated around blocking or risky operations. / 诊断阶段码字段是崩溃/活体链路的一部分，在阻塞或高风险操作前后更新。
+
+### STM32 Protocol / STM32 协议
+
+- If the STM32 `M` frame field list changes, update `Core/Src/app_protocol.c` and this README in the same change. / 若 STM32 `M` 帧字段列表变更，同步更新 `Core/Src/app_protocol.c` 和本 README。
+- Keep old fields append-only when possible so host tools can continue parsing the stable prefix. / 尽可能以追加方式保留旧字段，使上位机可继续解析稳定的前缀字段。
+
+## Known Gaps / Follow-up / 已知缺口与后续
+
+- USART TX is still blocking; high-rate or long reports can affect UI/SD timing. / USART TX 仍为阻塞式；高频或长报告可能影响 UI/SD 时序。
+- OLED refresh is still full-screen blocking I2C, mitigated by try-lock/skip but not yet page-sliced. / OLED 刷新仍为全屏阻塞 I2C，由 try-lock/skip 缓解但尚未分页。
+- SD log files are binary; a PC-side decoder/export tool would make them easier to inspect. / SD 日志为二进制格式；需要 PC 端解码/导出工具以便检查。
+- `docs/architecture_audit_codex.md` is useful historical context, but some findings are stale now that TIM6->MAXtask startup has been implemented. Verify against source before copying conclusions. / `docs/architecture_audit_codex.md` 有历史参考价值，但部分发现已过时（TIM6→MAXtask 启动已实现），引用前请对照源码。

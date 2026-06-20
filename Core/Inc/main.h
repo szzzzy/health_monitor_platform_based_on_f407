@@ -60,11 +60,11 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 /* USER CODE BEGIN Private defines */
 /*
- * MAX30102 INT is intentionally unused on this hardware revision.
+ * 当前硬件版本故意不使用 MAX30102 INT 引脚。
  *
- * PE5 is reserved for AD8232 LO- (see app_ecg.h), so do not alias PE5 as a
- * MAX30102 interrupt input. Keep this at 0U and use TIM6-driven FIFO polling.
- * If a future board wires MAX30102 INT, assign a dedicated EXTI pin first.
+ * PE5 已保留给 AD8232 LO-（见 app_ecg.h），不要再把 PE5 复用为
+ * MAX30102 中断输入。保持此宏为 0U，通过 TIM6 轮询驱动 FIFO。
+ * 如果后续硬件接入 MAX30102 INT，应先分配独立的 EXTI 引脚。
  */
 #define MAX30102_USE_INT_PIN      0U
 

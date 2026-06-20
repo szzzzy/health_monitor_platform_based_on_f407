@@ -23,16 +23,16 @@ typedef enum
 /*
  * 测量模块职责边界：
  * - app_measurement: 流程编排、传感器读取、门控、输出状态协调。
- * - app_hrv:         IBI 接受、32 拍 ring buffer、SDNN/RMSSD/SD1/SD2、rhythm_irregular。
- * - app_rr:          RIAV amplitude buffer、RR 估计、SQ>=25 门控。
- * - app_spo2_filter: SpO2 EMA、invalid/低SQ/motion 时不推进平滑。
- * - app_motion:      PPG-only motion score、AC RMS baseline、迟滞状态。
+ * - app_hrv:         IBI 接受、32 拍环形缓冲、SDNN/RMSSD/SD1/SD2、rhythm_irregular。
+ * - app_rr:          RIAV 振幅缓冲、RR 估计、SQ>=25 门控。
+ * - app_spo2_filter: SpO2 EMA，无效/低 SQ/运动时不推进平滑。
+ * - app_motion:      仅基于 PPG 的运动评分、AC RMS 基线、迟滞状态。
  */
 
 /* 初始化测量模块涉及的阈值等应用状态。 */
 void app_measurement_init_state(AppState_t *app);
 /* 清空基线、算法窗口、波形缓存与所有高级指标，回到”待测量”状态。
- * 区别于测量输出重置（手指离开）：runtime reset 会清 HRV/RR 历史。 */
+ * 区别于测量输出重置（手指离开）：运行时重置会清 HRV/RR 历史。 */
 void app_measurement_reset_runtime(void);
 /* 在基线采集阶段读一个样本并更新背景统计。 */
 uint8_t app_measurement_collect_baseline_sample(AppState_t *app);
@@ -78,11 +78,11 @@ typedef enum
 
 /* MAX30102 无新样本看门狗 — 当 sensor_last_sample_tick 长时间未更新时，
  * 强制执行 I2C 总线恢复 + max30102_init()。
- * 在主循环每轮和 baseline 采集循环中均需调用。 */
+ * 在主循环每轮和基线采集循环中均需调用。 */
 void app_measurement_service_sensor_watchdog(AppState_t *app);
 
-/* 批量 FIFO drain：一次 I2C burst 读所有可用样本并送入测量管道。
- * 返回处理的样本数 (0 = 无数据/overflow/I2C 错误)。 */
+/* 批量排空 FIFO：一次 I2C 突发读所有可用样本并送入测量管道。
+ * 返回处理的样本数 (0 = 无数据/溢出/I2C 错误)。 */
 uint8_t app_measurement_drain_fifo_batch(AppState_t *app);
 
 /* OLED 刷新门控：返回 1 时应跳过 OLED 刷新（不清 display_refresh_requested）。 */

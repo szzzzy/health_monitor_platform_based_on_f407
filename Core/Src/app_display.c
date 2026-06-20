@@ -46,11 +46,21 @@ typedef struct
   uint16_t sample_count;
   uint16_t settle_count;
   uint32_t scale_estimate;
+  uint32_t min_scale;       /* AGC 最小缩放，PPG=32, ECG=200 */
 } WaveformBuffer_t;
 
 static WaveformBuffer_t ir_waveform;
 static WaveformBuffer_t red_waveform;
 static WaveformBuffer_t ecg_waveform;
+
+/* 设置 ECG 波形独立最小 AGC scale，避免低幅噪声被放大 */
+void app_display_set_ecg_min_scale(uint32_t min_scale)
+{
+  ecg_waveform.min_scale = min_scale;
+  if (ecg_waveform.scale_estimate < min_scale) {
+    ecg_waveform.scale_estimate = min_scale;
+  }
+}
 
 static uint8_t page_button_poll_pressed(PageButton_t *button);
 static void waveform_buffer_reset(WaveformBuffer_t *waveform);
@@ -72,6 +82,7 @@ static void app_display_pulse_page(const AppState_t *app);
 static void app_display_oxy_page(const AppState_t *app);
 static void app_display_vitals_page(const AppState_t *app);
 static void app_display_ecg_page(const AppState_t *app);
+static void app_display_ecg_quality_page(const AppState_t *app);
 static void app_display_debug_d1_max(const AppState_t *app);
 static void app_display_debug_d2_fifo(const AppState_t *app);
 static void app_display_debug_d3_ppg_raw(const AppState_t *app);
@@ -81,6 +92,7 @@ static void app_display_debug_d6_sys(const AppState_t *app);
 static void app_display_debug_d7_sd(const AppState_t *app);
 static void app_display_debug_d8_ecg(const AppState_t *app);
 static void app_display_debug_d9_sched(const AppState_t *app);
+static void app_display_debug_d10_ecg_q(const AppState_t *app);
 static void app_display_draw_lines_8(const char line[8][24]);
 static uint32_t app_display_cap_u32(uint32_t value, uint32_t cap);
 static const char *app_get_quality_label(const AppState_t *app);
@@ -119,6 +131,14 @@ void app_display_init_state(AppState_t *app)
   app->page_prev_button.pin = PAGE_PREV_BUTTON_PIN;
   app->page_next_button.port = PAGE_NEXT_BUTTON_PORT;
   app->page_next_button.pin = PAGE_NEXT_BUTTON_PIN;
+
+  /* PPG 波形保持原始 MIN_SCALE=32 */
+  ir_waveform.min_scale  = WAVEFORM_AGC_MIN_SCALE;
+  red_waveform.min_scale = WAVEFORM_AGC_MIN_SCALE;
+  /* ECG 独立 min_scale=200：低幅噪声在 ±600 可视范围仅占 ~1.3 px/pixel
+   * 而 R 峰 (200-600 LSB 视觉输出) 仍占 16-48 px，清晰可见 */
+  ecg_waveform.min_scale = 200UL;
+
   waveform_buffer_reset(&ecg_waveform);
 }
 
@@ -216,19 +236,19 @@ void app_display_handle_buttons(AppState_t *app)
     return;
   }
 
-  /* PE2: Debug 模式开关 */
+  /* PE2：调试模式开关 */
   if (page_button_poll_pressed(&app->debug_toggle_button) != 0U)
   {
     if (app->debug_mode == 0U)
     {
-      /* 进入 Debug 模式，记住当前普通页面 */
+      /* 进入调试模式，记住当前普通页面 */
       app->saved_normal_page = app->current_page;
       app->debug_mode = 1U;
       app->debug_sub_page = DBG_SUB_D1_MAX;
     }
     else
     {
-      /* 退出 Debug 模式，回到之前的普通页面 */
+      /* 退出调试模式，回到之前的普通页面 */
       app->debug_mode = 0U;
       app->current_page = app->saved_normal_page;
     }
@@ -238,7 +258,7 @@ void app_display_handle_buttons(AppState_t *app)
 
   if (app->debug_mode != 0U)
   {
-    /* Debug 模式下 PE3/PE4 只在 Debug 子页之间切换 */
+    /* 调试模式下 PE3/PE4 只在调试子页之间切换 */
     if (page_button_poll_pressed(&app->page_prev_button) != 0U)
     {
       if (app->debug_sub_page == DBG_SUB_D1_MAX)
@@ -297,7 +317,7 @@ void app_display_measurement_page(const AppState_t *app)
     return;
   }
 
-  /* Debug 模式下绘制 Debug 子页面 */
+  /* 调试模式下绘制调试子页面 */
   if (app->debug_mode != 0U)
   {
     switch (app->debug_sub_page)
@@ -310,6 +330,7 @@ void app_display_measurement_page(const AppState_t *app)
       case DBG_SUB_D7_SD:       app_display_debug_d7_sd(app);       break;
       case DBG_SUB_D8_ECG:      app_display_debug_d8_ecg(app);      break;
       case DBG_SUB_D9_SCHED:    app_display_debug_d9_sched(app);    break;
+      case DBG_SUB_D10_ECG_Q:  app_display_debug_d10_ecg_q(app);  break;
       case DBG_SUB_D1_MAX:
       default:                  app_display_debug_d1_max(app);      break;
     }
@@ -328,6 +349,10 @@ void app_display_measurement_page(const AppState_t *app)
 
     case DISPLAY_PAGE_ECG:
       app_display_ecg_page(app);
+      break;
+
+    case DISPLAY_PAGE_ECG_QUALITY:
+      app_display_ecg_quality_page(app);
       break;
 
     case DISPLAY_PAGE_BPM:
@@ -740,6 +765,79 @@ static void app_display_ecg_page(const AppState_t *app)
 }
 
 /**
+ * @brief  渲染 ECG 质量页面：SQ/reason、HR/RR/PTT 和全高 ECG 波形。
+ * @param  app 指向应用状态的指针（ECG 质量和 PTT 字段）。
+ * @note   布局：y=0 显示 SQ+原因（左侧）和 "E Q" 标题（右侧）；y=8 显示
+ *         HR/RR/PTT（左侧）和 LO 状态（右侧）；y=16..63 为 48px 的 ECG 波形。
+ */
+static void app_display_ecg_quality_page(const AppState_t *app)
+{
+  char line0[32];
+  char line0r[8];
+  char line1[32];
+  char line1r[16];
+  const char *reason_str;
+
+  if (app == NULL) { return; }
+
+  (void)snprintf(line0r, sizeof(line0r), "E Q");
+
+  /* reason string */
+  switch (app->ecg_invalid_reason) {
+  case ECG_INVALID_OK:            reason_str = "OK";    break;
+  case ECG_INVALID_LEAD_OFF:      reason_str = "LEAD";  break;
+  case ECG_INVALID_ADC_SAT:       reason_str = "SAT";   break;
+  case ECG_INVALID_DMA_OVERFLOW:  reason_str = "DMA";   break;
+  case ECG_INVALID_NO_R_PEAK:     reason_str = "NoR";   break;
+  case ECG_INVALID_LOW_AMPLITUDE: reason_str = "LoA";   break;
+  case ECG_INVALID_NOISY:         reason_str = "NOIS";  break;
+  case ECG_INVALID_RAW_FLATLINE:  reason_str = "FLAT";  break;
+  default:                         reason_str = "?";     break;
+  }
+
+  (void)snprintf(line0, sizeof(line0), "SQ:%u R:%s",
+                 (unsigned int)app->ecg_signal_quality, reason_str);
+
+  if (app->ecg_lead_off != 0U)
+  {
+    (void)snprintf(line1, sizeof(line1), "LEAD OFF");
+    (void)snprintf(line1r, sizeof(line1r), "LO:%u",
+                   (unsigned int)app_ecg_read_lead_off_raw());
+  }
+  else
+  {
+    char hr_str[8], rr_str[8], ptt_str[8];
+
+    if ((app->ecg_valid != 0U) || (app->ecg_hr != 0U))
+      (void)snprintf(hr_str, sizeof(hr_str), "%u", (unsigned int)app->ecg_hr);
+    else
+      (void)snprintf(hr_str, sizeof(hr_str), "--");
+
+    if (app->ecg_rr_ms != 0U)
+      (void)snprintf(rr_str, sizeof(rr_str), "%u", (unsigned int)app->ecg_rr_ms);
+    else
+      (void)snprintf(rr_str, sizeof(rr_str), "--");
+
+    if ((app->ptt_valid != 0U) || (app->ptt_ms != 0U))
+      (void)snprintf(ptt_str, sizeof(ptt_str), "%u", (unsigned int)app->ptt_ms);
+    else
+      (void)snprintf(ptt_str, sizeof(ptt_str), "--");
+
+    (void)snprintf(line1, sizeof(line1), "H%s R%s P%s", hr_str, rr_str, ptt_str);
+    (void)snprintf(line1r, sizeof(line1r), "LO:%u",
+                   (unsigned int)app_ecg_read_lead_off_raw());
+  }
+
+  ssd1306_Clear(SSD1306_COLOR_BLACK);
+  ssd1306_DrawString(0, 0, line0);
+  app_display_draw_right(0, line0r);
+  ssd1306_DrawString(0, 8, line1);
+  app_display_draw_right(8, line1r);
+  waveform_buffer_draw(&ecg_waveform, 0U, 16U, SSD1306_WIDTH, 48U, 0U, 1U, 1U);
+  ssd1306_UpdateScreen();
+}
+
+/**
  * @brief  调试页面 D1：MAX30102 传感器健康状态、I2C 错误、恢复状态。
  * @param  app 指向应用状态的指针（传感器健康字段）。
  * @note   显示传感器健康状态、I2C 错误码、错误连续次数、
@@ -919,7 +1017,7 @@ static void app_display_debug_d3_ppg_raw(const AppState_t *app)
  *         IR/RED 交流 RMS 幅度、运动标志和分数，以及 SpO2 比率。
  */
 /* =========================================================================
- * D4 PPG Q — 信号质量、PI、运动伪影、SpO2 ratio
+ * D4 PPG Q — 信号质量、PI、运动伪影、SpO2 比率
  * ========================================================================= */
 static void app_display_debug_d4_ppg_q(const AppState_t *app)
 {
@@ -1138,11 +1236,10 @@ static void app_display_debug_d7_sd(const AppState_t *app)
 }
 
 /* =========================================================================
- * D8 ECG/PPG — ECG vs PPG comparison: HR, BPM, diff, RR, raw/filtered
- *              ranges, lead-off, display mode, error counters, ADC channel.
- *              Yellow RL/RLD electrode not routed through LO+/- pins —
- *              removing it does not change lead_off_raw. This is expected
- *              HW behavior.
+ * D8 ECG/PPG：ECG 与 PPG 对比，显示 HR、BPM、差值、RR、
+ *              原始/滤波范围、导联脱落、显示模式、错误计数和 ADC 通道。
+ *              黄色 RL/RLD 电极未接到 LO+/- 引脚；
+ *              移除它不会改变 lead_off_raw，这是预期硬件行为。
  * ========================================================================= */
 static void app_display_debug_d8_ecg(const AppState_t *app)
 {
@@ -1169,8 +1266,8 @@ static void app_display_debug_d8_ecg(const AppState_t *app)
   mode_str = "N";
 #endif
 
-  /* ECG-vs-PPG comparison: flag large discrepancies for debugging.
-   * Does NOT alter ECG/PPG algorithms — observation only. */
+  /* ECG 与 PPG 对比：调试时标记较大的差异。
+   * 仅用于观察，不改变 ECG/PPG 算法。 */
   both_valid = ((snap.ecg_valid != 0U) && (snap.ppg_valid != 0U)
                 && (snap.ecg_hr > 0U) && (snap.ppg_bpm > 0U)) ? 1U : 0U;
 
@@ -1235,7 +1332,7 @@ static void app_display_debug_d9_sched(const AppState_t *app)
   uint32_t mhb;
   uint32_t uhb;
 
-  /* 低频 delta 计算 */
+  /* 低频差值计算 */
   static uint32_t last_t6    = 0U;
   static uint32_t last_mhb   = 0U;
   static uint32_t last_tick  = 0U;
@@ -1294,17 +1391,88 @@ static void app_display_debug_d9_sched(const AppState_t *app)
   app_display_draw_lines_8(line);
 }
 
+/* =========================================================================
+ * D10 ECG Q — ECG 信号质量诊断：SQ/reason、raw_span/filt_span、
+ *              noise/threshold、peak_snr、DMA high watermark / overflow
+ * ========================================================================= */
+static void app_display_debug_d10_ecg_q(const AppState_t *app)
+{
+  char line[8][24];
+  const char *reason_str;
+  const char *last_reason_str;
+
+  if (app == NULL) { return; }
+
+  switch (app->ecg_invalid_reason) {
+  case ECG_INVALID_OK:            reason_str = "OK";   break;
+  case ECG_INVALID_LEAD_OFF:      reason_str = "LEAD"; break;
+  case ECG_INVALID_ADC_SAT:       reason_str = "SAT";  break;
+  case ECG_INVALID_DMA_OVERFLOW:  reason_str = "DMA";  break;
+  case ECG_INVALID_NO_R_PEAK:     reason_str = "NoR";  break;
+  case ECG_INVALID_LOW_AMPLITUDE: reason_str = "LoA";  break;
+  case ECG_INVALID_NOISY:         reason_str = "NOIS"; break;
+  case ECG_INVALID_RAW_FLATLINE:  reason_str = "FLAT"; break;
+  default:                         reason_str = "?";    break;
+  }
+
+  switch (app->ecg_last_drop_reason) {
+  case ECG_INVALID_OK:            last_reason_str = "OK";  break;
+  case ECG_INVALID_LEAD_OFF:      last_reason_str = "LD";  break;
+  case ECG_INVALID_ADC_SAT:       last_reason_str = "SAT"; break;
+  case ECG_INVALID_DMA_OVERFLOW:  last_reason_str = "DMA"; break;
+  case ECG_INVALID_NO_R_PEAK:     last_reason_str = "NR";  break;
+  case ECG_INVALID_LOW_AMPLITUDE: last_reason_str = "LA";  break;
+  case ECG_INVALID_NOISY:         last_reason_str = "NS";  break;
+  case ECG_INVALID_RAW_FLATLINE:  last_reason_str = "FL";  break;
+  default:                         last_reason_str = "?";   break;
+  }
+
+  (void)snprintf(line[0], sizeof(line[0]), "D10 ECGQ SQ%u %s",
+                 (unsigned int)app->ecg_signal_quality, reason_str);
+  (void)snprintf(line[1], sizeof(line[1]), "Rsp%u Fsp%u",
+                 (unsigned int)app->ecg_raw_span,
+                 (unsigned int)app->ecg_filtered_span);
+  (void)snprintf(line[2], sizeof(line[2]), "N%lu T%lu",
+                 (unsigned long)(app->ecg_noise_level > 999999UL ?
+                                 999999UL : app->ecg_noise_level),
+                 (unsigned long)(app->ecg_qrs_threshold > 999999UL ?
+                                 999999UL : app->ecg_qrs_threshold));
+  (void)snprintf(line[3], sizeof(line[3]), "SNR %u/100",
+                 (unsigned int)app->ecg_peak_snr_x100);
+  (void)snprintf(line[4], sizeof(line[4]), "DMAhwm %u OVF %lu",
+                 (unsigned int)app->ecg_dma_available_high_watermark,
+                 (unsigned long)(app->ecg_dma_overflow_count > 999999UL ?
+                                 999999UL : app->ecg_dma_overflow_count));
+  (void)snprintf(line[5], sizeof(line[5]), "SAT %lu LOFF %lu",
+                 (unsigned long)(app->ecg_adc_sat_count > 999999UL ?
+                                 999999UL : app->ecg_adc_sat_count),
+                 (unsigned long)(app->ecg_lead_off_count > 999999UL ?
+                                 999999UL : app->ecg_lead_off_count));
+  (void)snprintf(line[6], sizeof(line[6]), "V%u H%u R%u P%u",
+                 (unsigned int)app->ecg_valid,
+                 (unsigned int)app->ecg_hr,
+                 (unsigned int)app->ecg_rr_ms,
+                 (unsigned int)app->ptt_ms);
+  (void)snprintf(line[7], sizeof(line[7]), "L%s Q%u R%u F%u",
+                 last_reason_str,
+                 (unsigned int)app->ecg_last_drop_sq,
+                 (unsigned int)app->ecg_last_drop_raw_span,
+                 (unsigned int)app->ecg_last_drop_filtered_span);
+
+  app_display_draw_lines_8(line);
+}
+
 /*
  * 手指状态 → OLED 提示字符串。
  * 返回 NULL 表示处于正常测量状态，上层应绘制原有内容。
  * 否则返回的字符串应被醒目地绘制在页面中央。
- * WAIT 状态需要 buf 提供格式化空间 (>=15 bytes)。
+ * WAIT 状态需要 buf 提供格式化空间（至少 15 字节）。
  */
 static const char *app_get_finger_status(const AppState_t *app, char *buf, size_t buf_size)
 {
   if (app == NULL) { return NULL; }
 
-  /* 传感器链路异常优先显示，覆盖 finger 状态 */
+  /* 传感器链路异常优先显示，覆盖手指状态 */
   if (app->sensor_health == (uint8_t)SENSOR_HEALTH_I2C_ERR)
   {
     (void)snprintf(buf, buf_size, "I2C ERR %lu",
@@ -1557,7 +1725,7 @@ static void waveform_buffer_reset(WaveformBuffer_t *waveform)
   waveform->write_index = 0U;
   waveform->sample_count = 0U;
   waveform->settle_count = 0U;
-  waveform->scale_estimate = WAVEFORM_AGC_MIN_SCALE;
+  waveform->scale_estimate = waveform->min_scale;
 }
 
 static uint32_t waveform_abs_i32(int32_t value)
@@ -1621,9 +1789,9 @@ static void waveform_buffer_add_sample(WaveformBuffer_t *waveform, int32_t filte
     waveform->scale_estimate -= (delta >> WAVEFORM_AGC_RELEASE_SHIFT);
   }
 
-  if (waveform->scale_estimate < WAVEFORM_AGC_MIN_SCALE)
+  if (waveform->scale_estimate < waveform->min_scale)
   {
-    waveform->scale_estimate = WAVEFORM_AGC_MIN_SCALE;
+    waveform->scale_estimate = waveform->min_scale;
   }
   else if (waveform->scale_estimate > WAVEFORM_AGC_MAX_SCALE)
   {
@@ -1676,14 +1844,14 @@ static void waveform_buffer_mark_latest(WaveformBuffer_t *waveform)
  * @param  height   绘制区域的高度（像素）。
  * @param  dotted   非零表示绘制虚线（每隔一个像素），0 表示实线。
  * @param  markers  非零表示在底部渲染脉搏检测标记。
- * @note   两遍渲染：第一遍扫描 min/max 用于垂直自动缩放，
- *         第二遍将每个样本映射到像素坐标，上下留 1px 边距。
+ * @note   两遍渲染：第一遍扫描最小/最大值用于垂直自动缩放，
+ *         第二遍将每个样本映射到像素坐标，上下留 1 像素边距。
  *         如果缓冲为空，则绘制水平中心线。
- *         如果 vis_range < 4，则强制最小范围为 4，以避免除零并保持小信号可见。
+ *         如果可视范围 < 4，则强制最小范围为 4，以避免除零并保持小信号可见。
  */
 /*
- * 动态缩放波形绘制：扫描可见样本的 min/max，把数据映射到 y+1..y+height-2，
- * 上下各留 1px 边距，避免峰/谷被屏幕边缘截断。
+ * 动态缩放波形绘制：扫描可见样本的最小/最大值，把数据映射到 y+1..y+height-2，
+ * 上下各留 1 像素边距，避免峰/谷被屏幕边缘截断。
  * 若所有样本相等，绘制水平中线。
  * 脉搏标记放在波形区域底部 3 行，不进入主要波形显示区。
  */
@@ -1768,7 +1936,7 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
   vis_range = vis_max - vis_min;
   if (vis_range < 4) { vis_range = 4; }
 
-  /* 映射区间：y+1 到 y+height-2，上下各 1px margin */
+  /* 映射区间：y+1 到 y+height-2，上下各 1 像素边距 */
   map_top = (int32_t)y + 1;
   map_bot = (int32_t)y + (int32_t)height - 2;
   if (map_bot < map_top) { map_bot = map_top; }
@@ -1780,7 +1948,7 @@ static void waveform_buffer_draw(const WaveformBuffer_t *waveform,
     sample_index = (uint16_t)((start_index + i) % SSD1306_WIDTH);
     sample_value = waveform->samples[sample_index];
 
-    /* clamp 到可见范围 */
+    /* 钳位到可见范围 */
     if (sample_value > vis_max) { sample_value = vis_max; }
     if (sample_value < vis_min) { sample_value = vis_min; }
 

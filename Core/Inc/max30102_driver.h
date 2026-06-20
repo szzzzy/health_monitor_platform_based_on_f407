@@ -54,10 +54,10 @@
 #define MAX30102_DEFAULT_FIFO_CONFIG            0x0FU
 #define MAX30102_DEFAULT_MODE_CONFIG            MAX30102_MODE_SPO2
 /*
- * SPO2_CONFIG:
- * - ADC range: 16384 nA
- * - Sample rate: 100 sps
- * - LED pulse width: 411 us / 18-bit
+ * SPO2_CONFIG：
+ * - ADC 量程：16384 nA
+ * - 采样率：100 sps
+ * - LED 脉宽：411 us / 18-bit
  *
  * 固件在每个 10 ms 服务周期中读取所有待处理的 FIFO 样本，
  * 因此传感器保持 100 Hz 以匹配算法固定的采样率计算。

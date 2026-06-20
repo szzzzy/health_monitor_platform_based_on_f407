@@ -4,7 +4,7 @@
   * @brief   SD 二进制日志引擎 — 环形缓冲 + 分片写入
   *
   * 实时路径：PushSample() 仅 16 字节 memcpy
-  * 后台路径：ServiceBudget() 格式化 chunk → APP_SdFile_WriteBytes()
+  * 后台路径：ServiceBudget() 格式化分片 → APP_SdFile_WriteBytes()
   * 停止路径：OnMeasurementStop() → 分片排空 → f_sync
   *
   * 文件格式：
@@ -51,7 +51,7 @@ static uint16_t   session_written = 0U;
 /* 测量活跃门控 */
 static uint8_t    measurement_active = 0U;
 
-/* 延迟 flush 状态机 */
+/* 延迟排空状态机 */
 static uint8_t    flush_pending = 0U;
 typedef enum {
   FLUSH_STATE_IDLE = 0,
@@ -65,10 +65,10 @@ static FlushDeferredState_t flush_deferred_state = FLUSH_STATE_IDLE;
 #define BACKOFF_MS       60000U
 #define WRITE_CHUNK_BYTES ((uint32_t)DATA_LOG_CHUNK_SAMPLES * sizeof(DataLogRawSample_t))
 
-/* 反压阈值：ring 超过此比例则拒绝启动/恢复 SD 写入 */
+/* 反压阈值：环形缓冲超过此比例则拒绝启动/恢复 SD 写入 */
 #define BACKLOG_START_GUARD  (DATA_LOG_RING_SAMPLES / 4U)   /* 25% = 512 样本 */
 #define BACKLOG_PAUSE_GUARD  (DATA_LOG_RING_SAMPLES / 2U)   /* 50% = 1024 样本 */
-/* 格式化缓冲区：文件头(32B) + chunk(512B) = 544B，无需更大 */
+/* 格式化缓冲区：文件头(32B) + 分片(512B) = 544B，无需更大 */
 static uint8_t fmt_buf[sizeof(DataLogFileHeader_t) + WRITE_CHUNK_BYTES];
 
 /* ---- 内部辅助 ---- */
@@ -126,7 +126,7 @@ static uint16_t ring_get_count(void)
  * @brief  丢弃环形缓冲区中当前的所有样本
  * @param  无
  * @return 被丢弃的样本数
- * @note  在 flush 完成期间用于原子地丢弃剩余数据
+ * @note  在排空完成期间用于原子地丢弃剩余数据
  ******************************************************************************
  */
 static uint16_t ring_clear_pending(void)
@@ -174,7 +174,7 @@ static uint16_t ring_pop(DataLogRawSample_t *dst, uint16_t count)
  *        当环形缓冲区超过 25% 时阻止 SD 写入。
  ******************************************************************************
  */
-/* 检查反压：ring 积压过多 → 不入队，让 FIFO 优先 */
+/* 检查反压：环形缓冲积压过多 → 不入队，让 FIFO 优先 */
 static uint8_t backlog_ok_for_sd(void)
 {
   uint16_t count = ring_get_count();
@@ -195,7 +195,7 @@ static uint8_t backlog_ok_for_sd(void)
  ******************************************************************************
  * @brief  启动或重新启动 SD 二进制日志会话
  * @param  enforce_backlog_guard 非零则在启动前强制检查积压
- * @return 成功返回 1，失败返回 0（backoff 待处理、积压已满或 SD 错误）
+ * @return 成功返回 1，失败返回 0（退避待处理、积压已满或 SD 错误）
  * @note  启动会话后写入文件头。重复失败时进入 BACKOFF 状态。
  ******************************************************************************
  */
@@ -251,15 +251,15 @@ static uint8_t sd_try_start(uint8_t enforce_backlog_guard)
 
 /**
  ******************************************************************************
- * @brief  从环形缓冲区弹出一个 chunk 并写入 SD 卡
+ * @brief  从环形缓冲区弹出一个分片并写入 SD 卡
  * @param  budget_ms 允许的最大写入持续时间（毫秒）
  * @return 写入的样本数，失败时返回 0
  * @note  写入失败或超预算时进入 BACKOFF 状态。
- *        chunk 大小为 DATA_LOG_CHUNK_SAMPLES（32 个样本，512 字节）。
+ *        分片大小为 DATA_LOG_CHUNK_SAMPLES（32 个样本，512 字节）。
  ******************************************************************************
  */
 /*
- * 从环形缓冲 pop 一个 chunk，直接 f_write 写入 SD。
+ * 从环形缓冲弹出一个分片，直接 f_write 写入 SD。
  * 每次 512B @ 12MHz SDIO ≈ 0.3ms，远在预算内。
  * 返回写入的样本数。
  */
@@ -279,8 +279,8 @@ static uint16_t sd_write_one_chunk(uint32_t budget_ms)
   last_write_ms = HAL_GetTick() - t0;
 
   /*
-   * 写入超预算或失败 → 暂停 SD，进入 backoff。
-   * WriteBytes 内部失败时已做 close_session_after_error 级联清理。
+   * 写入超预算或失败 → 暂停 SD，进入退避。
+   * 写入函数内部失败时已做 close_session_after_error 级联清理。
    */
   if (ret != APP_SD_FILE_OK)
   {
@@ -385,7 +385,7 @@ void APP_DataLog_PushSample(uint32_t tick, uint32_t red, uint32_t ir,
  * @return 写入的字节数（0 或 512），如果未写入则返回 0
  * @note  实现 SD 状态机（IDLE, TRY_START, ACTIVE, BACKOFF）。
  *        当 measurement_active 设置时不会发生物理 SD I/O。
- *        每轮至多写一个 512B chunk（DATA_LOG_CHUNK_SAMPLES 个样本）。
+ *        每轮至多写一个 512B 分片（DATA_LOG_CHUNK_SAMPLES 个样本）。
  ******************************************************************************
  */
 uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms)
@@ -404,17 +404,17 @@ uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms)
     if ((ring_get_count() >= DATA_LOG_CHUNK_SAMPLES) && backlog_ok_for_sd())
     {
       sd_state = SD_STATE_TRY_START;
-      /* fall through */
+      /* 继续落入下一分支 */
     }
     else { return 0U; }
-    /* fall through */
+    /* 继续落入下一分支 */
 
   case SD_STATE_TRY_START:
     if (!sd_try_start(1U)) return 0U;
-    /* fall through */
+    /* 继续落入下一分支 */
 
   case SD_STATE_ACTIVE:
-    /* 反压门控：backlog 过高时暂停写入（不进 BACKOFF，等 backlog 下降后自动恢复） */
+    /* 反压门控：积压过高时暂停写入（不进 BACKOFF，等积压下降后自动恢复） */
     if (!backlog_ok_for_sd())
     {
       return 0U;
@@ -448,13 +448,13 @@ uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms)
  * @brief  通知测量会话已停止
  * @param  无
  * @return 无
- * @note  O(1)；仅设置待处理标志。实际的 flush 工作由
+ * @note  O(1)；仅设置待处理标志。实际的排空工作由
  *        APP_DataLog_ServiceDeferredStop 在安全窗口中完成。
  ******************************************************************************
  */
 /*
- * 手指离开时：仅设置延迟 flush 标志 (O(1))。
- * 实际 drain + f_sync + f_close 由 APP_DataLog_ServiceDeferredStop() 在安全窗口分片执行。
+ * 手指离开时：仅设置延迟排空标志 (O(1))。
+ * 实际排空 + f_sync + f_close 由 APP_DataLog_ServiceDeferredStop() 在安全窗口分片执行。
  */
 void APP_DataLog_OnMeasurementStop(void)
 {
@@ -514,20 +514,20 @@ void APP_DataLog_SetMeasurementActive(uint8_t active)
 
 /**
  ******************************************************************************
- * @brief  服务延迟 flush 状态机（drain, sync, close）
+ * @brief  服务延迟排空状态机（排空、同步、关闭）
  * @param  无
- * @return flush 完全完成时返回 1，仍在进行中时返回 0
+ * @return 排空完全完成时返回 1，仍在进行中时返回 0
  * @note  实现多周期状态机：IDLE -> DRAINING -> SYNC -> DONE。
  *        每次调用仅执行一次 I/O 操作以避免长时间阻塞。
  ******************************************************************************
  */
 /*
- * 分片延迟 flush 状态机。
- * 每轮只做一个动作（1 chunk f_write 或 1 次 f_sync+f_close），
+ * 分片延迟排空状态机。
+ * 每轮只做一个动作（1 个分片 f_write 或 1 次 f_sync+f_close），
  * 避免在安全窗口一次性阻塞过久。
  *
  * 状态转移: IDLE → DRAINING → SYNC → DONE → IDLE
- * 仅在 finger_present==0 的安全窗口由 main.c 调用。
+ * 仅在手指不在位的安全窗口由 main.c 调用。
  */
 uint8_t APP_DataLog_ServiceDeferredStop(void)
 {
@@ -536,18 +536,18 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
   switch (flush_deferred_state)
   {
   case FLUSH_STATE_IDLE:
-    /* 检查是否有 session 可用；如无，丢弃 ring 后直接完成 */
+    /* 检查是否有会话可用；如无，丢弃环形缓冲后直接完成 */
     if (sd_state != SD_STATE_ACTIVE)
     {
-      /* 尝试启动 session 以便写剩余数据 */
+      /* 尝试启动会话以便写剩余数据 */
       if (!sd_try_start(0U))
       {
-        /* 启动失败时保留 ring，等待 BACKOFF 到期后继续尝试。 */
+        /* 启动失败时保留环形缓冲，等待 BACKOFF 到期后继续尝试。 */
         return 0U;
       }
     }
     flush_deferred_state = FLUSH_STATE_DRAINING;
-    /* fall through */
+    /* 继续落入下一分支 */
 
   case FLUSH_STATE_DRAINING:
     if (sd_state != SD_STATE_ACTIVE)
@@ -559,9 +559,9 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
     if (ring_get_count() >= DATA_LOG_CHUNK_SAMPLES)
     {
       (void)sd_write_one_chunk(10U);
-      return 0U; /* 还有数据，下轮继续 drain */
+      return 0U; /* 还有数据，下轮继续排空 */
     }
-    /* ring 不足一个 chunk → 排空剩余零散样本 */
+    /* 环形缓冲不足一个分片 → 排空剩余零散样本 */
     if (ring_get_count() > 0U)
     {
       uint16_t remaining = ring_pop((DataLogRawSample_t *)fmt_buf, ring_get_count());
@@ -587,10 +587,10 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
       }
     }
     flush_deferred_state = FLUSH_STATE_SYNC;
-    /* fall through */
+    /* 继续落入下一分支 */
 
   case FLUSH_STATE_SYNC:
-    /* StopSession 内部: f_sync → f_close → f_mount(unmount) → Deinit
+    /* 停止会话内部：f_sync → f_close → f_mount(卸载) → 反初始化
      * 每一步都可能阻塞 (卡慢/坏卡时可达 200ms+)。
      * 标记阶段码以便崩溃时定位在此。 */
     {
@@ -606,7 +606,7 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
     sd_state = SD_STATE_IDLE;
     sd_paused = 0U;
     flush_deferred_state = FLUSH_STATE_DONE;
-    /* fall through */
+    /* 继续落入下一分支 */
 
   case FLUSH_STATE_DONE:
     flush_pending = 0U;
@@ -622,9 +622,9 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
 
 /**
  ******************************************************************************
- * @brief  检查延迟 flush 是否待处理
+ * @brief  检查延迟排空是否待处理
  * @param  无
- * @return 如果 flush 待处理则返回 1，否则返回 0
+ * @return 如果延迟排空待处理则返回 1，否则返回 0
  ******************************************************************************
  */
 uint8_t APP_DataLog_IsFlushPending(void)
