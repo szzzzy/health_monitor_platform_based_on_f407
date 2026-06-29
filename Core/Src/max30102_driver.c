@@ -6,6 +6,7 @@
   */
 
 #include "max30102_driver.h"
+#include "eeprom_store.h"
 #include "i2c.h"
 #include <stdint.h>
 
@@ -33,6 +34,26 @@ static MAX30102_FifoDebug_t max30102_fifo_debug;
 static volatile uint8_t max30102_data_ready_flag = 1U;
 static volatile uint8_t max30102_int_seen = 0U;
 static uint8_t max30102_poll_fallback_ticks = 0U;
+
+static uint8_t max30102_get_red_led_pa(void)
+{
+  if (g_eeprom.max30102_led_red_pa == 0U)
+  {
+    return MAX30102_DEFAULT_LED1_PA;
+  }
+
+  return g_eeprom.max30102_led_red_pa;
+}
+
+static uint8_t max30102_get_ir_led_pa(void)
+{
+  if (g_eeprom.max30102_led_ir_pa == 0U)
+  {
+    return MAX30102_DEFAULT_LED2_PA;
+  }
+
+  return g_eeprom.max30102_led_ir_pa;
+}
 
 /* ---- 数据就绪 ---- */
 
@@ -339,14 +360,14 @@ HAL_StatusTypeDef max30102_init(void)
   }
 
   /* 设置 RED LED 电流。 */
-  status = max30102_write_reg(MAX30102_REG_LED1_PA, MAX30102_DEFAULT_LED1_PA);
+  status = max30102_write_reg(MAX30102_REG_LED1_PA, max30102_get_red_led_pa());
   if (status != HAL_OK)
   {
     return status;
   }
 
   /* 设置 IR LED 电流。 */
-  status = max30102_write_reg(MAX30102_REG_LED2_PA, MAX30102_DEFAULT_LED2_PA);
+  status = max30102_write_reg(MAX30102_REG_LED2_PA, max30102_get_ir_led_pa());
   if (status != HAL_OK)
   {
     return status;

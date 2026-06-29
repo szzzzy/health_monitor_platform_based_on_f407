@@ -14,6 +14,7 @@ extern "C" {
 void    app_runtime_send_report_if_due(AppState_t *app);
 void    app_runtime_refresh_display_if_needed(AppState_t *app);
 void    app_runtime_update_sd_log_status(AppState_t *app);
+void    app_runtime_service_eeprom_stats(const AppState_t *app);
 uint8_t app_runtime_sd_service_safe(const AppState_t *app);
 
 #ifdef __cplusplus

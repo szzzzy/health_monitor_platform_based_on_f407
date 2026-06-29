@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "app_data_log.h"
+#include "eeprom_cmd.h"
 #include "usart.h"
 
 /* 串口上报与接收缓冲长度，足够覆盖当前文本协议。 */
@@ -355,7 +356,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   /* -- 显示 -- */
   app_csv_appendf(&b, "%lu,", (unsigned long)app->display_refresh_count);
   app_csv_appendf(&b, "%lu,", (unsigned long)app->display_last_refresh_tick);
-  app_csv_appendf(&b, "%u,",  (unsigned int)app->debug_mode);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->page_mode);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->current_page);
 
   /* -- ECG/PTT (旧上位机忽略尾部即可) -- */
@@ -670,7 +671,7 @@ static void app_send_rtc_set_response(AppState_t *app, uint8_t success, const ch
   (void)send_uart_line(app, response, (uint16_t)strlen(response));
 }
 
-/* 处理单行串口命令，目前仅支持设置 RTC 时间。 */
+/* 处理单行串口命令，支持 eeprom 和 time 两类命令。 */
 static bool app_process_uart_line(AppState_t *app, const char *line)
 {
   APP_RTC_DateTime_t new_time = {0};
@@ -679,6 +680,12 @@ static bool app_process_uart_line(AppState_t *app, const char *line)
   if ((app == NULL) || (line == NULL))
   {
     return false;
+  }
+
+  /* EEPROM commands: info/dump/reset/setsn/sethw/setmfg/setled */
+  if (eeprom_cmd_process(app, line))
+  {
+    return true;
   }
 
   payload = app_get_time_command_payload(line);

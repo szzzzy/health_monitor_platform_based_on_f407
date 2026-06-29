@@ -435,6 +435,11 @@
               <FilePath>../Core/Src/app_display.c</FilePath>
             </File>
             <File>
+              <FileName>app_settings.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/app_settings.c</FilePath>
+            </File>
+            <File>
               <FileName>app_measurement.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/app_measurement.c</FilePath>
@@ -483,6 +488,21 @@
               <FileName>app_protocol.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/app_protocol.c</FilePath>
+            </File>
+            <File>
+              <FileName>eeprom_driver.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/eeprom_driver.c</FilePath>
+            </File>
+            <File>
+              <FileName>eeprom_store.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/eeprom_store.c</FilePath>
+            </File>
+            <File>
+              <FileName>eeprom_cmd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/eeprom_cmd.c</FilePath>
             </File>
             <File>
               <FileName>app_sd_card.c</FileName>

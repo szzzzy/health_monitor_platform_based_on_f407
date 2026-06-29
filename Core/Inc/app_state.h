@@ -19,6 +19,15 @@ extern "C" {
 #define APP_OXY_BALANCE_LOW     2U
 #define APP_OXY_BALANCE_HIGH    3U
 
+/* 页面模式：PE2 按钮在三种模式间循环切换。 */
+typedef enum
+{
+  PAGE_MODE_NORMAL   = 0U,
+  PAGE_MODE_DEBUG    = 1U,
+  PAGE_MODE_SETTINGS = 2U,
+  PAGE_MODE_COUNT    = 3U
+} PageMode_t;
+
 /* OLED 当前支持的页面类型。VITALS 页汇总展示 HR/RR/IBI/HRV/PI/SQ 等多种指标。 */
 typedef enum
 {
@@ -47,6 +56,16 @@ typedef enum
   DBG_SUB_D10_ECG_Q,
   DBG_SUB_COUNT
 } DebugSubPage_t;
+
+/* 设置子页面类型。 */
+typedef enum
+{
+  SETTINGS_SUB_IDENTITY  = 0U,
+  SETTINGS_SUB_CALIBRATE = 1U,
+  SETTINGS_SUB_RUNTIME   = 2U,
+  SETTINGS_SUB_ERRORS    = 3U,
+  SETTINGS_SUB_COUNT     = 4U
+} SettingsSubPage_t;
 
 /*
  * 轮询式按键状态：
@@ -195,8 +214,9 @@ typedef struct
   uint16_t contact_settle_samples; /* 手指刚放上后的接触稳定倒计数（100Hz 节拍） */
   uint8_t report_due;
   uint8_t display_refresh_requested;
-  uint8_t debug_mode;
+  PageMode_t page_mode;
   DebugSubPage_t debug_sub_page;
+  SettingsSubPage_t settings_sub_page;
   DisplayPage_t saved_normal_page;
   /* 最近一次完整串口接收/发送的报文是否有效。 */
   bool uart_rx_message_valid;

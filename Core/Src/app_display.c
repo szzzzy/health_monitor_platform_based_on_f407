@@ -9,6 +9,7 @@
 #include "app_measurement.h"
 #include "app_sched_diag.h"
 #include "app_sd_card.h"
+#include "app_settings.h"
 #include "ssd1306.h"
 
 /* PE2/PE3/PE4 当前作为页面切换和调试按键输入，按下时为低电平。 */
@@ -122,8 +123,9 @@ void app_display_init_state(AppState_t *app)
 
   app->current_page = DISPLAY_PAGE_BPM;
   app->display_refresh_requested = 1U;
-  app->debug_mode = 0U;
+  app->page_mode = PAGE_MODE_NORMAL;
   app->debug_sub_page = DBG_SUB_D1_MAX;
+  app->settings_sub_page = SETTINGS_SUB_IDENTITY;
   app->saved_normal_page = DISPLAY_PAGE_BPM;
   app->debug_toggle_button.port = DEBUG_TOGGLE_BUTTON_PORT;
   app->debug_toggle_button.pin = DEBUG_TOGGLE_BUTTON_PIN;
@@ -236,29 +238,32 @@ void app_display_handle_buttons(AppState_t *app)
     return;
   }
 
-  /* PE2：调试模式开关 */
+  /* PE2：在 NORMAL → DEBUG → SETTINGS 三种模式间循环 */
   if (page_button_poll_pressed(&app->debug_toggle_button) != 0U)
   {
-    if (app->debug_mode == 0U)
+    if (app->page_mode == PAGE_MODE_NORMAL)
     {
-      /* 进入调试模式，记住当前普通页面 */
       app->saved_normal_page = app->current_page;
-      app->debug_mode = 1U;
+      app->page_mode = PAGE_MODE_DEBUG;
       app->debug_sub_page = DBG_SUB_D1_MAX;
+    }
+    else if (app->page_mode == PAGE_MODE_DEBUG)
+    {
+      app->page_mode = PAGE_MODE_SETTINGS;
+      app->settings_sub_page = SETTINGS_SUB_IDENTITY;
     }
     else
     {
-      /* 退出调试模式，回到之前的普通页面 */
-      app->debug_mode = 0U;
+      app->page_mode = PAGE_MODE_NORMAL;
       app->current_page = app->saved_normal_page;
     }
     app->display_refresh_requested = 1U;
     return;
   }
 
-  if (app->debug_mode != 0U)
+  if (app->page_mode == PAGE_MODE_DEBUG)
   {
-    /* 调试模式下 PE3/PE4 只在调试子页之间切换 */
+    /* 调试模式下 PE3/PE4 在调试子页之间切换 */
     if (page_button_poll_pressed(&app->page_prev_button) != 0U)
     {
       if (app->debug_sub_page == DBG_SUB_D1_MAX)
@@ -278,9 +283,31 @@ void app_display_handle_buttons(AppState_t *app)
       app->display_refresh_requested = 1U;
     }
   }
+  else if (app->page_mode == PAGE_MODE_SETTINGS)
+  {
+    /* 设置模式下 PE3/PE4 在设置子页之间切换 */
+    if (page_button_poll_pressed(&app->page_prev_button) != 0U)
+    {
+      if (app->settings_sub_page == SETTINGS_SUB_IDENTITY)
+      {
+        app->settings_sub_page = (SettingsSubPage_t)(SETTINGS_SUB_COUNT - 1U);
+      }
+      else
+      {
+        app->settings_sub_page = (SettingsSubPage_t)(app->settings_sub_page - 1U);
+      }
+      app->display_refresh_requested = 1U;
+    }
+
+    if (page_button_poll_pressed(&app->page_next_button) != 0U)
+    {
+      app->settings_sub_page = (SettingsSubPage_t)((app->settings_sub_page + 1U) % SETTINGS_SUB_COUNT);
+      app->display_refresh_requested = 1U;
+    }
+  }
   else
   {
-    /* 常规模式下 PE3/PE4 只在普通页面之间切换（不含 DEBUG） */
+    /* 常规模式下 PE3/PE4 在普通页面之间切换（不含 DEBUG） */
     if (page_button_poll_pressed(&app->page_prev_button) != 0U)
     {
       if (app->current_page == DISPLAY_PAGE_BPM)
@@ -318,7 +345,7 @@ void app_display_measurement_page(const AppState_t *app)
   }
 
   /* 调试模式下绘制调试子页面 */
-  if (app->debug_mode != 0U)
+  if (app->page_mode == PAGE_MODE_DEBUG)
   {
     switch (app->debug_sub_page)
     {
@@ -334,6 +361,13 @@ void app_display_measurement_page(const AppState_t *app)
       case DBG_SUB_D1_MAX:
       default:                  app_display_debug_d1_max(app);      break;
     }
+    return;
+  }
+
+  /* 设置模式下绘制设置子页面 */
+  if (app->page_mode == PAGE_MODE_SETTINGS)
+  {
+    app_settings_render_page(app);
     return;
   }
 

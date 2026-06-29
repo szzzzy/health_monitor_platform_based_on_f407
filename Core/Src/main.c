@@ -48,6 +48,7 @@
 #include "max30102.h"
 #include "ssd1306.h"
 #include "app_diag.h"
+#include "eeprom_store.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -157,6 +158,15 @@ int main(void)
    * 先恢复 I2C1 总线，确保 OLED 和 MAX30102 不会因为上电总线卡死而初始化失败。 */
   (void)MX_I2C1_RecoverBus();
   app.i2c_recover_count++;
+  eeprom_store_init();
+  if (app.crash_flag != 0U)
+  {
+    uint32_t crash_context = ((uint32_t)app.crash_source) |
+                             (((uint32_t)app.crash_task) << 8U);
+    eeprom_store_log_error(EEPROM_ERR_CRASH_RECORD,
+                           app.crash_phase,
+                           crash_context);
+  }
   ssd1306_Init();
   app_protocol_update_rtc_snapshot(&app);
   app_display_status_page(&app, "MAX30102 INIT", "SYSTEM BOOT");

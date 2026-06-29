@@ -5,12 +5,16 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
+
 #include "app_state.h"
 
 void app_rtos_bind_state(AppState_t *state);
 void app_rtos_notify_max_from_isr(void);
 void app_rtos_mark_ready(void);
 AppState_t *app_rtos_get_state(void);
+uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms);
+void app_rtos_i2c_release(void);
 
 #ifdef __cplusplus
 }

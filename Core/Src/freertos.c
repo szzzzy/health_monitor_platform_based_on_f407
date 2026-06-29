@@ -115,8 +115,6 @@ const osMutexAttr_t i2c1Mutex_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-static uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms);
-static void app_rtos_i2c_release(void);
 static void app_rtos_service_max(AppState_t *app);
 /* USER CODE END FunctionPrototypes */
 
@@ -189,7 +187,7 @@ void app_rtos_notify_max_from_isr(void)
  * @note  序列化 MAX 任务与 UI 任务之间的 I2C 访问。
  ******************************************************************************
  */
-static uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms)
+uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms)
 {
   if (i2c1MutexHandle == NULL)
   {
@@ -207,7 +205,7 @@ static uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms)
  * @note  句柄为 NULL 时调用安全（空操作）。
  ******************************************************************************
  */
-static void app_rtos_i2c_release(void)
+void app_rtos_i2c_release(void)
 {
   if (i2c1MutexHandle != NULL)
   {
@@ -565,6 +563,7 @@ void StartTask04(void *argument)
 
     app_rtos_state->ui_task_phase = PHASE_UI_REPORT_SEND;
     app_runtime_send_report_if_due(app_rtos_state);
+    app_runtime_service_eeprom_stats(app_rtos_state);
 
     /* 每 20 拍 (~400ms) 采集一次栈水印 */
     {
