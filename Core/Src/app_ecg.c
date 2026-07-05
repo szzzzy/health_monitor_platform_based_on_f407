@@ -67,6 +67,15 @@
 #define APP_ECG_QRS_NOISE_GAIN      3U   /* 动态阈值 = 噪声基线 × 增益 */
 #define APP_ECG_QRS_END_DIV         2U   /* 波群结束：幅值跌至候选峰值/2 */
 #define APP_ECG_QRS_MAX_WIDTH_MS    160U /* QRS 波群最大宽度 */
+#define APP_ECG_RR_HISTORY_SIZE     5U
+#define APP_ECG_SEARCH_HISTORY_SIZE 8U
+#define APP_ECG_DYNAMIC_REF_MIN_MS  300U
+#define APP_ECG_DYNAMIC_REF_MAX_MS  420U
+#define APP_ECG_DYNAMIC_REF_PERCENT 35U
+#define APP_ECG_SEARCHBACK_DELAY_PERCENT 160U
+#define APP_ECG_SEARCHBACK_THRESHOLD_PERCENT 55U
+#define APP_ECG_T_WAVE_WINDOW_MS    420U
+#define APP_ECG_T_WAVE_PEAK_PERCENT 60U
 
 /* === ADC 饱和检测阈值 ====================================================== */
 #define APP_ECG_ADC_SAT_THRESHOLD   4090U
@@ -259,6 +268,13 @@ typedef struct
   uint32_t candidate_peak_abs;
   uint32_t candidate_peak_ms;
   uint32_t candidate_start_ms;
+  uint16_t rr_history[APP_ECG_RR_HISTORY_SIZE];
+  uint8_t  rr_count;
+  uint8_t  rr_write_index;
+  uint32_t search_peak_ms[APP_ECG_SEARCH_HISTORY_SIZE];
+  uint32_t search_peak_abs[APP_ECG_SEARCH_HISTORY_SIZE];
+  uint8_t  search_count;
+  uint8_t  search_write_index;
 } AppEcgState_t;
 
 static AppEcgState_t ecg_state;
@@ -405,6 +421,21 @@ static uint8_t  app_ecg_smooth_quality(uint8_t current, uint8_t target);
 static void     app_ecg_latch_quality_drop(AppState_t *app,
                                             uint8_t prev_reason,
                                             uint8_t prev_sq);
+static uint32_t app_ecg_current_threshold(void);
+static uint16_t app_ecg_rr_median(void);
+static uint32_t app_ecg_dynamic_refractory_ms(void);
+static void     app_ecg_add_rr_history(uint16_t rr_ms);
+static void     app_ecg_store_search_candidate(uint32_t peak_ms,
+                                               uint32_t peak_abs);
+static uint8_t  app_ecg_is_t_wave_like(uint32_t peak_ms,
+                                       uint32_t peak_abs);
+static uint8_t  app_ecg_try_searchback(AppState_t *app,
+                                       uint32_t timestamp_ms,
+                                       uint32_t threshold,
+                                       AppEcgUpdate_t *update);
+static AppEcgUpdate_t app_ecg_accept_r_peak(AppState_t *app,
+                                            uint32_t peak_ms,
+                                            uint32_t peak_abs);
 static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
                                              int32_t filtered,
                                              uint32_t timestamp_ms);
@@ -809,7 +840,7 @@ static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
 {
   AppEcgUpdate_t update;
   uint32_t magnitude, threshold, noise_delta;
-  uint32_t rr_ms, hr_bpm;
+  uint32_t refractory_ms;
 
   (void)memset(&update, 0, sizeof(update));
 
@@ -828,20 +859,7 @@ static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
    *   信号明显时 threshold = noise + (signal-noise)/4  (两峰之间)
    *   信号微弱时 threshold = noise × GAIN               (回退到纯噪声增益)
    * 均钳位在 [MIN, MAX]，防静默或饱和。 */
-  if ((ecg_state.signal_peak > (ecg_state.noise_level * 2U))
-      && (ecg_state.signal_peak > APP_ECG_QRS_MIN_THRESHOLD))
-  {
-    threshold = ecg_state.noise_level
-                + ((ecg_state.signal_peak - ecg_state.noise_level) / 4U);
-  }
-  else
-  {
-    threshold = ecg_state.noise_level * APP_ECG_QRS_NOISE_GAIN;
-  }
-  if (threshold < APP_ECG_QRS_MIN_THRESHOLD)
-    threshold = APP_ECG_QRS_MIN_THRESHOLD;
-  else if (threshold > APP_ECG_QRS_MAX_THRESHOLD)
-    threshold = APP_ECG_QRS_MAX_THRESHOLD;
+  threshold = app_ecg_current_threshold();
 
   /* ===== 空闲态 ===== */
   if (ecg_state.in_candidate == 0U)
@@ -858,10 +876,17 @@ static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
       ecg_state.noise_level -= (noise_delta / 16U);
     }
 
-    /* 触发：幅值超阈值 + 生理不应期满足 */
+    if (app_ecg_try_searchback(app, timestamp_ms, threshold, &update) != 0U)
+    {
+      return update;
+    }
+
+    refractory_ms = app_ecg_dynamic_refractory_ms();
+
+    /* 触发：幅值超阈值 + 动态不应期满足 */
     if ((magnitude >= threshold) &&
         ((ecg_state.last_r_peak_ms == 0UL) ||
-         ((timestamp_ms - ecg_state.last_r_peak_ms) >= APP_ECG_MIN_RR_MS)))
+         ((timestamp_ms - ecg_state.last_r_peak_ms) >= refractory_ms)))
     {
       ecg_state.in_candidate       = 1U;
       ecg_state.candidate_peak_abs = magnitude;
@@ -893,37 +918,283 @@ static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
   /* 候选峰值必须 ≥ 阈值 */
   if (ecg_state.candidate_peak_abs < threshold)
   {
+    if ((ecg_state.candidate_peak_abs * 100U) >=
+        (threshold * APP_ECG_SEARCHBACK_THRESHOLD_PERCENT))
+    {
+      app_ecg_store_search_candidate(ecg_state.candidate_peak_ms,
+                                     ecg_state.candidate_peak_abs);
+    }
     return update;
   }
 
-  /* === 确认 R 峰 === */
-  update.r_peak_detected = 1U;
-  update.r_peak_ms       = ecg_state.candidate_peak_ms;
-  app->ecg_r_peak_ms     = ecg_state.candidate_peak_ms;
+  if (app_ecg_is_t_wave_like(ecg_state.candidate_peak_ms,
+                             ecg_state.candidate_peak_abs) != 0U)
+  {
+    return update;
+  }
 
-  /* 更新信号峰值 EMA (α=1/8≈0.125)，用于双估计阈值 */
-  if (ecg_state.signal_peak == 0UL) {
-    ecg_state.signal_peak = ecg_state.candidate_peak_abs;
-  } else {
-    ecg_state.signal_peak +=
-        ((int32_t)(ecg_state.candidate_peak_abs - ecg_state.signal_peak) >> 3);
+  return app_ecg_accept_r_peak(app,
+                               ecg_state.candidate_peak_ms,
+                               ecg_state.candidate_peak_abs);
+}
+
+static uint32_t app_ecg_current_threshold(void)
+{
+  uint32_t threshold;
+
+  if ((ecg_state.signal_peak > (ecg_state.noise_level * 2U)) &&
+      (ecg_state.signal_peak > APP_ECG_QRS_MIN_THRESHOLD))
+  {
+    threshold = ecg_state.noise_level +
+                ((ecg_state.signal_peak - ecg_state.noise_level) / 4U);
+  }
+  else
+  {
+    threshold = ecg_state.noise_level * APP_ECG_QRS_NOISE_GAIN;
+  }
+
+  if (threshold < APP_ECG_QRS_MIN_THRESHOLD)
+  {
+    threshold = APP_ECG_QRS_MIN_THRESHOLD;
+  }
+  else if (threshold > APP_ECG_QRS_MAX_THRESHOLD)
+  {
+    threshold = APP_ECG_QRS_MAX_THRESHOLD;
+  }
+
+  return threshold;
+}
+
+static uint16_t app_ecg_rr_median(void)
+{
+  uint16_t sorted[APP_ECG_RR_HISTORY_SIZE];
+  uint16_t tmp;
+  uint8_t i;
+  uint8_t j;
+  uint8_t n;
+
+  n = ecg_state.rr_count;
+  if (n == 0U)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < n; i++)
+  {
+    sorted[i] = ecg_state.rr_history[i];
+  }
+
+  for (i = 1U; i < n; i++)
+  {
+    tmp = sorted[i];
+    j = i;
+    while ((j > 0U) && (sorted[j - 1U] > tmp))
+    {
+      sorted[j] = sorted[j - 1U];
+      j--;
+    }
+    sorted[j] = tmp;
+  }
+
+  return sorted[n / 2U];
+}
+
+static uint32_t app_ecg_dynamic_refractory_ms(void)
+{
+  uint16_t median_rr = app_ecg_rr_median();
+  uint32_t refractory_ms;
+
+  if (median_rr == 0U)
+  {
+    return APP_ECG_MIN_RR_MS;
+  }
+
+  refractory_ms = ((uint32_t)median_rr * APP_ECG_DYNAMIC_REF_PERCENT) / 100U;
+  if (refractory_ms < APP_ECG_DYNAMIC_REF_MIN_MS)
+  {
+    refractory_ms = APP_ECG_DYNAMIC_REF_MIN_MS;
+  }
+  else if (refractory_ms > APP_ECG_DYNAMIC_REF_MAX_MS)
+  {
+    refractory_ms = APP_ECG_DYNAMIC_REF_MAX_MS;
+  }
+
+  return refractory_ms;
+}
+
+static void app_ecg_add_rr_history(uint16_t rr_ms)
+{
+  ecg_state.rr_history[ecg_state.rr_write_index] = rr_ms;
+  ecg_state.rr_write_index = (uint8_t)((ecg_state.rr_write_index + 1U) %
+                                       APP_ECG_RR_HISTORY_SIZE);
+  if (ecg_state.rr_count < APP_ECG_RR_HISTORY_SIZE)
+  {
+    ecg_state.rr_count++;
+  }
+}
+
+static void app_ecg_store_search_candidate(uint32_t peak_ms,
+                                           uint32_t peak_abs)
+{
+  if (peak_ms == 0UL)
+  {
+    return;
+  }
+
+  ecg_state.search_peak_ms[ecg_state.search_write_index] = peak_ms;
+  ecg_state.search_peak_abs[ecg_state.search_write_index] = peak_abs;
+  ecg_state.search_write_index =
+      (uint8_t)((ecg_state.search_write_index + 1U) %
+                APP_ECG_SEARCH_HISTORY_SIZE);
+  if (ecg_state.search_count < APP_ECG_SEARCH_HISTORY_SIZE)
+  {
+    ecg_state.search_count++;
+  }
+}
+
+static uint8_t app_ecg_is_t_wave_like(uint32_t peak_ms,
+                                      uint32_t peak_abs)
+{
+  uint32_t rr_since_last;
+
+  if ((ecg_state.last_r_peak_ms == 0UL) || (peak_ms <= ecg_state.last_r_peak_ms) ||
+      (ecg_state.signal_peak == 0UL))
+  {
+    return 0U;
+  }
+
+  rr_since_last = peak_ms - ecg_state.last_r_peak_ms;
+  if ((rr_since_last <= APP_ECG_T_WAVE_WINDOW_MS) &&
+      ((peak_abs * 100U) < (ecg_state.signal_peak * APP_ECG_T_WAVE_PEAK_PERCENT)))
+  {
+    return 1U;
+  }
+
+  return 0U;
+}
+
+static uint8_t app_ecg_try_searchback(AppState_t *app,
+                                      uint32_t timestamp_ms,
+                                      uint32_t threshold,
+                                      AppEcgUpdate_t *update)
+{
+  uint16_t median_rr;
+  uint32_t search_delay;
+  uint32_t lower_threshold;
+  uint32_t refractory_ms;
+  uint32_t best_peak_abs = 0UL;
+  uint32_t best_peak_ms = 0UL;
+  uint8_t i;
+
+  if ((app == NULL) || (update == NULL) ||
+      (ecg_state.last_r_peak_ms == 0UL) ||
+      (ecg_state.rr_count < 3U) ||
+      (ecg_state.search_count == 0U) ||
+      (timestamp_ms <= ecg_state.last_r_peak_ms))
+  {
+    return 0U;
+  }
+
+  median_rr = app_ecg_rr_median();
+  if (median_rr == 0U)
+  {
+    return 0U;
+  }
+
+  search_delay = ((uint32_t)median_rr * APP_ECG_SEARCHBACK_DELAY_PERCENT) / 100U;
+  if ((timestamp_ms - ecg_state.last_r_peak_ms) < search_delay)
+  {
+    return 0U;
+  }
+
+  lower_threshold = (threshold * APP_ECG_SEARCHBACK_THRESHOLD_PERCENT) / 100U;
+  if (lower_threshold < (APP_ECG_QRS_MIN_THRESHOLD / 2U))
+  {
+    lower_threshold = APP_ECG_QRS_MIN_THRESHOLD / 2U;
+  }
+
+  refractory_ms = app_ecg_dynamic_refractory_ms();
+  for (i = 0U; i < ecg_state.search_count; i++)
+  {
+    uint32_t candidate_ms = ecg_state.search_peak_ms[i];
+    uint32_t candidate_abs = ecg_state.search_peak_abs[i];
+
+    if ((candidate_ms > (ecg_state.last_r_peak_ms + refractory_ms)) &&
+        ((candidate_ms - ecg_state.last_r_peak_ms) >= APP_ECG_MIN_RR_MS) &&
+        (candidate_ms < timestamp_ms) &&
+        ((candidate_ms - ecg_state.last_r_peak_ms) <= APP_ECG_MAX_RR_MS) &&
+        (candidate_abs >= lower_threshold) &&
+        (candidate_abs > best_peak_abs) &&
+        (app_ecg_is_t_wave_like(candidate_ms, candidate_abs) == 0U))
+    {
+      best_peak_ms = candidate_ms;
+      best_peak_abs = candidate_abs;
+    }
+  }
+
+  if (best_peak_ms == 0UL)
+  {
+    return 0U;
+  }
+
+  *update = app_ecg_accept_r_peak(app, best_peak_ms, best_peak_abs);
+  ecg_state.search_count = 0U;
+  ecg_state.search_write_index = 0U;
+  return update->r_peak_detected;
+}
+
+static AppEcgUpdate_t app_ecg_accept_r_peak(AppState_t *app,
+                                            uint32_t peak_ms,
+                                            uint32_t peak_abs)
+{
+  AppEcgUpdate_t update;
+  uint32_t rr_ms;
+  uint32_t hr_bpm;
+
+  (void)memset(&update, 0, sizeof(update));
+  if ((app == NULL) || (peak_ms == 0UL))
+  {
+    return update;
+  }
+
+  update.r_peak_detected = 1U;
+  update.r_peak_ms = peak_ms;
+  app->ecg_r_peak_ms = peak_ms;
+
+  if (ecg_state.signal_peak == 0UL)
+  {
+    ecg_state.signal_peak = peak_abs;
+  }
+  else
+  {
+    if (peak_abs >= ecg_state.signal_peak)
+    {
+      ecg_state.signal_peak += ((peak_abs - ecg_state.signal_peak) >> 3);
+    }
+    else
+    {
+      ecg_state.signal_peak -= ((ecg_state.signal_peak - peak_abs) >> 3);
+    }
   }
 
   if (ecg_state.last_r_peak_ms != 0UL)
   {
-    rr_ms = ecg_state.candidate_peak_ms - ecg_state.last_r_peak_ms;
-
+    rr_ms = peak_ms - ecg_state.last_r_peak_ms;
     if ((rr_ms >= APP_ECG_MIN_RR_MS) && (rr_ms <= APP_ECG_MAX_RR_MS))
     {
       hr_bpm = (60000UL + (rr_ms / 2UL)) / rr_ms;
-      if (hr_bpm > 255UL) hr_bpm = 255UL;
+      if (hr_bpm > 255UL)
+      {
+        hr_bpm = 255UL;
+      }
 
       app->ecg_rr_ms = (uint16_t)rr_ms;
+      app_ecg_add_rr_history((uint16_t)rr_ms);
 
-      /* EMA 平滑, α=0.25 */
       if ((app->ecg_valid != 0U) && (app->ecg_hr != 0U))
       {
-        app->ecg_hr = (uint8_t)((((uint16_t)app->ecg_hr * 3U) + (uint16_t)hr_bpm + 2U) / 4U);
+        app->ecg_hr = (uint8_t)((((uint16_t)app->ecg_hr * 3U) +
+                                  (uint16_t)hr_bpm + 2U) / 4U);
       }
       else
       {
@@ -931,15 +1202,12 @@ static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
       }
 
       app->ecg_valid = 1U;
-      update.rr_ms   = (uint16_t)rr_ms;
-      update.hr_bpm  = app->ecg_hr;
-
-      /* PTT 链路：仅当 ecg_valid 已置位后，记录 ECG R 峰时间戳供 PTT 使用 */
-      app_ptt_add_ecg_peak(ecg_state.candidate_peak_ms);
+      update.rr_ms = (uint16_t)rr_ms;
+      update.hr_bpm = app->ecg_hr;
+      app_ptt_add_ecg_peak(peak_ms);
     }
     else
     {
-      /* RR 超出生理范围 → 标无效，不清 peak_count（可能是偶发噪声） */
       app->ecg_valid = 0U;
       app->ecg_hr = 0U;
       app->ecg_rr_ms = 0U;
@@ -948,16 +1216,8 @@ static AppEcgUpdate_t app_ecg_process_sample(AppState_t *app,
       app_ptt_reset(app);
     }
   }
-  else
-  {
-    /* 首个 R 峰：只记录时间戳，不输出 ecg_hr / ecg_valid / PTT。
-     * 需要第二个满足范围的峰才可验证 RR 是否合理。 */
-    update.r_peak_detected = 1U;
-    update.r_peak_ms       = ecg_state.candidate_peak_ms;
-    /* ecg_valid 保持 0，ecg_hr 不变，ptt 不记录 */
-  }
 
-  ecg_state.last_r_peak_ms = ecg_state.candidate_peak_ms;
+  ecg_state.last_r_peak_ms = peak_ms;
   return update;
 }
 
@@ -1175,11 +1435,7 @@ void app_ecg_update_quality(AppState_t *app)
   noise = ecg_state.noise_level;
   app->ecg_noise_level = noise;
 
-  threshold = noise * APP_ECG_QRS_NOISE_GAIN;
-  if (threshold < APP_ECG_QRS_MIN_THRESHOLD)
-    threshold = APP_ECG_QRS_MIN_THRESHOLD;
-  else if (threshold > APP_ECG_QRS_MAX_THRESHOLD)
-    threshold = APP_ECG_QRS_MAX_THRESHOLD;
+  threshold = app_ecg_current_threshold();
   app->ecg_qrs_threshold = threshold;
 
   /* 最新 R 峰 SNR */

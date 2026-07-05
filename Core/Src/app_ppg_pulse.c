@@ -38,6 +38,12 @@
 #define APP_BEAT_EMA_NEW_WEIGHT     1U    /* EMA 新值权重 (1/8) */
 #define APP_BEAT_EMA_OLD_WEIGHT     7U    /* EMA 旧值权重 (7/8) */
 #define APP_BEAT_EMA_SHIFT          3U    /* 除数 = 2^3 = 8，用于手动 EMA */
+#define APP_BEAT_SIGNAL_QUALITY_MIN 25U
+#define APP_BEAT_IBI_HISTORY_SIZE   5U
+#define APP_BEAT_IBI_JUMP_PERCENT   40U
+#define APP_BEAT_MIN_NOISE_MULT     2U
+#define APP_BEAT_AMP_MIN_PERCENT    35U
+#define APP_BEAT_AMP_MAX_PERCENT    280U
 
 /* 状态机状态 */
 #define BEAT_STATE_IDLE     0U
@@ -59,7 +65,19 @@ static struct
   uint8_t  sample_count;        /* 已接收样本计数（初始化用） */
   int32_t  sample_buf[2];       /* 初始化窗口样本缓冲 */
   uint32_t hysteresis;          /* 当前迟滞值（从 EMA 或噪声门限推导） */
+  uint16_t ibi_history[APP_BEAT_IBI_HISTORY_SIZE];
+  uint8_t  ibi_count;
+  uint8_t  ibi_write_index;
 } beat;
+
+static uint32_t app_ppg_abs_diff_u32(uint32_t lhs, uint32_t rhs);
+static uint16_t app_ppg_pulse_median_ibi(void);
+static void app_ppg_pulse_add_ibi_history(uint16_t ibi_ms);
+static uint8_t app_ppg_pulse_quality_ok(const AppState_t *app,
+                                        uint16_t ibi_ms,
+                                        uint32_t beat_amplitude,
+                                        uint32_t noise_floor);
+static void app_ppg_pulse_update_amp_ema(uint32_t beat_amplitude);
 
 /**
  ******************************************************************************
@@ -197,21 +215,8 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
       beat_amplitude = (uint32_t)(beat.local_max - beat.prev_trough);
 
       /* 仅当幅度超过噪声门限才接受 */
-      if (beat_amplitude >= noise_floor)
+      if (beat_amplitude >= (noise_floor * APP_BEAT_MIN_NOISE_MULT))
       {
-        /* 更新峰谷幅度的 EMA */
-        if (beat.beat_amp_ema_valid != 0U)
-        {
-          beat.beat_amp_ema = ((beat.beat_amp_ema * APP_BEAT_EMA_OLD_WEIGHT) +
-                               (beat_amplitude * APP_BEAT_EMA_NEW_WEIGHT) +
-                               (1U << (APP_BEAT_EMA_SHIFT - 1U))) >> APP_BEAT_EMA_SHIFT;
-        }
-        else
-        {
-          beat.beat_amp_ema = beat_amplitude;
-          beat.beat_amp_ema_valid = 1U;
-        }
-
         /* 计算 IBI（从上一个峰到当前峰） */
         if (beat.prev_peak_sample != 0U)
         {
@@ -219,19 +224,42 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
           if ((interval_samples >= min_interval_samples) &&
               (interval_samples <= max_interval_samples))
           {
-            /* 有效脉搏！ */
-            pulse_info->beat_valid = 1U;
-            pulse_info->interval_samples = (uint16_t)interval_samples;
-            pulse_info->latest_ibi_ms = (uint16_t)((interval_samples * 1000U +
-                                                    (MAX30102_ALGO_SAMPLE_RATE_HZ / 2U)) /
-                                                   MAX30102_ALGO_SAMPLE_RATE_HZ);
-            pulse_info->latest_peak_sample = beat.local_max_sample;
-            pulse_info->beat_amplitude = beat_amplitude;
-            pulse_detected = 1U;
+            uint16_t ibi_ms;
+
+            ibi_ms = (uint16_t)((interval_samples * 1000U +
+                                 (MAX30102_ALGO_SAMPLE_RATE_HZ / 2U)) /
+                                MAX30102_ALGO_SAMPLE_RATE_HZ);
+
+            if (app_ppg_pulse_quality_ok(app, ibi_ms, beat_amplitude, noise_floor) != 0U)
+            {
+              pulse_info->beat_valid = 1U;
+              pulse_info->interval_samples = (uint16_t)interval_samples;
+              pulse_info->latest_ibi_ms = ibi_ms;
+              pulse_info->latest_peak_sample = beat.local_max_sample;
+              pulse_info->beat_amplitude = beat_amplitude;
+              pulse_detected = 1U;
+              app_ppg_pulse_add_ibi_history(ibi_ms);
+              app_ppg_pulse_update_amp_ema(beat_amplitude);
+              beat.prev_peak_sample = beat.local_max_sample;
+            }
+          }
+          else if (interval_samples > max_interval_samples)
+          {
+            if ((app->signal_quality >= APP_BEAT_SIGNAL_QUALITY_MIN) &&
+                (app->motion_artifact == 0U))
+            {
+              beat.prev_peak_sample = beat.local_max_sample;
+              app_ppg_pulse_update_amp_ema(beat_amplitude);
+            }
           }
         }
 
-        beat.prev_peak_sample = beat.local_max_sample;
+        else if ((app->signal_quality >= APP_BEAT_SIGNAL_QUALITY_MIN) &&
+                 (app->motion_artifact == 0U))
+        {
+          beat.prev_peak_sample = beat.local_max_sample;
+          app_ppg_pulse_update_amp_ema(beat_amplitude);
+        }
       }
 
       /* 切换到下降跟踪 */
@@ -274,25 +302,25 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
  *         重复峰值或 IBI 静默返回。
  ******************************************************************************
  */
-void app_ppg_pulse_process_metrics(AppState_t *app,
-                                   const MAX30102_PulseInfo_t *pulse_info,
-                                   uint32_t total_samples)
+uint8_t app_ppg_pulse_process_metrics(AppState_t *app,
+                                      const MAX30102_PulseInfo_t *pulse_info,
+                                      uint32_t total_samples)
 {
   if ((app == NULL) || (pulse_info == NULL) || (pulse_info->beat_valid == 0U))
   {
-    return;
+    return 0U;
   }
 
   /* HRV 峰值可见性窗口：防止同一峰被重复标记 */
   if (app_hrv_mark_peak_seen(pulse_info->latest_peak_sample) == 0U)
   {
-    return;
+    return 0U;
   }
 
   /* 记录 IBI 到 HRV 缓冲区 */
   if (app_hrv_add_ibi(app, pulse_info->latest_ibi_ms) == 0U)
   {
-    return;
+    return 0U;
   }
 
   /* 更新基于搏动的 PI EMA（每个已接受搏动更新一次） */
@@ -326,5 +354,133 @@ void app_ppg_pulse_process_metrics(AppState_t *app,
   else if (app->signal_quality < APP_RR_SIGNAL_QUALITY_MIN)
   {
     app->rr_valid = 0U;
+  }
+
+  return 1U;
+}
+
+static uint32_t app_ppg_abs_diff_u32(uint32_t lhs, uint32_t rhs)
+{
+  return (lhs >= rhs) ? (lhs - rhs) : (rhs - lhs);
+}
+
+static uint16_t app_ppg_pulse_median_ibi(void)
+{
+  uint16_t sorted[APP_BEAT_IBI_HISTORY_SIZE];
+  uint16_t tmp;
+  uint8_t i;
+  uint8_t j;
+  uint8_t n;
+  uint8_t idx;
+
+  n = (beat.ibi_count < APP_BEAT_IBI_HISTORY_SIZE) ? beat.ibi_count :
+                                                    APP_BEAT_IBI_HISTORY_SIZE;
+  if (n == 0U)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < n; i++)
+  {
+    idx = (uint8_t)((beat.ibi_write_index + APP_BEAT_IBI_HISTORY_SIZE - 1U - i) %
+                    APP_BEAT_IBI_HISTORY_SIZE);
+    sorted[i] = beat.ibi_history[idx];
+  }
+
+  for (i = 1U; i < n; i++)
+  {
+    tmp = sorted[i];
+    j = i;
+    while ((j > 0U) && (sorted[j - 1U] > tmp))
+    {
+      sorted[j] = sorted[j - 1U];
+      j--;
+    }
+    sorted[j] = tmp;
+  }
+
+  return sorted[n / 2U];
+}
+
+static void app_ppg_pulse_add_ibi_history(uint16_t ibi_ms)
+{
+  beat.ibi_history[beat.ibi_write_index] = ibi_ms;
+  beat.ibi_write_index = (uint8_t)((beat.ibi_write_index + 1U) %
+                                   APP_BEAT_IBI_HISTORY_SIZE);
+  if (beat.ibi_count < APP_BEAT_IBI_HISTORY_SIZE)
+  {
+    beat.ibi_count++;
+  }
+}
+
+static uint8_t app_ppg_pulse_quality_ok(const AppState_t *app,
+                                        uint16_t ibi_ms,
+                                        uint32_t beat_amplitude,
+                                        uint32_t noise_floor)
+{
+  uint16_t median_ibi;
+
+  if (app == NULL)
+  {
+    return 0U;
+  }
+
+  if ((app->signal_quality < APP_BEAT_SIGNAL_QUALITY_MIN) ||
+      (app->motion_artifact != 0U))
+  {
+    return 0U;
+  }
+
+  if ((ibi_ms < APP_HRV_IBI_MIN_MS) || (ibi_ms > APP_HRV_IBI_MAX_MS))
+  {
+    return 0U;
+  }
+
+  if (beat_amplitude < (noise_floor * APP_BEAT_MIN_NOISE_MULT))
+  {
+    return 0U;
+  }
+
+  if (beat.beat_amp_ema_valid != 0U)
+  {
+    if ((beat_amplitude * 100U) <
+        (beat.beat_amp_ema * APP_BEAT_AMP_MIN_PERCENT))
+    {
+      return 0U;
+    }
+
+    if ((beat_amplitude * 100U) >
+        (beat.beat_amp_ema * APP_BEAT_AMP_MAX_PERCENT))
+    {
+      return 0U;
+    }
+  }
+
+  if (beat.ibi_count >= 3U)
+  {
+    median_ibi = app_ppg_pulse_median_ibi();
+    if ((median_ibi != 0U) &&
+        (app_ppg_abs_diff_u32(ibi_ms, median_ibi) >
+         (((uint32_t)median_ibi * APP_BEAT_IBI_JUMP_PERCENT) / 100U)))
+    {
+      return 0U;
+    }
+  }
+
+  return 1U;
+}
+
+static void app_ppg_pulse_update_amp_ema(uint32_t beat_amplitude)
+{
+  if (beat.beat_amp_ema_valid != 0U)
+  {
+    beat.beat_amp_ema = ((beat.beat_amp_ema * APP_BEAT_EMA_OLD_WEIGHT) +
+                         (beat_amplitude * APP_BEAT_EMA_NEW_WEIGHT) +
+                         (1U << (APP_BEAT_EMA_SHIFT - 1U))) >> APP_BEAT_EMA_SHIFT;
+  }
+  else
+  {
+    beat.beat_amp_ema = beat_amplitude;
+    beat.beat_amp_ema_valid = 1U;
   }
 }

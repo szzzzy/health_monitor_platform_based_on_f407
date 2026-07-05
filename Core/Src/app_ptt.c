@@ -15,7 +15,12 @@
 
 #define APP_PTT_MIN_MS                60U
 #define APP_PTT_MAX_MS                600U
+#define APP_PTT_TRUSTED_MIN_MS        80U
+#define APP_PTT_TRUSTED_MAX_MS        350U
+#define APP_PTT_MIN_ECG_SQ            35U
+#define APP_PTT_MIN_PPG_SQ            35U
 #define APP_PTT_ECG_PEAK_HISTORY_SIZE 4U
+#define APP_PTT_VALUE_HISTORY_SIZE    5U
 
 static struct
 {
@@ -24,6 +29,13 @@ static struct
   uint8_t  write_index;
 } ptt_ecg_state;
 
+static struct
+{
+  uint16_t value_ms[APP_PTT_VALUE_HISTORY_SIZE];
+  uint8_t count;
+  uint8_t write_index;
+} ptt_value_state;
+
 /* PPG 样本序号 → 绝对 ms 时间戳 */
 static uint32_t app_ptt_ppg_sample_to_ms(const AppState_t *app,
                                          uint32_t peak_sample,
@@ -31,6 +43,8 @@ static uint32_t app_ptt_ppg_sample_to_ms(const AppState_t *app,
 
 /* 在 ECG 历史中查找 PPG 波峰之前最近的有效 R 峰 */
 static uint8_t app_ptt_find_ref_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms);
+static void app_ptt_add_value(uint16_t ptt_ms);
+static uint16_t app_ptt_median_value(void);
 
 /**
  ******************************************************************************
@@ -42,6 +56,7 @@ static uint8_t app_ptt_find_ref_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms
 void app_ptt_reset(AppState_t *app)
 {
   (void)memset(&ptt_ecg_state, 0, sizeof(ptt_ecg_state));
+  (void)memset(&ptt_value_state, 0, sizeof(ptt_value_state));
   if (app != NULL)
   {
     app->ptt_valid = 0U;
@@ -91,7 +106,11 @@ void app_ptt_update_from_ppg_peak(AppState_t *app,
   /* 前置条件 */
   if ((app->ecg_valid == 0U) ||
       (app->ecg_lead_off != 0U) ||
-      (app->ecg_r_peak_ms == 0UL))
+      (app->ecg_r_peak_ms == 0UL) ||
+      (app->ecg_signal_quality < APP_PTT_MIN_ECG_SQ) ||
+      (app->signal_quality < APP_PTT_MIN_PPG_SQ) ||
+      (app->motion_artifact != 0U) ||
+      (app->ibi_valid == 0U))
   {
     app->ptt_valid = 0U;
     return;
@@ -127,7 +146,14 @@ void app_ptt_update_from_ppg_peak(AppState_t *app,
     return;
   }
 
-  app->ptt_ms    = (uint16_t)ptt_ms;
+  if ((ptt_ms < APP_PTT_TRUSTED_MIN_MS) || (ptt_ms > APP_PTT_TRUSTED_MAX_MS))
+  {
+    app->ptt_valid = 0U;
+    return;
+  }
+
+  app_ptt_add_value((uint16_t)ptt_ms);
+  app->ptt_ms    = app_ptt_median_value();
   app->ptt_valid = 1U;
 }
 
@@ -172,4 +198,49 @@ static uint8_t app_ptt_find_ref_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms
     }
   }
   return 0U;
+}
+
+static void app_ptt_add_value(uint16_t ptt_ms)
+{
+  ptt_value_state.value_ms[ptt_value_state.write_index] = ptt_ms;
+  ptt_value_state.write_index = (uint8_t)((ptt_value_state.write_index + 1U) %
+                                          APP_PTT_VALUE_HISTORY_SIZE);
+  if (ptt_value_state.count < APP_PTT_VALUE_HISTORY_SIZE)
+  {
+    ptt_value_state.count++;
+  }
+}
+
+static uint16_t app_ptt_median_value(void)
+{
+  uint16_t sorted[APP_PTT_VALUE_HISTORY_SIZE];
+  uint16_t tmp;
+  uint8_t i;
+  uint8_t j;
+  uint8_t n;
+
+  n = ptt_value_state.count;
+  if (n == 0U)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < n; i++)
+  {
+    sorted[i] = ptt_value_state.value_ms[i];
+  }
+
+  for (i = 1U; i < n; i++)
+  {
+    tmp = sorted[i];
+    j = i;
+    while ((j > 0U) && (sorted[j - 1U] > tmp))
+    {
+      sorted[j] = sorted[j - 1U];
+      j--;
+    }
+    sorted[j] = tmp;
+  }
+
+  return sorted[n / 2U];
 }

@@ -20,6 +20,8 @@ This project is an STM32F407ZGTx physiological-signal acquisition firmware. The 
   UART: `USART2` uses DMA circular RX + IDLE for command reception; TX still uses blocking `HAL_UART_Transmit()`, single-segment timeout `100 ms`.
 - SD 日志：当前是二进制日志，不是 CSV。实时路径只 `APP_DataLog_PushSample()` 写 16B 样本到 RAM ring；物理 `f_write/f_sync/f_close` 只在 `SDtask` 安全窗口执行。
   SD logging: currently binary, not CSV. The real-time path only calls `APP_DataLog_PushSample()` to write 16B records into a RAM ring; physical `f_write/f_sync/f_close` only happens in the `SDtask` safe window.
+- EEPROM：`M24C02` 通过 I2C1 保存设备身份、MAX30102 LED 默认电流、运行计数和 8 条错误环形日志；布局版本为 `2`，带 CRC16/CRC8 校验。
+  EEPROM: an `M24C02` on I2C1 stores device identity, MAX30102 default LED currents, runtime counters, and an 8-entry error ring; the layout version is `2` with CRC16/CRC8 checks.
 
 ## 系统架构 / Architecture
 
@@ -50,6 +52,11 @@ DataLog RAM ring
   -> FatFs
   -> APP_SD_Card_Write()
   -> HAL_SD_WriteBlocks()
+
+M24C02 EEPROM
+  -> eeprom_store_init() during boot
+  -> identity/default LED currents/runtime counters/error ring
+  -> app_runtime_service_eeprom_stats() hourly runtime sync
 ```
 
 ### FreeRTOS Tasks / 任务列表
@@ -72,10 +79,10 @@ DataLog RAM ring
   `MAX30102 INT` 引脚有意禁用：`MAX30102_USE_INT_PIN = 0U`。
 - `PE5` is reserved for `AD8232 LO-`; do not reuse it as MAX30102 INT.
   `PE5` 保留给 `AD8232 LO-`，不可复用为 MAX30102 INT。
-- PPG algorithms include BPM, SpO2 ratio/balance, PI, SQ, motion hint, IBI, HRV time-domain/frequency-domain short-window metrics, and RR estimate.
-  PPG 算法：BPM、SpO2 比率/平衡、PI、SQ、运动提示、IBI、HRV 时域/频域短窗口指标、RR 估计。
-- ECG path includes DC removal, lowpass, 50 Hz notch, 10-20 Hz bandpass, derivative energy, 120 ms MWI, adaptive QRS threshold, ECG HR/RR/PTT, lead-off detection, and ECG quality scoring.
-  ECG 链路：DC 去漂、低通、50 Hz 陷波、10-20 Hz 带通、差分能量、120 ms MWI、自适应 QRS 阈值、ECG HR/RR/PTT、导联脱落检测、ECG 质量评分。
+- PPG algorithms include BPM, beat-derived BPM smoothing, SpO2 ratio/balance, PI, SQ, motion hint, IBI quality gates, HRV time-domain/frequency-domain short-window metrics, and RR estimate.
+  PPG 算法：BPM、基于有效搏动的 BPM 平滑、SpO2 比率/平衡、PI、SQ、运动提示、IBI 质量门控、HRV 时域/频域短窗口指标、RR 估计。
+- ECG path includes DC removal, lowpass, 50 Hz notch, 10-20 Hz bandpass, derivative energy, 120 ms MWI, adaptive QRS threshold, dynamic refractory/search-back, T-wave rejection, ECG HR/RR/PTT, lead-off detection, and ECG quality scoring.
+  ECG 链路：DC 去漂、低通、50 Hz 陷波、10-20 Hz 带通、差分能量、120 ms MWI、自适应 QRS 阈值、动态不应期/搜索回补、T 波拒判、ECG HR/RR/PTT、导联脱落检测、ECG 质量评分。
 - OLED pages: `PULSE`, `OXY`, `VITALS`, `ECG`, `ECG Q`, and debug pages `D1-D10`.
   OLED 页面：`PULSE`、`OXY`、`VITALS`、`ECG`、`ECG Q`，以及调试页 `D1-D10`。
 - UART protocol supports periodic `M` measurement frames and `T` RTC set acknowledgements.
@@ -84,6 +91,10 @@ DataLog RAM ring
   SD 日志使用 2048 样本 RAM 环形缓冲，512B 后台写入块。
 - Crash/liveness diagnostics are stored through backup registers and reported through UART/OLED diagnostic pages.
   崩溃/活体诊断通过备份寄存器存储，并通过串口/OLED 诊断页上报。
+- I2C1 bus recovery toggles SCL and regenerates STOP before reinitializing the bus, reducing boot failures caused by a slave holding SDA low.
+  I2C1 总线恢复会翻转 SCL 并重新生成 STOP，再初始化总线，降低从机拉低 SDA 导致的启动失败。
+- M24C02 EEPROM persistence stores boot/runtime counters, manufacturing identity, default MAX30102 LED currents, and compact fault history.
+  M24C02 EEPROM 持久化保存启动/运行计数、出厂身份、MAX30102 默认 LED 电流和简要故障历史。
 
 ## 硬件与引脚 / Hardware and Pinout
 
@@ -93,14 +104,16 @@ DataLog RAM ring
 | PPG sensor | `MAX30102` |
 | ECG front-end | `AD8232` |
 | Display | `SSD1306 128x64 I2C OLED` |
+| Persistent store | `M24C02` / `24C02`, 256-byte I2C EEPROM |
 | Clock | `HSE 8 MHz`, `LSE 32.768 kHz`, `PLLQ = 7`, 48 MHz domain enabled |
 
 ### I2C1
 
 - `PB8` -> `I2C1_SCL`
 - `PB9` -> `I2C1_SDA`
-- MAX30102 and SSD1306 share this bus. / MAX30102 和 SSD1306 共享此总线。
+- MAX30102, SSD1306, and M24C02 EEPROM share this bus. / MAX30102、SSD1306 与 M24C02 EEPROM 共享此总线。
 - I2C1 is configured as Fast mode; board-level external pull-ups are required. / I2C1 配置为 Fast 模式，板上需外接上拉电阻。
+- M24C02 uses 7-bit address `0x50` (`0xA0` after HAL left shift). / M24C02 使用 7 位地址 `0x50`（HAL 左移后为 `0xA0`）。
 
 ### MAX30102
 
@@ -190,6 +203,41 @@ Runtime constraints: / 运行时约束：
 - `measurement_active != 0` blocks all physical SD I/O. / `measurement_active != 0` 时阻塞所有物理 SD I/O。
 - `APP_DataLog_ServiceDeferredStop()` drains and syncs after the finger leaves / measurement stops. / `APP_DataLog_ServiceDeferredStop()` 在手指离开/测量停止后排空并同步。
 
+## EEPROM 持久化存储 / EEPROM Persistent Store
+
+STM32 固件在启动阶段调用 `eeprom_store_init()` 读取 I2C1 上的 M24C02。若芯片为空、版本不匹配或 CRC 校验失败，则回退到默认值并尝试写回 EEPROM。
+
+The STM32 firmware calls `eeprom_store_init()` during boot to read the M24C02 on I2C1. If the chip is blank, the layout version mismatches, or CRC validation fails, firmware falls back to defaults and attempts to write them back.
+
+| Field / 字段 | Value / 值 |
+| --- | --- |
+| Device / 器件 | `M24C02` / `24C02`, 256 B |
+| I2C address / I2C 地址 | 7-bit `0x50`, HAL address `0xA0` |
+| Layout / 布局 | `EEPROM_LAYOUT_VERSION = 2U` |
+| Magic / 魔数 | `0x424D4501UL` |
+| Default serial / 默认序列号 | `BME-2026-00001` |
+| Default hardware rev / 默认硬件版本 | `V1.0` |
+| Default LED currents / 默认 LED 电流 | RED `0x80`, IR `0x80` |
+
+Layout summary: / 布局摘要：
+
+| Offset / 偏移 | Content / 内容 |
+| --- | --- |
+| `0x00..0x07` | magic, version, CRC16 / 魔数、版本、CRC16 |
+| `0x08..0x29` | serial, hardware revision, manufacturing date, MAX30102 LED currents / 序列号、硬件版本、出厂日期、MAX30102 LED 电流 |
+| `0x2A..0x4F` | reserved, serialized as zero / 保留区，序列化为零 |
+| `0x50..0x5F` | runtime counters: run hours x10, boot count, sensor read errors, recoveries / 运行计数：运行小时 x10、启动次数、传感器读错误、恢复次数 |
+| `0x60..0x6F` | reserved, serialized as zero / 保留区，序列化为零 |
+| `0x70..0xE9` | 8-entry error ring, write pointer, total count / 8 条错误环形日志、写指针、累计计数 |
+| `0xEA..0xFF` | reserved tail, serialized as zero / 尾部保留区，序列化为零 |
+
+Runtime policy: / 运行策略：
+
+- EEPROM access shares the I2C1 mutex and uses a longer store timeout (`EEPROM_STORE_I2C_LOCK_TIMEOUT_MS = 500U`). / EEPROM 访问共享 I2C1 互斥锁，并使用较长的存储超时。
+- `app_runtime_service_eeprom_stats()` syncs runtime counters about once per hour. / `app_runtime_service_eeprom_stats()` 约每小时同步一次运行计数。
+- `eeprom_store_log_error()` writes compact fault records only when EEPROM has initialized successfully. / `eeprom_store_log_error()` 仅在 EEPROM 初始化成功后写入简要故障记录。
+- Do not add EEPROM writes to the MAX/ECG real-time path. / 不要把 EEPROM 写入加入 MAX/ECG 实时路径。
+
 ## USART2 Protocol / 串口协议
 
 ### Measurement Frame / 测量帧
@@ -241,8 +289,8 @@ T,success,rtc_valid,yyyymmdd,hhmmss,reason
 - `SDNN/RMSSD/SD1/SD2`: require enough accepted IBI samples; SD1/SD2 are short-window Poincare descriptors, not diagnostic labels. / 需足够的已接受 IBI 样本。SD1/SD2 为短窗口 Poincare 描述符，不是诊断标签。
 - `LF/HF`: short-window HRV estimate from the 32-beat IBI buffer using 4 Hz resampling, mean removal, Hann windowing, CMSIS-DSP RFFT, LF `0.04-0.15 Hz`, HF `0.15-0.40 Hz`. It is for engineering trend observation only, not standard 5-minute HRV spectral analysis. / 基于 32 拍 IBI 缓冲的短窗口 HRV 估计，工程趋势观察用，不是标准 5 分钟 HRV 频谱分析。
 - `RR`: requires sufficient SQ, accepted beats, window length, and pulse-amplitude modulation. / 需足够的 SQ、已接受搏动数、窗口长度和脉搏幅度调制。
-- `ECG HR/RR`: requires at least two valid R-peaks in the 300-2000 ms range. / 需在 300-2000 ms 范围内至少两个有效 R 峰。
-- `PTT`: computed from ECG R-peak to IR PPG pulse peak; it is not a blood-pressure estimate. / 由 ECG R 峰到 IR PPG 脉搏峰计算；不是血压估计值。
+- `ECG HR/RR`: requires valid R-peaks in the physiological RR range after refractory, search-back, and T-wave rejection checks. / 需通过不应期、搜索回补和 T 波拒判后的生理 RR 范围内有效 R 峰。
+- `PTT`: computed from ECG R-peak to IR PPG pulse peak, gated by ECG/PPG quality and median-filtered; it is not a blood-pressure estimate. / 由 ECG R 峰到 IR PPG 脉搏峰计算，经过 ECG/PPG 质量门控和中值滤波；不是血压估计值。
 
 ## 工程结构 / Project Structure
 
@@ -254,10 +302,12 @@ Drivers/                    STM32 HAL, CMSIS, CMSIS-DSP
 Middlewares/Third_Party/    FatFs and FreeRTOS middleware
 MDK-ARM/BME.uvprojx         Main Keil project
 BME.ioc                     STM32CubeMX project file
-docs/                       STM32 architecture notes and maintenance prompts
+docs/                       Architecture audit, changelog, and closeout notes
 ```
 
-Only `MDK-ARM/BME.uvprojx` exists as the Keil project in this workspace. Do not rely on older README references to a `MAX30102_Simple_Test.uvprojx` file.
+Only `MDK-ARM/BME.uvprojx` exists as the Keil project in this STM32 workspace. Do not rely on older README references to a `MAX30102_Simple_Test.uvprojx` file.
+
+本 STM32 工作区内唯一 Keil 工程是 `MDK-ARM/BME.uvprojx`。不要继续依赖旧 README 中提到的 `MAX30102_Simple_Test.uvprojx`。
 
 ## Build / 编译
 
@@ -275,7 +325,7 @@ Expected result for a clean firmware build is `0 Error(s), 0 Warning(s)` in the 
 
 ## Quick Start / 快速上手
 
-1. Connect MAX30102, AD8232, SSD1306, USART2, buttons, and optional SD card according to the pinout above. / 按上述引脚连接 MAX30102、AD8232、SSD1306、USART2、按键和（可选）SD 卡。
+1. Connect MAX30102, AD8232, SSD1306, M24C02 EEPROM, USART2, buttons, and optional SD card according to the pinout above. / 按上述引脚连接 MAX30102、AD8232、SSD1306、M24C02 EEPROM、USART2、按键和（可选）SD 卡。
 2. Build and flash `MDK-ARM/BME.uvprojx`. / 编译并烧录 `MDK-ARM/BME.uvprojx`。
 3. Power on without a finger on MAX30102; the boot sequence collects the no-finger baseline. / 上电时不要将手指放在 MAX30102 上；启动流程先采集无手指基线。
 4. After the baseline page reports ready, place a finger on MAX30102. / 基线页显示就绪后，将手指放在 MAX30102 上。

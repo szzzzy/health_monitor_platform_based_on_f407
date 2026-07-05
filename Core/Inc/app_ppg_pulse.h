@@ -28,9 +28,9 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
                              MAX30102_PulseInfo_t *pulse_info);
 
 /* 脉搏后处理：推送 IBI 到 HRV、振幅到 RR、触发 OLED 标记 */
-void app_ppg_pulse_process_metrics(AppState_t *app,
-                                   const MAX30102_PulseInfo_t *pulse_info,
-                                   uint32_t total_samples);
+uint8_t app_ppg_pulse_process_metrics(AppState_t *app,
+                                      const MAX30102_PulseInfo_t *pulse_info,
+                                      uint32_t total_samples);
 
 #ifdef __cplusplus
 }

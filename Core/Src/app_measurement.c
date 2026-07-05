@@ -50,6 +50,18 @@
 #define APP_CONTACT_SETTLE_SAMPLES        200U
 /* 基于搏动的 PI 超时：无新搏动超过此窗口则标无效 */
 #define APP_PI_STALE_SAMPLES              (MAX30102_ALGO_SAMPLE_RATE_HZ * 5U)
+#define APP_PPG_BEAT_BPM_STALE_SAMPLES    (MAX30102_ALGO_SAMPLE_RATE_HZ * 3U)
+#define APP_PPG_BPM_MIN_RESULT            35U
+#define APP_PPG_BPM_MAX_RESULT            220U
+#define APP_SPO2_BEAT_RATIO_HISTORY_SIZE  8U
+#define APP_SPO2_BEAT_RATIO_MIN_COUNT     3U
+#define APP_SPO2_BEAT_STALE_SAMPLES       (MAX30102_ALGO_SAMPLE_RATE_HZ * 8U)
+#define APP_SPO2_BEAT_MIN_AC              30U
+#define APP_SPO2_BEAT_RATIO_MIN_X1000     300U
+#define APP_SPO2_BEAT_RATIO_MAX_X1000     3000U
+#define APP_HR_FUSION_DIFF_BPM            18U
+#define APP_HR_FUSION_CONFIRM_COUNT       4U
+#define APP_HR_FUSION_MIN_SQ              35U
 #define APP_SENSOR_STALE_TIMEOUT_MS       3000U
 #define APP_SENSOR_STALE_CONFIRM_INTERVAL_MS 1000U
 #define APP_SENSOR_STALE_CONFIRM_COUNT       3U
@@ -72,6 +84,20 @@ static struct
 } sample_debug_state;
 /* BPM 评估抽头计数器：每 N 个样本才跑一次完整 BPM 计算 */
 static uint8_t bpm_update_decimator;
+static struct
+{
+  uint8_t valid;
+  uint8_t bpm;
+  uint32_t sample;
+} ppg_beat_bpm_state;
+static struct
+{
+  uint16_t ratio_x1000[APP_SPO2_BEAT_RATIO_HISTORY_SIZE];
+  uint8_t count;
+  uint8_t write_index;
+  uint32_t sample;
+} spo2_beat_state;
+static uint8_t hr_fusion_mismatch_count;
 /* 延迟的主循环必须在总线恢复前有机会耗尽 FIFO。 */
 static uint32_t sensor_last_recovery_tick = 0UL;
 static uint32_t sensor_last_stale_probe_tick = 0UL;
@@ -82,6 +108,20 @@ static void app_reset_measurement_outputs(AppState_t *app);
 static void app_invalidate_advanced_outputs(AppState_t *app);
 static void app_reset_advanced_metrics(AppState_t *app);
 static HAL_StatusTypeDef app_measurement_reinit_sensor(void);
+static void app_measurement_reset_beat_states(void);
+static uint8_t app_measurement_bpm_from_ibi(uint16_t ibi_ms, uint8_t *bpm_value);
+static uint8_t app_measurement_ppg_beat_bpm_recent(uint32_t current_sample);
+static uint8_t app_measurement_spo2_beat_recent(uint32_t current_sample);
+static uint8_t app_measurement_spo2_update_from_beat(AppState_t *app,
+                                                     const MAX30102_SpO2_t *state,
+                                                     const MAX30102_PulseInfo_t *pulse,
+                                                     uint8_t *spo2_value);
+static void app_measurement_spo2_add_ratio(uint16_t ratio_x1000,
+                                           uint32_t beat_sample);
+static uint16_t app_measurement_spo2_select_ratio(void);
+static uint8_t app_measurement_spo2_from_ratio(uint16_t ratio_x1000,
+                                               uint8_t *spo2_value);
+static void app_measurement_update_hr_fusion(AppState_t *app);
 
 /**
  ******************************************************************************
@@ -113,6 +153,7 @@ void app_measurement_reset_runtime(void)
   max30102_spo2_reset(&spo2_state);
   (void)memset(&sample_debug_state, 0, sizeof(sample_debug_state));
   bpm_update_decimator = 0U;
+  app_measurement_reset_beat_states();
   app_spo2_filter_reset(NULL);
   app_motion_reset(NULL);
   app_ppg_signal_reset_envelope();
@@ -575,6 +616,9 @@ void app_measurement_process(AppState_t *app)
   uint8_t acorr_bpm = 0U;
   uint8_t raw_spo2_valid = 0U;
   uint8_t raw_spo2_value = 0U;
+  uint8_t beat_spo2_attempted = 0U;
+  uint8_t beat_spo2_valid = 0U;
+  uint8_t beat_spo2_value = 0U;
   uint8_t signal_quality = 0U;
   int32_t red_waveform_sample = 0;
   int32_t ir_waveform_sample = 0;
@@ -612,6 +656,7 @@ void app_measurement_process(AppState_t *app)
       app->ir_pi_ac_ema_valid = 0U;
       app->last_beat_sample = 0U;
       bpm_update_decimator = 0U;
+      app_measurement_reset_beat_states();
     }
   }
 
@@ -655,6 +700,7 @@ void app_measurement_process(AppState_t *app)
       app->bpm_valid = 0U;
       app_spo2_filter_update_output(app, 0U, 0U);
       app_invalidate_advanced_outputs(app);
+      app_measurement_reset_beat_states();
       return;
     }
   }
@@ -695,19 +741,54 @@ void app_measurement_process(AppState_t *app)
 
     if (app_ppg_pulse_update(app, ir_waveform_sample, spo2_state.total_samples, &pulse_info) != 0U)
     {
-      app_ppg_pulse_process_metrics(app, &pulse_info, spo2_state.total_samples);
-      app_ptt_update_from_ppg_peak(app, pulse_info.latest_peak_sample, spo2_state.total_samples);
+      if (app_ppg_pulse_process_metrics(app, &pulse_info, spo2_state.total_samples) != 0U)
+      {
+        uint8_t beat_bpm;
+
+        if (app_measurement_bpm_from_ibi(pulse_info.latest_ibi_ms, &beat_bpm) != 0U)
+        {
+          ppg_beat_bpm_state.valid = 1U;
+          ppg_beat_bpm_state.bpm = beat_bpm;
+          ppg_beat_bpm_state.sample = pulse_info.latest_peak_sample;
+          (void)app_bpm_filter_update(app, 1U, beat_bpm);
+          app_measurement_update_hr_fusion(app);
+        }
+
+        beat_spo2_attempted = 1U;
+        beat_spo2_valid = app_measurement_spo2_update_from_beat(app,
+                                                                &spo2_state,
+                                                                &pulse_info,
+                                                                &beat_spo2_value);
+        if (beat_spo2_valid != 0U)
+        {
+          app_spo2_filter_update_output(app, 1U, beat_spo2_value);
+        }
+
+        app_ptt_update_from_ppg_peak(app, pulse_info.latest_peak_sample, spo2_state.total_samples);
+      }
     }
   }
 
-  raw_spo2_valid = max30102_calculate_spo2(&spo2_state, &raw_spo2_value);
-  if ((raw_spo2_valid != 0U) && (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2))
+  if (beat_spo2_valid == 0U)
   {
-    raw_spo2_valid = 0U;
-  }
-  if (app->contact_settle_samples == 0U)
-  {
-    app_spo2_filter_update_output(app, raw_spo2_valid, raw_spo2_value);
+    raw_spo2_valid = max30102_calculate_spo2(&spo2_state, &raw_spo2_value);
+    if ((raw_spo2_valid != 0U) && (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2))
+    {
+      raw_spo2_valid = 0U;
+    }
+    if (app->contact_settle_samples == 0U)
+    {
+      if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2) ||
+          ((beat_spo2_attempted != 0U) &&
+           (app_measurement_spo2_beat_recent(spo2_state.total_samples) != 0U)))
+      {
+        app_spo2_filter_update_output(app, 0U, 0U);
+      }
+      else if (app_measurement_spo2_beat_recent(spo2_state.total_samples) == 0U)
+      {
+        app_spo2_filter_update_output(app, raw_spo2_valid, raw_spo2_value);
+      }
+    }
   }
 
   if (app->contact_settle_samples == 0U)
@@ -724,6 +805,17 @@ void app_measurement_process(AppState_t *app)
     if (app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM)
     {
       acorr_bpm_valid = max30102_autocorr_bpm(&spo2_state, &acorr_bpm);
+    }
+
+    if (app_measurement_ppg_beat_bpm_recent(spo2_state.total_samples) != 0U)
+    {
+      if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+      {
+        (void)app_bpm_filter_update(app, 0U, 0U);
+        app->rr_valid = 0U;
+      }
+      app_measurement_update_hr_fusion(app);
+      return;
     }
 
     if ((raw_bpm_valid != 0U) && (acorr_bpm_valid != 0U))
@@ -757,6 +849,7 @@ void app_measurement_process(AppState_t *app)
     {
       bpm_update_decimator = 0U;
     }
+    app_measurement_update_hr_fusion(app);
   }
 }
 
@@ -786,6 +879,326 @@ void app_measurement_update_periodic_flags(AppState_t *app)
   app->refresh_div = 0U;
   app->report_due = 1U;
   app->display_refresh_requested = 1U;
+}
+
+static void app_measurement_reset_beat_states(void)
+{
+  (void)memset(&ppg_beat_bpm_state, 0, sizeof(ppg_beat_bpm_state));
+  (void)memset(&spo2_beat_state, 0, sizeof(spo2_beat_state));
+  hr_fusion_mismatch_count = 0U;
+}
+
+static uint8_t app_measurement_bpm_from_ibi(uint16_t ibi_ms, uint8_t *bpm_value)
+{
+  uint32_t bpm;
+
+  if ((bpm_value == NULL) || (ibi_ms == 0U))
+  {
+    return 0U;
+  }
+
+  bpm = (60000UL + ((uint32_t)ibi_ms / 2UL)) / (uint32_t)ibi_ms;
+  if ((bpm < APP_PPG_BPM_MIN_RESULT) || (bpm > APP_PPG_BPM_MAX_RESULT))
+  {
+    return 0U;
+  }
+
+  *bpm_value = (uint8_t)bpm;
+  return 1U;
+}
+
+static uint8_t app_measurement_ppg_beat_bpm_recent(uint32_t current_sample)
+{
+  if (ppg_beat_bpm_state.valid == 0U)
+  {
+    return 0U;
+  }
+
+  if (current_sample < ppg_beat_bpm_state.sample)
+  {
+    return 0U;
+  }
+
+  return ((current_sample - ppg_beat_bpm_state.sample) <=
+          APP_PPG_BEAT_BPM_STALE_SAMPLES) ? 1U : 0U;
+}
+
+static uint8_t app_measurement_spo2_beat_recent(uint32_t current_sample)
+{
+  if (spo2_beat_state.count < APP_SPO2_BEAT_RATIO_MIN_COUNT)
+  {
+    return 0U;
+  }
+
+  if (current_sample < spo2_beat_state.sample)
+  {
+    return 0U;
+  }
+
+  return ((current_sample - spo2_beat_state.sample) <=
+          APP_SPO2_BEAT_STALE_SAMPLES) ? 1U : 0U;
+}
+
+static uint8_t app_measurement_spo2_update_from_beat(AppState_t *app,
+                                                     const MAX30102_SpO2_t *state,
+                                                     const MAX30102_PulseInfo_t *pulse,
+                                                     uint8_t *spo2_value)
+{
+  uint32_t peak_sample;
+  uint32_t start_sample;
+  uint32_t oldest_sample;
+  uint32_t sample;
+  uint16_t start_index;
+  uint16_t sample_index;
+  uint32_t red_min = 0xFFFFFFFFUL;
+  uint32_t red_max = 0U;
+  uint32_t ir_min = 0xFFFFFFFFUL;
+  uint32_t ir_max = 0U;
+  uint64_t red_sum = 0ULL;
+  uint64_t ir_sum = 0ULL;
+  uint32_t count = 0U;
+  uint32_t red_dc;
+  uint32_t ir_dc;
+  uint32_t red_ac;
+  uint32_t ir_ac;
+  uint32_t ratio_x1000;
+  uint64_t denominator;
+
+  if ((app == NULL) || (state == NULL) || (pulse == NULL) ||
+      (spo2_value == NULL) || (pulse->beat_valid == 0U))
+  {
+    return 0U;
+  }
+
+  if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2) ||
+      (app->motion_artifact != 0U) ||
+      (app->spo2_balance_status != APP_OXY_BALANCE_OK))
+  {
+    return 0U;
+  }
+
+  if ((state->sample_count == 0U) || (state->total_samples == 0U) ||
+      (pulse->interval_samples == 0U))
+  {
+    return 0U;
+  }
+
+  peak_sample = pulse->latest_peak_sample;
+  if (peak_sample >= state->total_samples)
+  {
+    peak_sample = state->total_samples - 1U;
+  }
+  if (peak_sample < pulse->interval_samples)
+  {
+    return 0U;
+  }
+
+  start_sample = peak_sample - (uint32_t)pulse->interval_samples;
+  oldest_sample = state->total_samples - state->sample_count;
+  if (start_sample < oldest_sample)
+  {
+    return 0U;
+  }
+
+  start_index = (state->sample_count < MAX30102_SPO2_WINDOW_SIZE) ? 0U :
+                                                                  state->write_index;
+  for (sample = start_sample; sample <= peak_sample; sample++)
+  {
+    uint32_t red;
+    uint32_t ir;
+    uint32_t offset = sample - oldest_sample;
+
+    if (offset >= state->sample_count)
+    {
+      return 0U;
+    }
+
+    sample_index = (uint16_t)((start_index + (uint16_t)offset) %
+                              MAX30102_SPO2_WINDOW_SIZE);
+    red = state->red_samples[sample_index];
+    ir = state->ir_samples[sample_index];
+
+    if (red < red_min) { red_min = red; }
+    if (red > red_max) { red_max = red; }
+    if (ir < ir_min) { ir_min = ir; }
+    if (ir > ir_max) { ir_max = ir; }
+    red_sum += red;
+    ir_sum += ir;
+    count++;
+  }
+
+  if (count == 0U)
+  {
+    return 0U;
+  }
+
+  red_dc = (uint32_t)((red_sum + (count / 2U)) / count);
+  ir_dc = (uint32_t)((ir_sum + (count / 2U)) / count);
+  red_ac = red_max - red_min;
+  ir_ac = ir_max - ir_min;
+
+  if ((red_dc == 0U) || (ir_dc == 0U) ||
+      (red_ac < APP_SPO2_BEAT_MIN_AC) ||
+      (ir_ac < APP_SPO2_BEAT_MIN_AC))
+  {
+    return 0U;
+  }
+
+  denominator = (uint64_t)ir_ac * (uint64_t)red_dc;
+  if (denominator == 0ULL)
+  {
+    return 0U;
+  }
+
+  ratio_x1000 = (uint32_t)((((uint64_t)red_ac * (uint64_t)ir_dc * 1000ULL) +
+                            (denominator / 2ULL)) / denominator);
+  if ((ratio_x1000 < APP_SPO2_BEAT_RATIO_MIN_X1000) ||
+      (ratio_x1000 > APP_SPO2_BEAT_RATIO_MAX_X1000))
+  {
+    return 0U;
+  }
+
+  app_measurement_spo2_add_ratio((uint16_t)ratio_x1000, peak_sample);
+  if (spo2_beat_state.count < APP_SPO2_BEAT_RATIO_MIN_COUNT)
+  {
+    return 0U;
+  }
+
+  return app_measurement_spo2_from_ratio(app_measurement_spo2_select_ratio(),
+                                         spo2_value);
+}
+
+static void app_measurement_spo2_add_ratio(uint16_t ratio_x1000,
+                                           uint32_t beat_sample)
+{
+  spo2_beat_state.ratio_x1000[spo2_beat_state.write_index] = ratio_x1000;
+  spo2_beat_state.write_index =
+      (uint8_t)((spo2_beat_state.write_index + 1U) %
+                APP_SPO2_BEAT_RATIO_HISTORY_SIZE);
+  if (spo2_beat_state.count < APP_SPO2_BEAT_RATIO_HISTORY_SIZE)
+  {
+    spo2_beat_state.count++;
+  }
+  spo2_beat_state.sample = beat_sample;
+}
+
+static uint16_t app_measurement_spo2_select_ratio(void)
+{
+  uint16_t sorted[APP_SPO2_BEAT_RATIO_HISTORY_SIZE];
+  uint16_t tmp;
+  uint32_t sum = 0U;
+  uint8_t i;
+  uint8_t j;
+  uint8_t n;
+
+  n = spo2_beat_state.count;
+  if (n == 0U)
+  {
+    return 0U;
+  }
+
+  for (i = 0U; i < n; i++)
+  {
+    sorted[i] = spo2_beat_state.ratio_x1000[i];
+  }
+
+  for (i = 1U; i < n; i++)
+  {
+    tmp = sorted[i];
+    j = i;
+    while ((j > 0U) && (sorted[j - 1U] > tmp))
+    {
+      sorted[j] = sorted[j - 1U];
+      j--;
+    }
+    sorted[j] = tmp;
+  }
+
+  if (n >= 5U)
+  {
+    for (i = 1U; i < (uint8_t)(n - 1U); i++)
+    {
+      sum += sorted[i];
+    }
+    return (uint16_t)((sum + ((uint32_t)(n - 2U) / 2U)) /
+                      (uint32_t)(n - 2U));
+  }
+
+  return sorted[n / 2U];
+}
+
+static uint8_t app_measurement_spo2_from_ratio(uint16_t ratio_x1000,
+                                               uint8_t *spo2_value)
+{
+  int32_t spo2_milli;
+  int64_t ratio_square_term;
+
+  if ((spo2_value == NULL) || (ratio_x1000 == 0U))
+  {
+    return 0U;
+  }
+
+  ratio_square_term = ((int64_t)ratio_x1000 * (int64_t)ratio_x1000 + 500LL) / 1000LL;
+  spo2_milli = (int32_t)(94845LL + ((30354LL * (int64_t)ratio_x1000 + 500LL) / 1000LL) -
+                         ((45060LL * ratio_square_term + 500LL) / 1000LL));
+  if ((spo2_milli < 70000L) || (spo2_milli > 100000L))
+  {
+    return 0U;
+  }
+
+  *spo2_value = (uint8_t)((spo2_milli + 500L) / 1000L);
+  return 1U;
+}
+
+static void app_measurement_update_hr_fusion(AppState_t *app)
+{
+  uint8_t diff;
+
+  if ((app == NULL) || (app->ecg_valid == 0U) || (app->bpm_valid == 0U) ||
+      (app->ecg_hr == 0U) || (app->bpm_value == 0U))
+  {
+    hr_fusion_mismatch_count = 0U;
+    return;
+  }
+
+  diff = (app->ecg_hr > app->bpm_value) ? (uint8_t)(app->ecg_hr - app->bpm_value) :
+                                         (uint8_t)(app->bpm_value - app->ecg_hr);
+  if (diff <= APP_HR_FUSION_DIFF_BPM)
+  {
+    hr_fusion_mismatch_count = 0U;
+    return;
+  }
+
+  if (hr_fusion_mismatch_count < APP_HR_FUSION_CONFIRM_COUNT)
+  {
+    hr_fusion_mismatch_count++;
+  }
+  if (hr_fusion_mismatch_count < APP_HR_FUSION_CONFIRM_COUNT)
+  {
+    return;
+  }
+
+  if ((app->motion_artifact != 0U) ||
+      ((app->signal_quality < APP_HR_FUSION_MIN_SQ) &&
+       (app->ecg_signal_quality >= APP_HR_FUSION_MIN_SQ)))
+  {
+    app->bpm_valid = 0U;
+  }
+  else if ((app->ecg_signal_quality < APP_HR_FUSION_MIN_SQ) &&
+           (app->signal_quality >= APP_HR_FUSION_MIN_SQ))
+  {
+    app->ecg_valid = 0U;
+    app->ptt_valid = 0U;
+  }
+  else if (app->ecg_signal_quality > (uint8_t)(app->signal_quality + 15U))
+  {
+    app->bpm_valid = 0U;
+  }
+  else if (app->signal_quality > (uint8_t)(app->ecg_signal_quality + 15U))
+  {
+    app->ecg_valid = 0U;
+    app->ptt_valid = 0U;
+  }
 }
 
 /*
@@ -835,6 +1248,7 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
     app_rr_reset(app);
     app_ppg_pulse_reset();
     app_ptt_reset(app);
+    app_measurement_reset_beat_states();
 
     app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
 
@@ -1131,6 +1545,7 @@ static void app_reset_measurement_outputs(AppState_t *app)
   app->ir_pi_ac_ema_valid = 0U;
   app->last_beat_sample = 0U;
   app->contact_settle_samples = 0U;
+  app_measurement_reset_beat_states();
   app_oxy_status_reset(app);
   app_reset_advanced_metrics(app);
 
@@ -1156,4 +1571,5 @@ static void app_reset_advanced_metrics(AppState_t *app)
   app_hrv_reset(app);
   app_rr_reset(app);
   app_ppg_pulse_reset();
+  app_measurement_reset_beat_states();
 }
