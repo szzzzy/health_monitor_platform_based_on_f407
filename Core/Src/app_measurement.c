@@ -27,6 +27,7 @@
 #include "app_motion.h"
 #include "app_oxy_status.h"
 #include "app_ppg_pulse.h"
+#include "app_ppg_sqi.h"
 #include "app_ppg_signal.h"
 #include "app_ptt.h"
 #include "app_rr.h"
@@ -135,6 +136,7 @@ static void app_measurement_update_hr_fusion(AppState_t *app);
 void app_measurement_init_state(AppState_t *app)
 {
   app_ppg_signal_init_state(app);
+  app_ppg_sqi_reset(app);
 }
 
 /**
@@ -156,6 +158,7 @@ void app_measurement_reset_runtime(void)
   app_measurement_reset_beat_states();
   app_spo2_filter_reset(NULL);
   app_motion_reset(NULL);
+  app_ppg_sqi_reset(NULL);
   app_ppg_signal_reset_envelope();
   app_reset_advanced_metrics(NULL);
   app_display_reset_waveforms();
@@ -657,6 +660,7 @@ void app_measurement_process(AppState_t *app)
       app->last_beat_sample = 0U;
       bpm_update_decimator = 0U;
       app_measurement_reset_beat_states();
+      app_ppg_sqi_reset(app);
     }
   }
 
@@ -681,11 +685,14 @@ void app_measurement_process(AppState_t *app)
     }
 
     app_motion_update_artifact(app, &signal_metrics, signal_quality);
+    app_ppg_sqi_update_window(app, &signal_metrics, signal_quality);
+    app_ppg_sqi_apply_quality_gate(app);
   }
   else
   {
     app_oxy_status_clear_instant(app);
     app_motion_update_artifact(app, NULL, 0U);
+    app_ppg_sqi_update_window(app, NULL, 0U);
     app_invalidate_advanced_outputs(app);
   }
 
@@ -745,6 +752,10 @@ void app_measurement_process(AppState_t *app)
       {
         uint8_t beat_bpm;
 
+        app_ppg_sqi_note_accepted_beat(app,
+                                       pulse_info.latest_ibi_ms,
+                                       pulse_info.beat_amplitude);
+
         if (app_measurement_bpm_from_ibi(pulse_info.latest_ibi_ms, &beat_bpm) != 0U)
         {
           ppg_beat_bpm_state.valid = 1U;
@@ -772,13 +783,16 @@ void app_measurement_process(AppState_t *app)
   if (beat_spo2_valid == 0U)
   {
     raw_spo2_valid = max30102_calculate_spo2(&spo2_state, &raw_spo2_value);
-    if ((raw_spo2_valid != 0U) && (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2))
+    if ((raw_spo2_valid != 0U) &&
+        ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2) ||
+         (app_ppg_sqi_allows_spo2(app) == 0U)))
     {
       raw_spo2_valid = 0U;
     }
     if (app->contact_settle_samples == 0U)
     {
       if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2) ||
+          (app_ppg_sqi_allows_spo2(app) == 0U) ||
           ((beat_spo2_attempted != 0U) &&
            (app_measurement_spo2_beat_recent(spo2_state.total_samples) != 0U)))
       {
@@ -802,14 +816,16 @@ void app_measurement_process(AppState_t *app)
     bpm_update_decimator = 0U;
     raw_bpm_valid = max30102_calculate_bpm_with_pulse(&spo2_state, &raw_bpm_value, &pulse_info);
 
-    if (app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+    if ((app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM) &&
+        (app_ppg_sqi_allows_hr(app) != 0U))
     {
       acorr_bpm_valid = max30102_autocorr_bpm(&spo2_state, &acorr_bpm);
     }
 
     if (app_measurement_ppg_beat_bpm_recent(spo2_state.total_samples) != 0U)
     {
-      if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+      if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM) ||
+          (app_ppg_sqi_allows_hr(app) == 0U))
       {
         (void)app_bpm_filter_update(app, 0U, 0U);
         app->rr_valid = 0U;
@@ -833,14 +849,17 @@ void app_measurement_process(AppState_t *app)
       raw_bpm_value = acorr_bpm;
     }
 
-    if ((raw_bpm_valid != 0U) && (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM))
+    if ((raw_bpm_valid != 0U) &&
+        ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM) ||
+         (app_ppg_sqi_allows_hr(app) == 0U)))
     {
       raw_bpm_valid = 0U;
       pulse_info.beat_valid = 0U;
     }
 
     (void)pulse_info.beat_valid;
-    if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+    if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM) ||
+        (app_ppg_sqi_allows_hr(app) == 0U))
     {
       app->rr_valid = 0U;
     }
@@ -971,6 +990,7 @@ static uint8_t app_measurement_spo2_update_from_beat(AppState_t *app,
   }
 
   if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2) ||
+      (app_ppg_sqi_allows_spo2(app) == 0U) ||
       (app->motion_artifact != 0U) ||
       (app->spo2_balance_status != APP_OXY_BALANCE_OK))
   {
@@ -1247,6 +1267,7 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
     app_hrv_reset(app);
     app_rr_reset(app);
     app_ppg_pulse_reset();
+    app_ppg_sqi_reset(app);
     app_ptt_reset(app);
     app_measurement_reset_beat_states();
 
@@ -1547,6 +1568,7 @@ static void app_reset_measurement_outputs(AppState_t *app)
   app->contact_settle_samples = 0U;
   app_measurement_reset_beat_states();
   app_oxy_status_reset(app);
+  app_ppg_sqi_reset(app);
   app_reset_advanced_metrics(app);
 
   /* PTT 依赖 PPG 脉搏波峰与 ECG R 峰的时间差，手指状态切换后旧历史无效 */

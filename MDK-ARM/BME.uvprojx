@@ -465,6 +465,11 @@
               <FilePath>../Core/Src/app_ppg_pulse.c</FilePath>
             </File>
             <File>
+              <FileName>app_ppg_sqi.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/app_ppg_sqi.c</FilePath>
+            </File>
+            <File>
               <FileName>app_hrv.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/app_hrv.c</FilePath>

@@ -10,7 +10,7 @@
 #include "usart.h"
 
 /* 串口上报与接收缓冲长度，足够覆盖当前文本协议。 */
-#define JSON_PAYLOAD_SIZE     1280U
+#define JSON_PAYLOAD_SIZE     1536U
 #define UART_RX_LINE_SIZE     64U
 #define STM32_UART_TIMEOUT_MS 100U
 
@@ -194,7 +194,11 @@ void app_protocol_send_sensor_report(AppState_t *app)
  *   wdt_task_phase,max_task_stack_hwm,ui_task_stack_hwm,sd_task_stack_hwm,
  *   wdt_task_stack_hwm,max_task_heartbeat,ui_task_heartbeat,
  *   ecg_signal_quality,ecg_invalid_reason,ecg_raw_span,ecg_filtered_span,
- *   ecg_noise_level,ecg_qrs_threshold,ecg_peak_snr_x100,ecg_dma_available_high_watermark
+ *   ecg_noise_level,ecg_qrs_threshold,ecg_peak_snr_x100,ecg_dma_available_high_watermark,
+ *   ppg_sqi_score,ppg_sqi_flags,ppg_sqi_low_perfusion_count,ppg_sqi_motion_count,
+ *   ppg_sqi_balance_count,ppg_sqi_transition_count,ppg_sqi_ibi_reject_count,
+ *   ppg_sqi_amp_reject_count,ppg_sqi_suppressed_count,
+ *   ptt_reject_ecg_count,ptt_reject_ppg_count,ptt_reject_range_count,ptt_reject_jump_count
  */
 
 /* ---- 小型 CSV 构建器：避免超长 snprintf，逐字段追加 ---- */
@@ -406,8 +410,21 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_qrs_threshold);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_peak_snr_x100);
 
-  /* 最后一个字段，不加逗号 */
-  app_csv_appendf(&b, "%u", (unsigned int)app->ecg_dma_available_high_watermark);
+  /* Append-only tail diagnostics start here. */
+  app_csv_appendf(&b, "%u,", (unsigned int)app->ecg_dma_available_high_watermark);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_sqi_score);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_sqi_flags);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_sqi_low_perfusion_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_sqi_motion_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_sqi_balance_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_sqi_transition_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_sqi_ibi_reject_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_sqi_amp_reject_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_sqi_suppressed_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ptt_reject_ecg_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ptt_reject_ppg_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ptt_reject_range_count);
+  app_csv_appendf(&b, "%lu",  (unsigned long)app->ptt_reject_jump_count);
 
   return (uint16_t)b.len;
 }

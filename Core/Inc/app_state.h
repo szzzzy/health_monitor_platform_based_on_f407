@@ -139,6 +139,16 @@ typedef struct
   uint8_t motion_artifact;
   /* 原始运动评分 0–100，基于 AC RMS 尖峰 + RED/IR 平衡 + SQ 骤降三条信号合成。 */
   uint8_t motion_score;
+  /* Literature-guided PPG SQI side score and rejection counters. */
+  uint8_t ppg_sqi_score;
+  uint8_t ppg_sqi_flags;
+  uint32_t ppg_sqi_low_perfusion_count;
+  uint32_t ppg_sqi_motion_count;
+  uint32_t ppg_sqi_balance_count;
+  uint32_t ppg_sqi_transition_count;
+  uint32_t ppg_sqi_ibi_reject_count;
+  uint32_t ppg_sqi_amp_reject_count;
+  uint32_t ppg_sqi_suppressed_count;
   /* PI：存储 (AC/DC) × 1000，即标准灌注指数(%) × 10。例如 PI=12.3% → 值 123。
    * OXY 页显示为 PI:12.3（除以 10 取整+余数）。uint16 承载 >25.5% 的 PI 值。
    * signal_ir_pi_x1000 由基于搏动的 EMA 计算（ir_pi_ac_ema / ir_dc），
@@ -271,6 +281,10 @@ typedef struct
   /* PTT 状态 */
   uint8_t  ptt_valid;
   uint16_t ptt_ms;
+  uint32_t ptt_reject_ecg_count;
+  uint32_t ptt_reject_ppg_count;
+  uint32_t ptt_reject_range_count;
+  uint32_t ptt_reject_jump_count;
   /* ---- 诊断阶段码：每个任务在关键路径前写入，崩溃时从 BKP 寄存器恢复 ---- */
   uint8_t  max_task_phase;       /* MAXtask 当前阶段 (0=空闲/等待通知) */
   uint8_t  ui_task_phase;        /* UiTask 当前阶段 */

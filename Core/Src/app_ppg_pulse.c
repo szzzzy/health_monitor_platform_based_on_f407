@@ -27,6 +27,7 @@
 
 #include "app_display.h"
 #include "app_hrv.h"
+#include "app_ppg_sqi.h"
 #include "app_rr.h"
 
 /* 动态阈值参数 */
@@ -73,7 +74,7 @@ static struct
 static uint32_t app_ppg_abs_diff_u32(uint32_t lhs, uint32_t rhs);
 static uint16_t app_ppg_pulse_median_ibi(void);
 static void app_ppg_pulse_add_ibi_history(uint16_t ibi_ms);
-static uint8_t app_ppg_pulse_quality_ok(const AppState_t *app,
+static uint8_t app_ppg_pulse_quality_ok(AppState_t *app,
                                         uint16_t ibi_ms,
                                         uint32_t beat_amplitude,
                                         uint32_t noise_floor);
@@ -413,7 +414,7 @@ static void app_ppg_pulse_add_ibi_history(uint16_t ibi_ms)
   }
 }
 
-static uint8_t app_ppg_pulse_quality_ok(const AppState_t *app,
+static uint8_t app_ppg_pulse_quality_ok(AppState_t *app,
                                         uint16_t ibi_ms,
                                         uint32_t beat_amplitude,
                                         uint32_t noise_floor)
@@ -433,11 +434,13 @@ static uint8_t app_ppg_pulse_quality_ok(const AppState_t *app,
 
   if ((ibi_ms < APP_HRV_IBI_MIN_MS) || (ibi_ms > APP_HRV_IBI_MAX_MS))
   {
+    app_ppg_sqi_note_ibi_reject(app);
     return 0U;
   }
 
   if (beat_amplitude < (noise_floor * APP_BEAT_MIN_NOISE_MULT))
   {
+    app_ppg_sqi_note_amp_reject(app);
     return 0U;
   }
 
@@ -446,12 +449,14 @@ static uint8_t app_ppg_pulse_quality_ok(const AppState_t *app,
     if ((beat_amplitude * 100U) <
         (beat.beat_amp_ema * APP_BEAT_AMP_MIN_PERCENT))
     {
+      app_ppg_sqi_note_amp_reject(app);
       return 0U;
     }
 
     if ((beat_amplitude * 100U) >
         (beat.beat_amp_ema * APP_BEAT_AMP_MAX_PERCENT))
     {
+      app_ppg_sqi_note_amp_reject(app);
       return 0U;
     }
   }
@@ -463,6 +468,7 @@ static uint8_t app_ppg_pulse_quality_ok(const AppState_t *app,
         (app_ppg_abs_diff_u32(ibi_ms, median_ibi) >
          (((uint32_t)median_ibi * APP_BEAT_IBI_JUMP_PERCENT) / 100U)))
     {
+      app_ppg_sqi_note_ibi_reject(app);
       return 0U;
     }
   }
