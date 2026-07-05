@@ -9,7 +9,7 @@
 #include "eeprom_cmd.h"
 #include "usart.h"
 
-/* 串口上报与接收缓冲长度，足够覆盖当前文本协议。 */
+/* 串口上报与接收缓冲长度；1536 覆盖追加的 SQI/PTT 尾部诊断字段。 */
 #define JSON_PAYLOAD_SIZE     1536U
 #define UART_RX_LINE_SIZE     64U
 #define STM32_UART_TIMEOUT_MS 100U
@@ -410,7 +410,8 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_qrs_threshold);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_peak_snr_x100);
 
-  /* Append-only tail diagnostics start here. */
+  /* 追加式尾部诊断字段：保持前序字段顺序，旧上位机仍可按前缀解析。
+   * Append-only diagnostics: keep existing field order stable for old parsers. */
   app_csv_appendf(&b, "%u,", (unsigned int)app->ecg_dma_available_high_watermark);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_sqi_score);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_sqi_flags);

@@ -139,7 +139,8 @@ typedef struct
   uint8_t motion_artifact;
   /* 原始运动评分 0–100，基于 AC RMS 尖峰 + RED/IR 平衡 + SQ 骤降三条信号合成。 */
   uint8_t motion_score;
-  /* Literature-guided PPG SQI side score and rejection counters. */
+  /* 文献驱动 PPG SQI 侧路评分/标志/拒绝计数，用于 valid 门控和日志验证。
+   * Literature-guided PPG SQI side score, flags, and rejection counters. */
   uint8_t ppg_sqi_score;
   uint8_t ppg_sqi_flags;
   uint32_t ppg_sqi_low_perfusion_count;
@@ -281,6 +282,7 @@ typedef struct
   /* PTT 状态 */
   uint8_t  ptt_valid;
   uint16_t ptt_ms;
+  /* PTT 拒绝原因计数：区分 ECG、PPG、范围和突跳门控，便于实测回放定位。 */
   uint32_t ptt_reject_ecg_count;
   uint32_t ptt_reject_ppg_count;
   uint32_t ptt_reject_range_count;

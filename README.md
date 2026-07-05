@@ -1,6 +1,13 @@
-# BME STM32F407 Physiological Signal Firmware
+# BME STM32F407 生理信号固件 / Physiological Signal Firmware
 
-This repository contains the STM32F407ZGTx firmware for a physiological signal acquisition board built around:
+本仓库是基于 STM32F407ZGTx 的生理信号采集固件，面向工程验证、信号采集和趋势观察。
+它不是医疗诊断设备；PTT 仅作为 ECG 到 PPG 的时间差指标，不等同于血压估计。
+
+This repository contains STM32F407ZGTx firmware for physiological signal acquisition,
+engineering validation, and trend observation. It is not a medical diagnostic device.
+PTT is treated only as an ECG-to-PPG timing metric, not as a blood-pressure estimate.
+
+主要外设 / Main peripherals:
 
 - MAX30102 PPG
 - AD8232 ECG
@@ -11,20 +18,21 @@ This repository contains the STM32F407ZGTx firmware for a physiological signal a
 - SD/FatFs binary logging
 - FreeRTOS task scheduling
 
-The firmware is an engineering prototype for signal acquisition and trend observation. It is not a medical diagnostic device. PTT is treated only as an ECG-to-PPG timing metric and is not a blood-pressure estimate.
+## 当前架构 / Current Architecture
 
-## Current Architecture
+固件使用 FreeRTOS 任务模型，实时采样、显示、串口和 SD 写入分离，避免低优先级 I/O 阻塞采样路径。
 
-The firmware uses a FreeRTOS task model rather than a single blocking main loop.
+The firmware uses a FreeRTOS task model. Real-time sampling, display, UART, and SD
+writes are separated so low-priority I/O does not block the sampling path.
 
-| Task | Priority | Role |
-| --- | --- | --- |
-| `MAXtask` | High | 100 Hz MAX30102 service tick, FIFO drain, ECG DMA sample consumption, sensor recovery |
-| `Uitask` | Normal | UART command polling, buttons, OLED refresh, periodic reports |
-| `SDtask` | Low | Background binary log drain during safe windows |
-| `watchdogtask` | Above normal | IWDG refresh and liveness snapshots |
+| Task | Priority | 中文职责 | English role |
+| --- | --- | --- | --- |
+| `MAXtask` | High | 100 Hz MAX30102 节拍、FIFO 排空、ECG DMA 消费、传感器恢复 | 100 Hz MAX30102 tick, FIFO drain, ECG DMA consumer, sensor recovery |
+| `Uitask` | Normal | UART 命令、按键、OLED 刷新、周期上报 | UART commands, buttons, OLED refresh, periodic reports |
+| `SDtask` | Low | 在安全窗口后台写入二进制日志 | Background binary log writes during safe windows |
+| `watchdogtask` | Above normal | IWDG 喂狗和任务存活快照 | IWDG refresh and liveness snapshots |
 
-Main signal paths:
+主信号路径 / Main signal paths:
 
 ```text
 MAX30102 FIFO
@@ -42,132 +50,134 @@ AD8232 analog ECG
   -> AppState
 ```
 
-## Literature-Guided Algorithm Update
+## 文献驱动算法更新 / Literature-Guided Algorithm Update
 
-This branch implements the first firmware-side algorithm improvement derived from the local literature and prompt pack in `docs/literature_algorithm_improvement_prompts.md`.
+本分支根据本地文献和 `docs/literature_algorithm_improvement_prompts.md` 的提示词，
+在不替换现有 PPG/ECG 主检测器的前提下，增加了保守的 PPG SQI 门控和 PTT 置信门控。
 
-Evidence used:
+This branch uses the local literature and `docs/literature_algorithm_improvement_prompts.md`
+to add a conservative PPG SQI gate and PTT confidence gate without replacing the existing
+PPG or ECG production detectors.
 
-- Pan and Tompkins 1985, `A_Real-Time_QRS_Detection_Algorithm.pdf`: ECG QRS processing pattern using filtering, nonlinear energy, moving-window integration, adaptive thresholds, refractory logic, and search-back.
-- Christov 2004, `1475-925X-3-28.pdf`: adaptive ECG threshold concepts using slope, noise, and beat-expectation terms.
-- Elgendi 2013, `file.pdf`: PPG systolic peak detection using two moving averages and offset thresholding.
-- Park et al. 2022, `fphys-12-808451.pdf`: PPG engineering checklist for motion artifact, baseline wander, hypoperfusion, preprocessing, peak detection, and SQI.
-- Mohagheghian et al. 2022, `Optimized_Signal_Quality_Assessment_for_Photoplethysmogram_Signals_Using_Feature_Selection.pdf`: lightweight PPG SQA features such as IBI variability, skewness/kurtosis, and entropy/template features.
-- Rahman et al. 2022, `rsif.2022.0012.pdf`: caution against universal fixed SQI thresholds; prefer adaptive local baselines.
+参考依据 / Evidence used:
 
-The implementation keeps the production PPG and ECG detectors. It adds a conservative PPG SQI gate and PTT confidence gate around the existing outputs.
+- Pan and Tompkins 1985, `A_Real-Time_QRS_Detection_Algorithm.pdf`: ECG QRS filtering, nonlinear energy, moving-window integration, adaptive thresholding, refractory logic, and search-back.
+- Christov 2004, `1475-925X-3-28.pdf`: adaptive ECG thresholds based on slope, noise, and beat expectation.
+- Elgendi 2013, `file.pdf`: PPG systolic peak detection with moving averages and offset thresholding.
+- Park et al. 2022, `fphys-12-808451.pdf`: PPG artifact checklist covering motion, baseline wander, hypoperfusion, preprocessing, peak detection, and SQI.
+- Mohagheghian et al. 2022, `Optimized_Signal_Quality_Assessment_for_Photoplethysmogram_Signals_Using_Feature_Selection.pdf`: lightweight PPG SQA features such as IBI variability and morphology/statistical features.
+- Rahman et al. 2022, `rsif.2022.0012.pdf`: avoid universal fixed SQI thresholds where local adaptive baselines are available.
 
-## PPG SQI Gate
+## PPG SQI 门控 / PPG SQI Gate
 
-New module:
+新增模块 / New module:
 
 - `Core/Inc/app_ppg_sqi.h`
 - `Core/Src/app_ppg_sqi.c`
 
-Compile-time switches:
+编译开关 / Compile-time switches:
 
 - `APP_PPG_SQI_EXPERIMENTAL = 1U`
 - `APP_PPG_SQI_GATE_OUTPUTS = 1U`
 
-The SQI module maintains adaptive local baselines for IR/RED AC RMS and PI. Baselines update only during stable, non-motion, non-transition windows. Bad windows can lower `app->signal_quality`, but they never raise it.
+SQI 模块维护 IR/RED AC RMS 和 PI 的局部自适应基线。基线只在无运动、无接触过渡、
+无明显质量标志的稳定窗口中更新。坏窗口可以降低 `app->signal_quality`，但不会提高它。
 
-SQI flags:
+The SQI module maintains adaptive local baselines for IR/RED AC RMS and PI. Baselines update
+only during stable, non-motion, non-transition windows. Bad windows can lower
+`app->signal_quality`, but they never raise it.
 
-| Flag | Bit | Meaning |
-| --- | ---: | --- |
-| `APP_PPG_SQI_FLAG_LOW_PERFUSION` | `0x01` | IR AC/PI is too low versus local baseline or absolute floor |
-| `APP_PPG_SQI_FLAG_MOTION` | `0x02` | Existing PPG motion detector is active |
-| `APP_PPG_SQI_FLAG_BALANCE` | `0x04` | RED/IR ratio or balance is unreliable |
-| `APP_PPG_SQI_FLAG_TRANSITION` | `0x08` | Finger contact is still settling |
-| `APP_PPG_SQI_FLAG_BEAT_UNSTABLE` | `0x10` | IBI or beat amplitude jump was detected |
+| Flag | Bit | 中文含义 | English meaning |
+| --- | ---: | --- | --- |
+| `APP_PPG_SQI_FLAG_LOW_PERFUSION` | `0x01` | IR AC/PI 低于局部基线或绝对下限 | IR AC/PI is too low versus local baseline or absolute floor |
+| `APP_PPG_SQI_FLAG_MOTION` | `0x02` | 现有运动检测器处于激活状态 | Existing PPG motion detector is active |
+| `APP_PPG_SQI_FLAG_BALANCE` | `0x04` | RED/IR 比值或平衡状态不可靠 | RED/IR ratio or balance is unreliable |
+| `APP_PPG_SQI_FLAG_TRANSITION` | `0x08` | 手指接触仍在稳定期 | Finger contact is still settling |
+| `APP_PPG_SQI_FLAG_BEAT_UNSTABLE` | `0x10` | IBI 或 beat 幅度出现突跳 | IBI or beat amplitude jump was detected |
 
-Outputs affected:
+影响的输出 / Outputs affected:
+
+- HR/BPM：SQI 过低、运动或接触稳定期时抑制输出。
+- SpO2：低灌注、RED/IR 平衡异常、运动、接触过渡或 beat 不稳定时抑制输出。
+- PTT：PPG 峰时刻不可信时抑制匹配。
 
 - HR/BPM: suppressed when the SQI score is too low or contact/motion gates are active.
-- SpO2: suppressed when low perfusion, RED/IR balance, motion, contact transition, or beat instability is present.
+- SpO2: suppressed for low perfusion, RED/IR imbalance, motion, contact transition, or beat instability.
 - PTT: suppressed when PPG timing is not trustworthy.
 
-The gate uses fixed thresholds only for physiological or safety floors. Signal-quality decisions are primarily relative to local baselines.
+## PPG 脉搏检测 / PPG Pulse Detector
 
-## PPG Pulse Detector
+现有流式 PPG 脉搏状态机仍是主检测器，保留自适应迟滞、IBI 生理范围、IBI 中位数突跳检查、
+幅度跌落/尖峰检查、运动和信号质量检查。新增 SQI 只记录被拒绝候选 beat 的原因，并把
+IBI/幅度拒绝计数暴露到日志。
 
-The existing streaming PPG pulse detector remains the production detector:
+The existing streaming PPG pulse state machine remains the production detector. It keeps adaptive
+hysteresis, physiological IBI range checks, median IBI jump checks, amplitude drop/spike checks,
+and motion/quality checks. The new SQI path records why candidate beats were rejected and exposes
+IBI/amplitude rejection counters in logs.
 
-- adaptive hysteresis from beat amplitude EMA
-- physiological IBI range
-- IBI median jump check
-- beat amplitude drop/spike check
-- motion and signal-quality checks
+## ECG QRS 链路 / ECG QRS Path
 
-The detector now reports rejected IBI and amplitude candidates into the SQI counters. It does not allocate memory and remains O(1) per sample.
+ECG 链路保持原有实现：250 Hz ADC DMA、去直流、平滑、可选 50 Hz 陷波和 10-20 Hz 带通、
+导数能量、120 ms 移动窗积分、自适应阈值、动态不应期、T 波保护、search-back，以及导联脱落、
+ADC 饱和、DMA 溢出、平线和无 R 峰质量状态。
 
-## ECG QRS Path
+The ECG path is unchanged: 250 Hz ADC DMA, DC removal, smoothing, optional 50 Hz notch and
+10-20 Hz bandpass, derivative energy, 120 ms moving-window integration, adaptive thresholds,
+dynamic refractory handling, T-wave guard, search-back, and quality states for lead-off,
+ADC saturation, DMA overflow, flatline, and missing R peaks.
 
-The ECG path already follows the literature-supported pattern:
+## PTT 置信门控 / PTT Confidence Gate
 
-- 250 Hz ADC DMA samples
-- DC removal
-- smoothing
-- optional 50 Hz notch and 10-20 Hz bandpass
-- derivative energy
-- 120 ms moving-window integration
-- adaptive signal/noise threshold
-- dynamic refractory
-- T-wave guard
-- search-back
-- lead-off, ADC saturation, DMA overflow, flatline, and no-R-peak quality states
+PTT 只有在 ECG 和 PPG 两侧时序锚点都可信时才输出。门控条件包括 ECG valid、无导联脱落、
+ECG SQI 达标、无近期 ADC 饱和/DMA 溢出原因、PPG SQI 允许 PTT、无 PPG 运动/接触/低灌注门控、
+存在已接受 IBI、PPG 峰时刻未陈旧、PTT 位于 `80-350 ms` 可信范围，以及相对短历史中位数无过大突跳。
 
-This branch does not replace the ECG QRS detector. It keeps the current detector and uses ECG quality as an input to PTT confidence.
+PTT is accepted only when both timing anchors are trustworthy: ECG valid, no ECG lead-off,
+ECG SQI above threshold, no recent ADC saturation or DMA overflow reason, PPG SQI permits PTT,
+no PPG motion/contact/low-perfusion gate, accepted IBI is present, the PPG peak is not stale,
+PTT is in the trusted `80-350 ms` range, and the value does not jump excessively from the recent median.
 
-## PTT Confidence Gate
+拒绝计数 / Rejection counters:
 
-PTT is accepted only when both timing anchors are trustworthy:
+- `ptt_reject_ecg_count`
+- `ptt_reject_ppg_count`
+- `ptt_reject_range_count`
+- `ptt_reject_jump_count`
 
-- ECG valid
-- no ECG lead-off
-- ECG SQI above threshold
-- no recent ECG ADC saturation or DMA overflow reason
-- PPG SQI permits PTT
-- PPG motion/contact/low-perfusion gates are clear
-- accepted IBI is present
-- estimated PPG peak age is not stale
-- PTT is in the trusted range `80-350 ms`
-- PTT jump from recent median is not excessive
+## USART2 测量帧 / USART2 Measurement Frame
 
-Rejected PTT pairs are counted by reason:
+USART2 使用追加式 CSV 风格 `M` 帧。旧字段顺序保持不变，本次只在
+`ecg_dma_available_high_watermark` 之后追加诊断字段，旧上位机可继续按稳定前缀解析。
 
-- ECG gate
-- PPG gate
-- range gate
-- jump gate
+USART2 sends append-only CSV-style `M` frames. Existing field order is unchanged. This branch
+only appends diagnostics after `ecg_dma_available_high_watermark`, so older host tools can keep
+parsing the stable prefix.
 
-## USART2 Measurement Frame
+| Index | Field | 中文说明 / Description |
+| ---: | --- | --- |
+| 110 | `ppg_sqi_score` | SQI 后 PPG 质量分 / SQI-adjusted PPG quality score |
+| 111 | `ppg_sqi_flags` | SQI 标志位 / SQI flags |
+| 112 | `ppg_sqi_low_perfusion_count` | 低灌注计数 / low-perfusion count |
+| 113 | `ppg_sqi_motion_count` | 运动门控计数 / motion gate count |
+| 114 | `ppg_sqi_balance_count` | RED/IR 平衡异常计数 / RED/IR balance count |
+| 115 | `ppg_sqi_transition_count` | 接触过渡计数 / contact-transition count |
+| 116 | `ppg_sqi_ibi_reject_count` | IBI 拒绝计数 / IBI reject count |
+| 117 | `ppg_sqi_amp_reject_count` | beat 幅度拒绝计数 / amplitude reject count |
+| 118 | `ppg_sqi_suppressed_count` | SQI 降分计数 / SQI suppression count |
+| 119 | `ptt_reject_ecg_count` | ECG 侧 PTT 拒绝计数 / ECG-side PTT rejects |
+| 120 | `ptt_reject_ppg_count` | PPG 侧 PTT 拒绝计数 / PPG-side PTT rejects |
+| 121 | `ptt_reject_range_count` | PTT 范围拒绝计数 / PTT range rejects |
+| 122 | `ptt_reject_jump_count` | PTT 突跳拒绝计数 / PTT jump rejects |
 
-USART2 sends append-only CSV-style `M` frames. Existing fields keep their original order. This branch appends diagnostics after `ecg_dma_available_high_watermark`.
+## SD 二进制日志 / SD Binary Log
 
-New tail fields:
+SD 日志是二进制格式，不是 CSV。文件以 32 字节 `BMLG` 头开始，后接重复的 16 字节原始样本。
+实时路径只把记录压入 RAM ring，物理写卡由 `SDtask` 延后执行。
 
-| Index | Field |
-| ---: | --- |
-| 110 | `ppg_sqi_score` |
-| 111 | `ppg_sqi_flags` |
-| 112 | `ppg_sqi_low_perfusion_count` |
-| 113 | `ppg_sqi_motion_count` |
-| 114 | `ppg_sqi_balance_count` |
-| 115 | `ppg_sqi_transition_count` |
-| 116 | `ppg_sqi_ibi_reject_count` |
-| 117 | `ppg_sqi_amp_reject_count` |
-| 118 | `ppg_sqi_suppressed_count` |
-| 119 | `ptt_reject_ecg_count` |
-| 120 | `ptt_reject_ppg_count` |
-| 121 | `ptt_reject_range_count` |
-| 122 | `ptt_reject_jump_count` |
-
-Older host tools can continue parsing the stable prefix. New tools should use the appended counters to explain invalid HR, SpO2, and PTT states.
-
-## SD Binary Log
-
-SD logging is binary, not CSV. A file starts with a 32-byte `BMLG` header, followed by repeated 16-byte raw samples.
+SD logging is binary, not CSV. A file starts with a 32-byte `BMLG` header followed by repeated
+16-byte raw samples. The real-time path only pushes records into a RAM ring; physical writes are
+performed later by `SDtask`.
 
 ```c
 typedef struct __attribute__((packed)) {
@@ -188,9 +198,7 @@ typedef struct __attribute__((packed)) {
 } DataLogRawSample_t;
 ```
 
-Sampling never waits for physical SD I/O. The real-time path only pushes records into a RAM ring; `SDtask` performs physical writes later.
-
-## Build
+## 构建 / Build
 
 Keil project:
 
@@ -198,33 +206,29 @@ Keil project:
 MDK-ARM/BME.uvprojx
 ```
 
-CLI rebuild on this machine:
+本机 CLI 重新构建 / CLI rebuild on this machine:
 
 ```powershell
 cd D:\CUBEMX\template\BME\MDK-ARM
 & 'D:\Keil_v5\UV4\UV4.exe' -b BME.uvprojx -t BME -o build_ecg.log
 ```
 
-Expected clean result:
+期望结果 / Expected result:
 
 ```text
 0 Error(s), 0 Warning(s)
 ```
 
-## Validation Plan
+## 验证计划 / Validation Plan
 
-Before replacing any production detector, validate against project SD logs:
+替换任何主检测器之前，应先用项目 SD 日志回放验证。建议覆盖安静佩戴、弱灌注、运动、
+手指放上/拿开、IBI 不规则片段、ECG 导联脱落、ADC 饱和/平线、FIFO 积压或样本陈旧等场景。
 
-- quiet finger
-- weak perfusion
-- motion
-- attach/remove transitions
-- irregular IBI segments
-- ECG lead-off
-- ADC saturation or flatline
-- FIFO backlog or stale samples
+Before replacing any production detector, validate with project SD log replay. Cover quiet finger,
+weak perfusion, motion, attach/remove transitions, irregular IBI segments, ECG lead-off, ADC
+saturation or flatline, FIFO backlog, and stale samples.
 
-Recommended metrics:
+推荐指标 / Recommended metrics:
 
 - PPG valid-rate
 - SpO2 valid-rate
@@ -235,13 +239,11 @@ Recommended metrics:
 - PTT rejection reason counts
 - ECG/PPG HR agreement
 
-Keep the current production detector if results are mixed.
+## 集成规则 / Integration Rules
 
-## Integration Rules
-
-- Do not add dynamic allocation to real-time paths.
-- Do not add OLED, UART printf, SD, EEPROM writes, or long HAL delays to MAX/ECG real-time paths.
-- Keep per-sample updates O(1) where practical.
-- Reset adaptive signal state on finger loss, FIFO overflow, stale sensor recovery, or measurement restart.
-- Keep USART `M` frame changes append-only whenever possible.
-- Keep `TIM6` at 100 Hz and ECG sampling at 250 Hz unless all algorithms and documentation are rescaled together.
+- 实时路径不使用动态分配。 / Do not add dynamic allocation to real-time paths.
+- MAX/ECG 实时路径不加入 OLED、UART printf、SD、EEPROM 写入或长 HAL delay。 / Do not add OLED, UART printf, SD, EEPROM writes, or long HAL delays to MAX/ECG real-time paths.
+- 每样本更新尽量保持 O(1)。 / Keep per-sample updates O(1) where practical.
+- 手指离开、FIFO 溢出、传感器恢复或测量重启时重置自适应信号状态。 / Reset adaptive signal state on finger loss, FIFO overflow, sensor recovery, or measurement restart.
+- USART `M` 帧尽量只追加字段。 / Keep USART `M` frame changes append-only whenever possible.
+- 除非同步重标定算法和文档，不要改变 `TIM6` 100 Hz 和 ECG 250 Hz 采样配置。 / Keep `TIM6` at 100 Hz and ECG sampling at 250 Hz unless algorithms and documentation are rescaled together.

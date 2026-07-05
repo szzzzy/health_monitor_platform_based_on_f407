@@ -685,6 +685,7 @@ void app_measurement_process(AppState_t *app)
     }
 
     app_motion_update_artifact(app, &signal_metrics, signal_quality);
+    /* SQI 依赖运动标志和 PPG 窗口指标；先算 side score，再只向下钳制 signal_quality。 */
     app_ppg_sqi_update_window(app, &signal_metrics, signal_quality);
     app_ppg_sqi_apply_quality_gate(app);
   }
@@ -692,6 +693,7 @@ void app_measurement_process(AppState_t *app)
   {
     app_oxy_status_clear_instant(app);
     app_motion_update_artifact(app, NULL, 0U);
+    /* 无有效窗口时清除 SQI 输出，避免旧窗口的 flags 延续到 PLACE FINGER/等待阶段。 */
     app_ppg_sqi_update_window(app, NULL, 0U);
     app_invalidate_advanced_outputs(app);
   }
@@ -752,6 +754,7 @@ void app_measurement_process(AppState_t *app)
       {
         uint8_t beat_bpm;
 
+        /* 已被 PPG 状态机接受的 beat 进入 SQI 短历史，用于后续 IBI/幅度稳定性门控。 */
         app_ppg_sqi_note_accepted_beat(app,
                                        pulse_info.latest_ibi_ms,
                                        pulse_info.beat_amplitude);
@@ -783,6 +786,7 @@ void app_measurement_process(AppState_t *app)
   if (beat_spo2_valid == 0U)
   {
     raw_spo2_valid = max30102_calculate_spo2(&spo2_state, &raw_spo2_value);
+    /* SpO2 对低灌注、运动和平衡异常敏感，SQI 不通过时丢弃本窗口输出。 */
     if ((raw_spo2_valid != 0U) &&
         ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2) ||
          (app_ppg_sqi_allows_spo2(app) == 0U)))
@@ -816,6 +820,7 @@ void app_measurement_process(AppState_t *app)
     bpm_update_decimator = 0U;
     raw_bpm_valid = max30102_calculate_bpm_with_pulse(&spo2_state, &raw_bpm_value, &pulse_info);
 
+    /* HR/BPM 门控比 SpO2 宽松，但仍屏蔸运动期和接触稳定期的误检 beat。 */
     if ((app->signal_quality >= APP_SIGNAL_QUALITY_MIN_FOR_BPM) &&
         (app_ppg_sqi_allows_hr(app) != 0U))
     {

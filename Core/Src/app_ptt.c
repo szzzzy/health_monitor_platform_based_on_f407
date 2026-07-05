@@ -14,14 +14,17 @@
 #include "app_ppg_sqi.h"
 #include <string.h>
 
+/* PTT 生理边界和可信显示范围；trusted range 更窄，用于过滤明显错误匹配。 */
 #define APP_PTT_MIN_MS                60U
 #define APP_PTT_MAX_MS                600U
 #define APP_PTT_TRUSTED_MIN_MS        80U
 #define APP_PTT_TRUSTED_MAX_MS        350U
+/* ECG/PPG 两侧都需要足够质量，PTT 才有意义。 */
 #define APP_PTT_MIN_ECG_SQ            35U
 #define APP_PTT_MIN_PPG_SQ            35U
 #define APP_PTT_ECG_PEAK_HISTORY_SIZE 4U
 #define APP_PTT_VALUE_HISTORY_SIZE    5U
+/* PTT 突跳门控：绝对和相对阈值取较宽者，避免单次错配污染输出。 */
 #define APP_PTT_MAX_JUMP_MS           80U
 #define APP_PTT_MAX_JUMP_PERCENT      35U
 
@@ -39,6 +42,7 @@ static struct
   uint8_t write_index;
 } ptt_value_state;
 
+/* PTT 输出短历史：同时用于中位数平滑和突跳门控参考。 */
 /* PPG 样本序号 → 绝对 ms 时间戳 */
 static uint32_t app_ptt_ppg_sample_to_ms(const AppState_t *app,
                                          uint32_t peak_sample,
@@ -49,6 +53,7 @@ static uint8_t app_ptt_find_ref_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms
 static void app_ptt_add_value(uint16_t ptt_ms);
 static uint16_t app_ptt_median_value(void);
 static uint8_t app_ptt_jump_ok(uint16_t ptt_ms);
+/* 拒绝 helper 统一清 ptt_valid 并递增原因计数，便于上位机统计失败来源。 */
 static void app_ptt_reject_ecg(AppState_t *app);
 static void app_ptt_reject_ppg(AppState_t *app);
 static void app_ptt_reject_range(AppState_t *app);
@@ -171,6 +176,7 @@ void app_ptt_update_from_ppg_peak(AppState_t *app,
   }
 
   ptt_candidate = (uint16_t)ptt_ms;
+  /* 与短历史中位数相比突跳过大时拒绝，避免 ECG/PPG 单次错配进入输出历史。 */
   if (app_ptt_jump_ok(ptt_candidate) == 0U)
   {
     app_ptt_reject_jump(app);
@@ -270,6 +276,7 @@ static uint16_t app_ptt_median_value(void)
   return sorted[n / 2U];
 }
 
+/* 启动初期直接接受；历史足够后，用中位数 + 宽松限幅判断 PTT 是否突跳。 */
 static uint8_t app_ptt_jump_ok(uint16_t ptt_ms)
 {
   uint16_t median;

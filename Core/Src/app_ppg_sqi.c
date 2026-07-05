@@ -1,26 +1,48 @@
+/**
+  ******************************************************************************
+  * @file    app_ppg_sqi.c
+  * @brief   PPG SQI 实验门控 / Experimental PPG signal-quality gate
+  *
+  * 本模块把已有的窗口质量分、PI/AC 强度、RED/IR 平衡、运动标志、接触稳定期
+  * 与 beat-to-beat 稳定性合成为一个保守 SQI。SQI 只向下钳制输出置信度，
+  * 不改变原始采样、滤波或 PPG 峰值检测状态机。
+  *
+  * The SQI is intentionally a side gate: it can suppress HR/SpO2/PTT valid flags
+  * when evidence is weak, while keeping the original detector path observable for
+  * comparison in logs.
+  ******************************************************************************
+  */
+
 #include "app_ppg_sqi.h"
 
 #include <string.h>
 
+/* ---- SQI 调参常量 / SQI tuning constants ---- */
+/* 自适应基线慢速跟随：仅在无质量标志时更新，避免把坏窗口学习成正常基线。 */
 #define APP_PPG_SQI_BASE_SHIFT              6U
 #define APP_PPG_SQI_BASE_MIN_QUALITY        35U
+/* 低灌注判据：同时保留相对跌落和绝对下限，兼顾个体差异与极弱信号。 */
 #define APP_PPG_SQI_LOW_PERF_PERCENT        45U
 #define APP_PPG_SQI_LOW_PERF_ABS_AC         3U
 #define APP_PPG_SQI_LOW_PERF_ABS_PI         1U
+/* 不同异常对应的最高可用质量分；SQI 只降分，不主动升分。 */
 #define APP_PPG_SQI_LOW_PERF_CAP            24U
 #define APP_PPG_SQI_MOTION_CAP              20U
 #define APP_PPG_SQI_TRANSITION_CAP          15U
 #define APP_PPG_SQI_BALANCE_CAP             45U
 #define APP_PPG_SQI_BEAT_UNSTABLE_CAP       35U
+/* HR/SpO2/PTT 使用不同门限：PTT 对峰时刻更敏感，因此门限最高。 */
 #define APP_PPG_SQI_HR_MIN_SCORE            30U
 #define APP_PPG_SQI_SPO2_MIN_SCORE          35U
 #define APP_PPG_SQI_PTT_MIN_SCORE           45U
+/* beat-to-beat 稳定性：短历史中位数用于拒绝突跳 IBI 和异常幅度。 */
 #define APP_PPG_SQI_IBI_HISTORY_SIZE        5U
 #define APP_PPG_SQI_IBI_JUMP_PERCENT        35U
 #define APP_PPG_SQI_AMP_DROP_PERCENT        40U
 #define APP_PPG_SQI_AMP_SPIKE_PERCENT       260U
 #define APP_PPG_SQI_BEAT_HOLD_SAMPLES       50U
 
+/* SQI 内部状态：不进 AppState，避免串口协议被临时基线细节污染。 */
 typedef struct
 {
   uint8_t  initialized;
@@ -38,6 +60,7 @@ typedef struct
 
 static AppPpgSqiState_t ppg_sqi_state;
 
+/* ---- 内部工具函数 / Internal helpers ---- */
 static uint32_t app_ppg_sqi_slow_follow_u32(uint32_t current,
                                             uint32_t target,
                                             uint8_t shift);
@@ -58,6 +81,13 @@ static void app_ppg_sqi_add_ibi(uint16_t ibi_ms);
 static uint32_t app_ppg_sqi_abs_diff_u32(uint32_t lhs, uint32_t rhs);
 static void app_ppg_sqi_mark_beat_unstable(AppState_t *app, uint8_t ibi_reject);
 
+/**
+ ******************************************************************************
+ * @brief  重置 SQI 运行状态和 AppState 中的 SQI 诊断计数。
+ * @param  app AppState 指针；为 NULL 时只清内部自适应状态。
+ * @note   手指状态切换、FIFO 溢出和测量链路重置时调用，防止旧基线污染新佩戴。
+ ******************************************************************************
+ */
 void app_ppg_sqi_reset(AppState_t *app)
 {
   (void)memset(&ppg_sqi_state, 0, sizeof(ppg_sqi_state));
@@ -78,6 +108,16 @@ void app_ppg_sqi_reset(AppState_t *app)
   app->ppg_sqi_suppressed_count = 0UL;
 }
 
+/**
+ ******************************************************************************
+ * @brief  基于当前 PPG 窗口更新 SQI score/flags。
+ * @param  app         AppState 指针。
+ * @param  metrics     RED/IR AC、PI 和平衡状态输入；NULL 表示无有效 PPG 窗口。
+ * @param  raw_quality 原始 PPG 窗口质量分，作为 SQI 的上限输入。
+ * @note   先标记接触稳定期和运动，再根据本地基线判断低灌注；仅在无标志窗口
+ *         中慢速更新基线。This function never raises raw_quality.
+ ******************************************************************************
+ */
 void app_ppg_sqi_update_window(AppState_t *app,
                                const MAX30102_SignalMetrics_t *metrics,
                                uint8_t raw_quality)
@@ -188,6 +228,13 @@ void app_ppg_sqi_update_window(AppState_t *app,
 #endif
 }
 
+/**
+ ******************************************************************************
+ * @brief  将 SQI 侧评分向下钳制到 app->signal_quality。
+ * @param  app AppState 指针。
+ * @note   保持“只降不升”的原则，便于在日志中比较原始质量分与 SQI 后质量分。
+ ******************************************************************************
+ */
 void app_ppg_sqi_apply_quality_gate(AppState_t *app)
 {
 #if (APP_PPG_SQI_EXPERIMENTAL != 0U) && (APP_PPG_SQI_GATE_OUTPUTS != 0U)
@@ -200,6 +247,16 @@ void app_ppg_sqi_apply_quality_gate(AppState_t *app)
 #endif
 }
 
+/**
+ ******************************************************************************
+ * @brief  记录已接受的 PPG beat，用于维护 IBI 和幅度稳定性历史。
+ * @param  app            AppState 指针。
+ * @param  ibi_ms         本次 beat 的 inter-beat interval，单位 ms。
+ * @param  beat_amplitude 峰谷幅度。
+ * @note   若新 beat 与短历史中位数差异过大，先标记短暂 beat unstable，
+ *         但仍更新历史，让状态在真实节律变化时可以重新收敛。
+ ******************************************************************************
+ */
 void app_ppg_sqi_note_accepted_beat(AppState_t *app,
                                     uint16_t ibi_ms,
                                     uint32_t beat_amplitude)
@@ -255,16 +312,35 @@ void app_ppg_sqi_note_accepted_beat(AppState_t *app,
 #endif
 }
 
+/**
+ ******************************************************************************
+ * @brief  PPG 峰值检测因 IBI 异常拒绝候选 beat 时调用。
+ * @param  app AppState 指针。
+ ******************************************************************************
+ */
 void app_ppg_sqi_note_ibi_reject(AppState_t *app)
 {
   app_ppg_sqi_mark_beat_unstable(app, 1U);
 }
 
+/**
+ ******************************************************************************
+ * @brief  PPG 峰值检测因幅度异常拒绝候选 beat 时调用。
+ * @param  app AppState 指针。
+ ******************************************************************************
+ */
 void app_ppg_sqi_note_amp_reject(AppState_t *app)
 {
   app_ppg_sqi_mark_beat_unstable(app, 0U);
 }
 
+/**
+ ******************************************************************************
+ * @brief  判断当前 SQI 是否允许 HR/BPM 输出继续有效。
+ * @param  app AppState 指针。
+ * @return 允许返回 1，否则返回 0。
+ ******************************************************************************
+ */
 uint8_t app_ppg_sqi_allows_hr(const AppState_t *app)
 {
 #if (APP_PPG_SQI_EXPERIMENTAL != 0U) && (APP_PPG_SQI_GATE_OUTPUTS != 0U)
@@ -283,6 +359,13 @@ uint8_t app_ppg_sqi_allows_hr(const AppState_t *app)
   return 1U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  判断当前 SQI 是否允许 SpO2 输出继续有效。
+ * @param  app AppState 指针。
+ * @return 允许返回 1，否则返回 0。
+ ******************************************************************************
+ */
 uint8_t app_ppg_sqi_allows_spo2(const AppState_t *app)
 {
 #if (APP_PPG_SQI_EXPERIMENTAL != 0U) && (APP_PPG_SQI_GATE_OUTPUTS != 0U)
@@ -304,6 +387,15 @@ uint8_t app_ppg_sqi_allows_spo2(const AppState_t *app)
   return 1U;
 }
 
+/**
+ ******************************************************************************
+ * @brief  判断当前 SQI 是否允许 PTT 匹配使用 PPG 峰时刻。
+ * @param  app AppState 指针。
+ * @return 允许返回 1，否则返回 0。
+ * @note   PTT 对峰值时刻偏移最敏感，因此低灌注、运动、平衡异常和 beat unstable
+ *         都会阻断 PTT 更新。
+ ******************************************************************************
+ */
 uint8_t app_ppg_sqi_allows_ptt(const AppState_t *app)
 {
 #if (APP_PPG_SQI_EXPERIMENTAL != 0U) && (APP_PPG_SQI_GATE_OUTPUTS != 0U)
@@ -325,6 +417,7 @@ uint8_t app_ppg_sqi_allows_ptt(const AppState_t *app)
   return 1U;
 }
 
+/* 慢速一阶跟随，使用 shift 代替除法以适配 MCU 运行环境。 */
 static uint32_t app_ppg_sqi_slow_follow_u32(uint32_t current,
                                             uint32_t target,
                                             uint8_t shift)
@@ -356,6 +449,7 @@ static uint32_t app_ppg_sqi_slow_follow_u32(uint32_t current,
   return current - step;
 }
 
+/* 16-bit 包装版本，用于 PI 基线。 */
 static uint16_t app_ppg_sqi_slow_follow_u16(uint16_t current,
                                             uint16_t target,
                                             uint8_t shift)
@@ -365,6 +459,7 @@ static uint16_t app_ppg_sqi_slow_follow_u16(uint16_t current,
                                                shift);
 }
 
+/* 相对跌落检测：基线过低时只依赖绝对下限，避免除噪声误判。 */
 static uint8_t app_ppg_sqi_below_percent_u32(uint32_t current,
                                              uint32_t baseline,
                                              uint32_t percent)
@@ -378,6 +473,7 @@ static uint8_t app_ppg_sqi_below_percent_u32(uint32_t current,
           ((uint64_t)baseline * (uint64_t)percent)) ? 1U : 0U;
 }
 
+/* 16-bit 相对跌落检测，用于 PI x1000。 */
 static uint8_t app_ppg_sqi_below_percent_u16(uint16_t current,
                                              uint16_t baseline,
                                              uint32_t percent)
@@ -391,6 +487,7 @@ static uint8_t app_ppg_sqi_below_percent_u16(uint16_t current,
           ((uint64_t)baseline * (uint64_t)percent)) ? 1U : 0U;
 }
 
+/* 饱和递增诊断计数器，避免长时间运行后回卷。 */
 static void app_ppg_sqi_inc_u32(uint32_t *value)
 {
   if ((value != NULL) && (*value < 0xFFFFFFFFUL))
@@ -399,6 +496,7 @@ static void app_ppg_sqi_inc_u32(uint32_t *value)
   }
 }
 
+/* 将质量分钳制到异常对应上限。 */
 static void app_ppg_sqi_cap_score(uint8_t *score, uint8_t cap)
 {
   if ((score != NULL) && (*score > cap))
@@ -407,6 +505,7 @@ static void app_ppg_sqi_cap_score(uint8_t *score, uint8_t cap)
   }
 }
 
+/* 只在干净窗口中更新本地 AC/PI 基线。 */
 static void app_ppg_sqi_update_baseline(const MAX30102_SignalMetrics_t *metrics)
 {
   if (metrics == NULL)
@@ -432,6 +531,7 @@ static void app_ppg_sqi_update_baseline(const MAX30102_SignalMetrics_t *metrics)
                                   APP_PPG_SQI_BASE_SHIFT);
 }
 
+/* 短 IBI 历史中位数，抗单个误检 beat。 */
 static uint16_t app_ppg_sqi_median_ibi(void)
 {
   uint16_t sorted[APP_PPG_SQI_IBI_HISTORY_SIZE];
@@ -466,6 +566,7 @@ static uint16_t app_ppg_sqi_median_ibi(void)
   return sorted[n / 2U];
 }
 
+/* 环形写入已接受 IBI。 */
 static void app_ppg_sqi_add_ibi(uint16_t ibi_ms)
 {
   ppg_sqi_state.ibi_history[ppg_sqi_state.ibi_write_index] = ibi_ms;
@@ -478,11 +579,13 @@ static void app_ppg_sqi_add_ibi(uint16_t ibi_ms)
   }
 }
 
+/* 无符号绝对差。 */
 static uint32_t app_ppg_sqi_abs_diff_u32(uint32_t lhs, uint32_t rhs)
 {
   return (lhs >= rhs) ? (lhs - rhs) : (rhs - lhs);
 }
 
+/* 标记短暂 beat unstable，并在后续若干样本窗口内压低 SQI。 */
 static void app_ppg_sqi_mark_beat_unstable(AppState_t *app, uint8_t ibi_reject)
 {
 #if (APP_PPG_SQI_EXPERIMENTAL != 0U)

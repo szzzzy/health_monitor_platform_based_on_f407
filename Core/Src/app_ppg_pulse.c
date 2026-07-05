@@ -414,6 +414,15 @@ static void app_ppg_pulse_add_ibi_history(uint16_t ibi_ms)
   }
 }
 
+/*
+ * 候选 beat 质量复核：
+ *   - 保留状态机的峰谷检测职责；
+ *   - 在这里用 IBI 突跳、幅度跌落/尖峰和运动状态拒绝不稳定 beat；
+ *   - 拒绝原因同步给 SQI 计数器，方便日志回放时区分 IBI 与幅度问题。
+ *
+ * Candidate beat quality gate. The detector still owns peak/trough detection;
+ * this helper only rejects unstable candidates and reports the reason to SQI.
+ */
 static uint8_t app_ppg_pulse_quality_ok(AppState_t *app,
                                         uint16_t ibi_ms,
                                         uint32_t beat_amplitude,
