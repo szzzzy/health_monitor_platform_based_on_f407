@@ -26,22 +26,84 @@
 /* --------------------------------------------------------------------------
  * USART2 DMA 循环接收缓冲区
  *
- * DMA1_Stream5_Channel4 -> CIRCULAR 循环模式连续接收。
- * IDLE 中断用于检测帧间隔。
- * uart_dma_last_pos 记录协议层已消费的位置。
- * uart_dma_idle_flag 由中断置位，由协议层轮询并清除。
+ * DMA1_Stream5_Channel4 以 CIRCULAR 模式连续接收，半传输、整圈完成和空闲线
+ * 事件只置“有数据待查”标志，实际命令拆帧由 Uitask 完成。wrap_count 与 NDTR
+ * 共同组成单调生产计数，可识别协议层落后超过一圈的情况。
  * -------------------------------------------------------------------------- */
 static DMA_HandleTypeDef hdma_usart2_rx;
-static uint8_t  uart_dma_rx_buf[UART_DMA_RX_BUF_SIZE];
-static volatile uint16_t uart_dma_last_pos = 0U;
-static volatile uint8_t  uart_dma_idle_flag = 0U;
+static uint8_t  uart_dma_rx_buf[UART_DMA_RX_BUF_SIZE]
+    __attribute__((section(".dma_buffer"), aligned(4), used));
+static volatile uint16_t uart_dma_last_pos = 0U;    /* 兼容的环形消费索引 */
+static volatile uint8_t  uart_dma_idle_flag = 0U;   /* ISR 置位、协议任务清除的数据到达提示 */
+static volatile uint32_t uart_dma_wrap_count = 0U;  /* DMA 完整写满 64 字节的累计圈数 */
+static volatile uint32_t uart_error_count = 0U;     /* UART 错误及恢复失败累计次数 */
+static volatile uint32_t uart_dma_restart_count = 0U; /* DMA 接收启动/重启累计次数 */
 
 uint8_t *usart_get_dma_rx_buf(void)       { return uart_dma_rx_buf; }
 uint16_t usart_get_dma_last_pos(void)      { return uart_dma_last_pos; }
-void     usart_set_dma_last_pos(uint16_t p) { uart_dma_last_pos = p; }
+void     usart_set_dma_last_pos(uint16_t p) { uart_dma_last_pos = (uint16_t)(p % UART_DMA_RX_BUF_SIZE); }
 uint8_t  usart_get_dma_idle_flag(void)     { return uart_dma_idle_flag; }
 void     usart_clear_dma_idle_flag(void)   { uart_dma_idle_flag = 0U; }
 void     usart_set_dma_idle_flag(void)     { uart_dma_idle_flag = 1U; }
+
+uint32_t usart_get_uart_error_count(void) { return uart_error_count; }
+uint32_t usart_get_dma_restart_count(void) { return uart_dma_restart_count; }
+
+/**
+ * @brief  获取 DMA 自最近一次重启以来累计写入的字节数。
+ * @return 单调生产计数；DMA 尚未挂接时返回 0。
+ * @note   读取 NDTR 前后各取一次 wrap_count，若期间恰好绕圈则重读，避免把
+ *         新一圈的 NDTR 与旧一圈计数组合成不一致快照。
+ */
+uint32_t usart_get_dma_produced_count(void)
+{
+  uint32_t wraps_before;
+  uint32_t wraps_after;
+  uint16_t remaining;
+
+  if (huart2.hdmarx == NULL)
+  {
+    return 0U;
+  }
+
+  do
+  {
+    wraps_before = uart_dma_wrap_count;
+    remaining = (uint16_t)__HAL_DMA_GET_COUNTER(huart2.hdmarx);
+    wraps_after = uart_dma_wrap_count;
+  } while (wraps_before != wraps_after);
+
+  if (remaining == 0U)
+  {
+    return (wraps_before + 1UL) * UART_DMA_RX_BUF_SIZE;
+  }
+
+  return (wraps_before * UART_DMA_RX_BUF_SIZE) +
+         (uint32_t)((UART_DMA_RX_BUF_SIZE - remaining) % UART_DMA_RX_BUF_SIZE);
+}
+
+/**
+ * @brief  中止并重新启动 USART2 环形 DMA 接收，同时复位软件消费位置。
+ * @return HAL_UART_Receive_DMA() 的状态。
+ * @note   UART 错误回调也会调用本函数；协议层通过 restart_count 识别重启，
+ *         丢弃重启前尚未组成完整行的内容。
+ */
+HAL_StatusTypeDef usart_restart_dma_rx(void)
+{
+  HAL_StatusTypeDef status;
+
+  (void)HAL_UART_AbortReceive(&huart2);
+  uart_dma_last_pos = 0U;
+  uart_dma_wrap_count = 0U;
+  status = HAL_UART_Receive_DMA(&huart2, uart_dma_rx_buf, UART_DMA_RX_BUF_SIZE);
+  uart_dma_restart_count++;
+  if (status == HAL_OK)
+  {
+    uart_dma_idle_flag = 1U;
+  }
+
+  return status;
+}
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart2;
@@ -77,7 +139,10 @@ void MX_USART2_UART_Init(void)
   __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
   HAL_NVIC_SetPriority(USART2_IRQn, 3, 0);
   HAL_NVIC_EnableIRQ(USART2_IRQn);
-  HAL_UART_Receive_DMA(&huart2, uart_dma_rx_buf, UART_DMA_RX_BUF_SIZE);
+  if (usart_restart_dma_rx() != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END USART2_Init 2 */
 
 }
@@ -156,6 +221,35 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 }
 
 /* USER CODE BEGIN 1 */
+
+void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart)
+{
+  if ((huart != NULL) && (huart->Instance == USART2))
+  {
+    uart_dma_idle_flag = 1U;
+  }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if ((huart != NULL) && (huart->Instance == USART2))
+  {
+    uart_dma_wrap_count++;
+    uart_dma_idle_flag = 1U;
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if ((huart != NULL) && (huart->Instance == USART2))
+  {
+    uart_error_count++;
+    if (usart_restart_dma_rx() != HAL_OK)
+    {
+      uart_error_count++;
+    }
+  }
+}
 
 /* USER CODE END 1 */
 

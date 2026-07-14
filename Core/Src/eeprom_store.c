@@ -2,7 +2,12 @@
   ******************************************************************************
   * @file    eeprom_store.c
   * @brief   EEPROM 参数管理 — 布局序列化/反序列化、CRC16 校验、
-  *          版本迁移、出厂默认回退
+  *          版本检查、出厂默认回退与延迟写回
+  *
+  * RAM 中的 g_eeprom 是运行期镜像。落盘采用“数据区先写、8 字节头后写”的
+  * 两阶段提交；若中途掉电，旧头与新数据的 CRC 不匹配，下次启动会回退默认值，
+  * 不会把半新半旧内容当作有效布局。测量活跃时写请求只标记 dirty，Uitask
+  * 在安全窗口调用延迟服务，避免 EEPROM 页写周期占用共享 I2C1。
   ******************************************************************************
   */
 
@@ -15,14 +20,14 @@
 #define EEPROM_MAGIC         EEPROM_MAGIC_VALUE
 #define EEPROM_VERSION       EEPROM_LAYOUT_VERSION
 
-/* Layout v2:
- * 0x00..0x07 header: magic, version, crc16
- * 0x08..0x29 identity and MAX30102 LED current settings
- * 0x2A..0x4F reserved for future layout-compatible fields
- * 0x50..0x5F runtime counters
- * 0x60..0x6F reserved for layout-compatible additions
- * 0x70..0xE9 error log ring, write pointer, total count
- * 0xEA..0xFF reserved tail, kept zero by serialization
+/* 布局 v2：
+ * 0x00..0x07 头部：魔数、版本、CRC16
+ * 0x08..0x29 设备身份与 MAX30102 LED 电流设置
+ * 0x2A..0x4F 预留的布局兼容字段
+ * 0x50..0x5F 运行统计计数器
+ * 0x60..0x6F 预留的布局兼容字段
+ * 0x70..0xE9 错误日志环、写指针与累计条数
+ * 0xEA..0xFF 尾部预留，序列化时保持为零
  */
 #define EEPROM_ADDR_SERIAL   0x08U
 #define EEPROM_ADDR_HW_REV   0x20U
@@ -40,8 +45,13 @@
 
 #define ERROR_ENTRY_SIZE     15U
 #define EEPROM_STORE_I2C_LOCK_TIMEOUT_MS 500U
+#define EEPROM_STORE_RETRY_BACKOFF_MS     5000U
 
-eeprom_data_t g_eeprom;
+eeprom_data_t g_eeprom;                    /* EEPROM 内容的唯一 RAM 镜像 */
+static bool eeprom_measurement_active;      /* 为 true 时禁止物理 EEPROM 写入 */
+static bool eeprom_dirty;                   /* RAM 镜像尚未成功持久化 */
+static uint32_t eeprom_retry_deadline;      /* 写失败后的最早重试时刻，单位：ms */
+static uint32_t eeprom_write_error_count;   /* 实际 I2C 写失败累计次数 */
 
 /* ---- CRC16-CCITT (poly 0x1021, init 0xFFFF) ---- */
 static uint16_t eeprom_crc16(const uint8_t *data, uint16_t len)
@@ -166,7 +176,7 @@ static uint16_t eeprom_serialize(const eeprom_data_t *d, uint8_t buf[EEPROM_SIZE
   buf[EEPROM_ADDR_RUNTIME + 13] = (uint8_t)((d->sensor_recovery_count >> 8)  & 0xFFU);
   buf[EEPROM_ADDR_RUNTIME + 14] = (uint8_t)((d->sensor_recovery_count >> 16) & 0xFFU);
   buf[EEPROM_ADDR_RUNTIME + 15] = (uint8_t)((d->sensor_recovery_count >> 24) & 0xFFU);
-  /* 0x60..0x6F is reserved for future layout-compatible fields. */
+  /* 0x60..0x6F 为未来可兼容扩展字段预留。 */
   for (i = 0U; i < EEPROM_RESERVED_B_SIZE; i++)
   {
     buf[EEPROM_ADDR_RESERVED_B + i] = 0U;
@@ -190,7 +200,7 @@ static uint16_t eeprom_serialize(const eeprom_data_t *d, uint8_t buf[EEPROM_SIZE
     buf[base + 11] = 0U;
     buf[base + 12] = 0U;
     buf[base + 13] = 0U;
-    /* Reserved for future per-entry fields. */
+    /* 单条错误记录的尾部保留给未来扩展。 */
     buf[base + 14] = 0U;
   }
   buf[EEPROM_ADDR_ERR_WRP] = d->error_log_wr_ptr;
@@ -319,6 +329,12 @@ static bool eeprom_write_full(eeprom_data_t *d)
   uint16_t crc16;
   HAL_StatusTypeDef status;
 
+  if (eeprom_measurement_active)
+  {
+    eeprom_dirty = true;
+    return false;
+  }
+
   crc16 = eeprom_serialize(d, buf);
   d->crc16 = crc16;
   if (app_rtos_i2c_acquire(EEPROM_STORE_I2C_LOCK_TIMEOUT_MS) == 0U)
@@ -326,18 +342,40 @@ static bool eeprom_write_full(eeprom_data_t *d)
     return false;
   }
 
-  status = eeprom_write(0U, buf, EEPROM_SIZE);
+  /* 两阶段提交：先写数据区，最后写含魔数/版本/CRC 的头部。若末次 8 字节写入前
+   * 掉电，头部与数据区会 CRC 不匹配，从而拒绝半完成镜像。 */
+  status = eeprom_write(EEPROM_OFFSET_DATA,
+                        &buf[EEPROM_OFFSET_DATA],
+                        EEPROM_DATA_SIZE);
+  if (status == HAL_OK)
+  {
+    status = eeprom_write(0U, buf, EEPROM_OFFSET_DATA);
+  }
   app_rtos_i2c_release();
-  return (status == HAL_OK);
+  if (status != HAL_OK)
+  {
+    eeprom_dirty = true;
+    eeprom_retry_deadline = HAL_GetTick() + EEPROM_STORE_RETRY_BACKOFF_MS;
+    eeprom_write_error_count++;
+    return false;
+  }
+
+  eeprom_dirty = false;
+  return true;
 }
 
-/* ---- 公共 API ---- */
+/* ---- 公共 API：启动装载、显式同步、错误环和测量期延迟写回 ---- */
 
 void eeprom_store_init(void)
 {
   uint8_t buf[EEPROM_SIZE];
   uint32_t raw_magic;
   uint16_t raw_version;
+
+  eeprom_measurement_active = false;
+  eeprom_dirty = false;
+  eeprom_retry_deadline = 0UL;
+  eeprom_write_error_count = 0UL;
 
   /* 尝试读取 EEPROM */
   if (eeprom_read_full(buf) != HAL_OK)
@@ -377,7 +415,10 @@ void eeprom_store_init(void)
   {
     g_eeprom.total_boot_count++;
   }
-  (void)eeprom_write_full(&g_eeprom);
+  if (!eeprom_write_full(&g_eeprom))
+  {
+    g_eeprom.initialized = false;
+  }
 }
 
 bool eeprom_store_sync(void)
@@ -397,18 +438,18 @@ bool eeprom_store_reset_defaults(void)
   (void)memcpy(&g_eeprom, &defaults, sizeof(g_eeprom));
   g_eeprom.initialized = true;
   ok = eeprom_write_full(&g_eeprom);
-  g_eeprom.initialized = ok;
+  g_eeprom.initialized = true;
   return ok;
 }
 
-void eeprom_store_log_error(uint8_t type, uint8_t phase, uint32_t context)
+bool eeprom_store_log_error(uint8_t type, uint8_t phase, uint32_t context)
 {
   eeprom_error_entry_t *entry;
   uint8_t idx;
 
   if (!g_eeprom.initialized)
   {
-    return;
+    return false;
   }
 
   if (g_eeprom.error_log_wr_ptr >= EEPROM_ERROR_LOG_COUNT)
@@ -430,20 +471,57 @@ void eeprom_store_log_error(uint8_t type, uint8_t phase, uint32_t context)
     g_eeprom.error_log_count++;
   }
 
-  (void)eeprom_write_full(&g_eeprom);
+  return eeprom_write_full(&g_eeprom);
 }
 
-void eeprom_store_update_runtime(uint32_t run_hours_x10,
-                                  uint32_t sensor_read_errors,
-                                  uint32_t recoveries)
+bool eeprom_store_update_runtime(uint32_t run_hours_x10,
+                                 uint32_t sensor_read_errors,
+                                 uint32_t recoveries)
 {
   if (!g_eeprom.initialized)
   {
-    return;
+    return false;
   }
 
   g_eeprom.total_run_hours_x10   = run_hours_x10;
   g_eeprom.sensor_read_error_count = sensor_read_errors;
   g_eeprom.sensor_recovery_count = recoveries;
-  (void)eeprom_write_full(&g_eeprom);
+  return eeprom_write_full(&g_eeprom);
+}
+
+void eeprom_store_set_measurement_active(bool active)
+{
+  eeprom_measurement_active = active;
+}
+
+bool eeprom_store_service_deferred(void)
+{
+  bool ok;
+
+  if (!eeprom_dirty)
+  {
+    return true;
+  }
+  if (eeprom_measurement_active)
+  {
+    return false;
+  }
+  if ((eeprom_retry_deadline != 0UL) &&
+      ((int32_t)(HAL_GetTick() - eeprom_retry_deadline) < 0))
+  {
+    return false;
+  }
+
+  eeprom_retry_deadline = 0UL;
+  ok = eeprom_write_full(&g_eeprom);
+  if (ok)
+  {
+    g_eeprom.initialized = true;
+  }
+  return ok;
+}
+
+uint32_t eeprom_store_get_write_error_count(void)
+{
+  return eeprom_write_error_count;
 }

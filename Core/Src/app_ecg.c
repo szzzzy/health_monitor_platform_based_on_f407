@@ -3,8 +3,8 @@
   * @file    app_ecg.c
   * @brief   ECG QRS 检测 — 250 Hz 采样，简化 Pan-Tompkins 状态机
   *
-  * 每 10 ms 主循环调用 app_ecg_process_samples()，从 DMA 环形缓冲消费
-  * 全部待处理样本。单个样本的处理流水线：
+  * MAXtask 由 TIM6 的 10 ms 节拍唤醒后调用 app_ecg_process_samples()，从
+  * ADC1 DMA 环形缓冲消费全部待处理样本。单个样本的处理流水线：
   *   1. DMA 覆盖检测 → 丢弃旧数据 + 重置检测器
   *   2. 导联脱落检查 → 脱落则重置检测器并跳过后继续
   *   3. ADC 饱和检查 (>=4090 LSB) → 跳过该样本
@@ -15,15 +15,8 @@
   *   6. 双估计自适应阈值 (signal_peak/noise_peak) QRS 状态机
   *   7. 有效 R 峰 → 至少 2 峰才更新 HR/RR/PTT
   *
-  * F407 Cortex-M4F 相比 F103 Cortex-M3 在 ECG 实时处理上的优势：
-  *   - FPU 单周期单精度乘加：Phase 1 浮点 biquad 级联 (10 FMAC/样本)
-  *     仅占总 CPU 的 <0.002%，F103 软件浮点需 60+ 周期/乘加无法保证实时
-  *   - 168MHz 主频 + DSP 指令 (SIMD)：整数 MWI 一次迭代约 12 周期，
-  *     Phase 1+2 单样本总开销 <30 周期@250Hz，远低于 F103 (Cortex-M3 72MHz)
-  *   - 余量充裕：可同时维持 MAX30102 100Hz I2C DMA、OLED SPI、
-  *     SDIO FatFs 日志、FreeRTOS 调度，而 F103 各模块间互抢严重
-  *   - CMSIS-DSP 加速路径：手工 biquad/MWI 接口兼容 CMSIS-DSP API，
-  *     可一行替换为 arm_biquad_cascade_df1_f32 + arm_mean_f32 充分利用 SIMD
+  * DSP 预处理使用 Cortex-M4F 单精度 FPU；差分能量与移动窗口积分保持 O(1)
+  * 每样本更新。显示滤波链与 QRS 检测链相互独立，显示缩放不会改变检测结果。
   *
   * 每个消费样本配有推算的 4 ms 间隔时间戳，用于 RR 与 PTT 计算。
   *
@@ -126,15 +119,12 @@ static int32_t ecg_dmwi_step(EcgDerivMwi_t *d, int32_t filtered);
  * 使用单精度浮点 Direct Form I，利用 Cortex-M4F 硬件 FPU（单周期 MAC）。
  * 系数预计算为编译时常量，运行时仅 5 次乘加 + 2 次赋值/样本。
  *
- * STM32F103 (Cortex-M3, 无 FPU) 需软件浮点模拟——单样本 IIR 约 60+ CPU
- * 周期，在 250 Hz 下无法保证 MAX30102 + OLED 并行实时性。
- * STM32F407 (Cortex-M4F, 硬件 FPU) 单样本约 14 CPU 周期@168MHz，
- * 250 Hz × 14 ≈ 3500 cycles/s，占总算力 <0.002%，余量充裕。
+ * 目标 MCU 为 Cortex-M4F，编译器可使用硬件单精度浮点指令。这里不依赖动态
+ * 内存，所有系数和延迟状态均为静态存储，适合固定 250 Hz 流式处理。
  *
  * 接口兼容 CMSIS-DSP arm_biquad_casd_df1_inst_f32：
  *   typedef struct { float *pCoeffs; float *pState; ... } arm_biquad_casd_df1_inst_f32;
- * 当前使用内联 EcgBiquad_t 避免 malloc 和外部依赖；未来可替换为
- * arm_biquad_cascade_df1_f32() 一次调用处理整个样本块。
+ * 当前使用内联 EcgBiquad_t，避免动态分配并保持逐样本状态显式可见。
  * ========================================================================= */
 #if (APP_ECG_DSP_PREPROCESS != 0U)
 
@@ -740,8 +730,8 @@ uint8_t app_ecg_process_samples(AppState_t *app)
           avg = (ecg_visual_avg_buf[0] + ecg_visual_avg_buf[1]
                  + ecg_visual_avg_buf[2]) / (int32_t)APP_ECG_VISUAL_DECIM;
 
-          /* SQ is diagnostic only. Keep visual samples flowing so transient
-           * quality dips do not collapse the OLED waveform into a flat line. */
+          /* SQ 只用于解释可信度；短暂质量下降时仍持续送入显示样本，避免 OLED
+           * 波形因门控瞬间变成水平线。 */
           app_display_add_ecg_sample(avg);
           ecg_visual.decim = 0U;
         }
@@ -1057,7 +1047,8 @@ static uint8_t app_ecg_is_t_wave_like(uint32_t peak_ms,
 {
   uint32_t rr_since_last;
 
-  if ((ecg_state.last_r_peak_ms == 0UL) || (peak_ms <= ecg_state.last_r_peak_ms) ||
+  if ((ecg_state.last_r_peak_ms == 0UL) ||
+      ((int32_t)(peak_ms - ecg_state.last_r_peak_ms) <= 0) ||
       (ecg_state.signal_peak == 0UL))
   {
     return 0U;
@@ -1090,7 +1081,7 @@ static uint8_t app_ecg_try_searchback(AppState_t *app,
       (ecg_state.last_r_peak_ms == 0UL) ||
       (ecg_state.rr_count < 3U) ||
       (ecg_state.search_count == 0U) ||
-      (timestamp_ms <= ecg_state.last_r_peak_ms))
+      ((int32_t)(timestamp_ms - ecg_state.last_r_peak_ms) <= 0))
   {
     return 0U;
   }
@@ -1119,10 +1110,12 @@ static uint8_t app_ecg_try_searchback(AppState_t *app,
     uint32_t candidate_ms = ecg_state.search_peak_ms[i];
     uint32_t candidate_abs = ecg_state.search_peak_abs[i];
 
-    if ((candidate_ms > (ecg_state.last_r_peak_ms + refractory_ms)) &&
-        ((candidate_ms - ecg_state.last_r_peak_ms) >= APP_ECG_MIN_RR_MS) &&
-        (candidate_ms < timestamp_ms) &&
-        ((candidate_ms - ecg_state.last_r_peak_ms) <= APP_ECG_MAX_RR_MS) &&
+    uint32_t candidate_rr = candidate_ms - ecg_state.last_r_peak_ms;
+
+    if ((candidate_rr > refractory_ms) &&
+        (candidate_rr >= APP_ECG_MIN_RR_MS) &&
+        ((int32_t)(timestamp_ms - candidate_ms) > 0) &&
+        (candidate_rr <= APP_ECG_MAX_RR_MS) &&
         (candidate_abs >= lower_threshold) &&
         (candidate_abs > best_peak_abs) &&
         (app_ecg_is_t_wave_like(candidate_ms, candidate_abs) == 0U))

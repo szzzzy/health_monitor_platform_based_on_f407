@@ -14,12 +14,13 @@ static MAX30102_FifoDebug_t max30102_fifo_debug;
 
 /*
  * MAX30102 FIFO 数据就绪检测。
- * 当前项目默认关闭 MAX30102 INT，主循环按 TIM6 100 Hz 纯轮询 FIFO。
+ * 当前项目默认关闭 MAX30102 INT，由 TIM6 每 10 ms 唤醒 MAXtask 轮询 FIFO。
  *
  * 设计思路：
- *   max30102_data_ready_flag — 仅在启用 INT 时由 EXTI ISR 置 1，主循环读取后清零。
- *     上电初始值为 1，确保 TIM6 第一次节拍就会读一次 FIFO。
- *   max30102_int_seen — 记录是否至少触发过一次 EXTI 中断。
+ *   max30102_data_ready_flag — TIM6 回调或启用后的 EXTI 回调置 1，MAXtask 读取后清零。
+ *     上电初始值为 1，确保首次任务服务会读取一次 FIFO。
+ *   max30102_int_seen — 记录是否调用过数据就绪标记入口；仅在编译启用 INT
+ *     分支时参与“等待 INT/超时回退”决策。
  *     - 若 INT 引脚已连接，首次 EXTI 后置 1，切换到"INT 驱动模式"。
  *     - 若 INT 引脚未连接，始终为 0，系统退化到"纯 TIM6 轮询模式"。
  *
@@ -58,9 +59,9 @@ static uint8_t max30102_get_ir_led_pa(void)
 /* ---- 数据就绪 ---- */
 
 /**
- * @brief  从 EXTI 中断回调标记 FIFO 数据就绪。
- * @note   在 ISR 上下文中调用。设置数据就绪标志并记录
- *         已观测到 INT 边沿，启用 INT 驱动模式。
+ * @brief  从 TIM6 或 EXTI 中断回调标记 FIFO 数据就绪。
+ * @note   仅写原子宽度标志，不访问 I2C。是否启用 INT 等待模式仍由
+ *         MAX30102_USE_INT_PIN 编译开关决定。
  */
 void max30102_mark_data_ready_from_isr(void)
 {
@@ -493,29 +494,32 @@ static uint8_t fifo_batch_raw[MAX30102_FIFO_DEPTH * MAX30102_FIFO_BYTES_PER_SAMP
  *         清除 FIFO 并返回 0，同时设置溢出计数。
  */
 uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
-                                  uint8_t max_count, uint8_t *p_ovf)
+                                  uint8_t max_count, uint8_t *p_ovf,
+                                  MAX30102_BatchStatus_t *batch_status)
 {
   HAL_StatusTypeDef status;
   uint8_t wr_ptr, rd_ptr, ovf;
   uint8_t available, to_read;
   uint8_t i;
 
-  if ((red == NULL) || (ir == NULL) || (p_ovf == NULL) || (max_count == 0U))
+  if ((red == NULL) || (ir == NULL) || (p_ovf == NULL) ||
+      (batch_status == NULL) || (max_count == 0U))
   {
     return 0U;
   }
 
   *p_ovf = 0U;
+  *batch_status = MAX30102_BATCH_EMPTY;
 
   /* 步骤 1：读取 FIFO 指针 */
   status = max30102_read_reg(MAX30102_REG_OVF_COUNTER, &ovf);
-  if (status != HAL_OK) { return 0U; }
+  if (status != HAL_OK) { *batch_status = MAX30102_BATCH_I2C_ERROR; return 0U; }
 
   status = max30102_read_reg(MAX30102_REG_FIFO_WR_PTR, &wr_ptr);
-  if (status != HAL_OK) { return 0U; }
+  if (status != HAL_OK) { *batch_status = MAX30102_BATCH_I2C_ERROR; return 0U; }
 
   status = max30102_read_reg(MAX30102_REG_FIFO_RD_PTR, &rd_ptr);
-  if (status != HAL_OK) { return 0U; }
+  if (status != HAL_OK) { *batch_status = MAX30102_BATCH_I2C_ERROR; return 0U; }
 
   ovf &= MAX30102_FIFO_PTR_MASK;
   wr_ptr &= MAX30102_FIFO_PTR_MASK;
@@ -529,13 +533,19 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
   if (ovf > 0U)
   {
     *p_ovf = ovf;
-    (void)max30102_clear_fifo();
+    status = max30102_clear_fifo();
     max30102_fifo_debug.available_samples = 0U;
+    if (status != HAL_OK)
+    {
+      *batch_status = MAX30102_BATCH_FIFO_CLEAR_FAIL;
+      return 0U;
+    }
 #if (MAX30102_USE_INT_PIN != 0U)
     (void)max30102_clear_interrupt_status();
 #endif
     max30102_data_ready_flag = 1U;
     max30102_poll_fallback_ticks = 0U;
+    *batch_status = MAX30102_BATCH_OVERFLOW;
     return 0U;
   }
 
@@ -558,6 +568,7 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
   if (status != HAL_OK)
   {
     max30102_fifo_debug.available_samples = available;
+    *batch_status = MAX30102_BATCH_I2C_ERROR;
     return 0U;
   }
 
@@ -577,5 +588,6 @@ uint8_t max30102_read_fifo_batch(uint32_t *red, uint32_t *ir,
   max30102_fifo_debug.available_samples =
       (uint8_t)((wr_ptr - (rd_ptr + to_read)) & (MAX30102_FIFO_DEPTH - 1U));
 
+  *batch_status = MAX30102_BATCH_OK;
   return to_read;
 }

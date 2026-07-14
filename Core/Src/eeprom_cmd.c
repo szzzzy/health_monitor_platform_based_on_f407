@@ -1,7 +1,11 @@
 /**
   ******************************************************************************
   * @file    eeprom_cmd.c
-  * @brief   EEPROM UART CLI commands.
+  * @brief   EEPROM 串口命令解析、参数校验与运行期应用
+  *
+  * 支持 info/dump/reset/setsn/sethw/setmfg/setled。命令处理运行在 Uitask；
+  * 访问 EEPROM 或在线修改 MAX30102 LED 电流前必须获得 I2C1 互斥量。
+  * 存储成功与在线应用成功分别报告，避免把“已写入、未生效”误认为完全成功。
   ******************************************************************************
   */
 
@@ -16,9 +20,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RESPONSE_BUF_SIZE 384U
-#define EEPROM_CMD_I2C_LOCK_TIMEOUT_MS 200U
+#define RESPONSE_BUF_SIZE 384U                 /* 单条 CLI 响应格式化缓冲，单位：字节 */
+#define EEPROM_CMD_I2C_LOCK_TIMEOUT_MS 200U    /* 命令等待共享 I2C1 的上限，单位：ms */
 
+/** @brief 以阻塞方式发送一行 CLI 响应，并自动追加 CRLF。 */
 static void cmd_send(const char *str)
 {
   uint16_t len = (uint16_t)strlen(str);
@@ -30,6 +35,7 @@ static void cmd_send(const char *str)
   (void)HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2U, 100U);
 }
 
+/** @brief 跳过命令参数开头的空格和制表符，返回第一个非空白字符。 */
 static const char *skip_spaces(const char *s)
 {
   while ((*s == ' ') || (*s == '\t'))
@@ -39,6 +45,7 @@ static const char *skip_spaces(const char *s)
   return s;
 }
 
+/** @brief 匹配完整关键字，防止把 infox 等前缀相同字符串当成合法命令。 */
 static bool keyword_match(const char *text, const char *keyword)
 {
   size_t len;
@@ -57,6 +64,7 @@ static bool keyword_match(const char *text, const char *keyword)
   return ((text[len] == '\0') || (text[len] == ' ') || (text[len] == '\t'));
 }
 
+/** @brief 解析一个完整整数参数；支持 strtol 的十进制和 0x 前缀格式。 */
 static bool parse_long_arg(const char *text, long *value)
 {
   char *end;
@@ -89,6 +97,7 @@ static bool parse_long_arg(const char *text, long *value)
   return true;
 }
 
+/** @brief 校验 2000–2099 年范围内的 YYYYMMDD，并处理闰年二月。 */
 static bool parse_ymd_arg(const char *text, uint32_t *ymd)
 {
   static const uint8_t days_in_month[12] =
@@ -129,6 +138,7 @@ static bool parse_ymd_arg(const char *text, uint32_t *ymd)
   return true;
 }
 
+/** @brief 解析 RED/IR 两个 1–255 的 LED 寄存器值，拒绝多余尾随参数。 */
 static bool parse_two_led_args(const char *args, uint8_t *red, uint8_t *ir)
 {
   char *end;
@@ -167,6 +177,10 @@ static bool parse_two_led_args(const char *args, uint8_t *red, uint8_t *ir)
   return true;
 }
 
+/**
+ * @brief  把 RAM 镜像中的 RED/IR LED 电流写入正在运行的 MAX30102。
+ * @return 两个寄存器均写入成功返回 true；总线超时或任一写失败返回 false。
+ */
 static bool apply_led_settings_live(void)
 {
   HAL_StatusTypeDef status;
@@ -394,6 +408,12 @@ static void cmd_setled(const char *args, char *buf, uint16_t buf_size)
   cmd_send(buf);
 }
 
+/**
+ * @brief  处理一条可选的 EEPROM CLI 命令。
+ * @param  app 当前未使用，保留用于协议处理器的统一命令接口。
+ * @param  line 去除换行后的完整命令行。
+ * @return 命令以“eeprom”开头且已消费返回 true；非本模块命令返回 false。
+ */
 bool eeprom_cmd_process(AppState_t *app, const char *line)
 {
   char buf[RESPONSE_BUF_SIZE];

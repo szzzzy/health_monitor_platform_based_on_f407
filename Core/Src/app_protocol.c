@@ -1,3 +1,17 @@
+/**
+  ******************************************************************************
+  * @file    app_protocol.c
+  * @brief   USART2 文本协议：测量 M 帧上报与 TIME/SETTIME 命令处理。
+  *
+  * 协议边界：
+  *   1. 上行 M 帧是固定顺序 CSV，字段名前置在文档中，不随帧发送；
+  *   2. 字段升级遵循 append-only：已有列序不重排、不复用；
+  *   3. 尾部 schema_version / field_count / frame_seq 用于上位机校验；
+  *   4. 下行命令保持短行文本：推荐 SETTIME；TIME 仅保留为旧版设置时间别名，
+  *      不表示无参数查询。
+  ******************************************************************************
+  */
+
 #include "app_protocol.h"
 
 #include <ctype.h>
@@ -5,20 +19,36 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "app_data_log.h"
 #include "eeprom_cmd.h"
+#include "eeprom_store.h"
 #include "usart.h"
 
-/* 串口上报与接收缓冲长度；1536 覆盖追加的 SQI/PTT 尾部诊断字段。 */
+/* 串口上报与接收缓冲长度；1536 覆盖追加的 SQI/PTT/侧路诊断字段。 */
 #define JSON_PAYLOAD_SIZE     1536U
 #define UART_RX_LINE_SIZE     64U
-#define STM32_UART_TIMEOUT_MS 100U
+#define APP_PROTOCOL_UART_BAUD_BPS               115200UL
+#define APP_PROTOCOL_UART_BITS_PER_BYTE          10UL
+#define APP_PROTOCOL_UART_FIXED_MARGIN_MS        20UL
+/* M 帧协议契约：schema_version 随字段语义升级，field_count 为完整列数。 */
+#define APP_PROTOCOL_SCHEMA_VERSION 3U
+#define APP_PROTOCOL_M_FIELD_COUNT  160U
 
-static char json_payload[JSON_PAYLOAD_SIZE];
+/* 输出/输入行缓冲：仅协议模块内部使用，调用方只通过公开 API 触发。 */
+static char json_payload[JSON_PAYLOAD_SIZE]
+    __attribute__((section(".ccm_data"), aligned(4), used));
 static char uart_rx_line[UART_RX_LINE_SIZE];
 static uint16_t uart_rx_line_len;
+static uint32_t uart_rx_consumed_count;
+static uint32_t uart_rx_restart_seen;
+static uint8_t uart_rx_discard_until_newline;
+/* 单调递增帧号：帮助 ESP32/GUI 发现丢帧、截断或串口重同步。 */
+static uint32_t app_protocol_frame_seq;
 
-static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t buffer_size);
+static uint16_t build_sensor_packet(const AppState_t *app,
+                                    char *buffer,
+                                    size_t buffer_size,
+                                    uint8_t *overflow);
+static uint32_t app_uart_tx_timeout_ms(uint16_t payload_len);
 static bool send_uart_line(AppState_t *app, const char *payload, uint16_t payload_len);
 static const char *app_skip_spaces(const char *text);
 static uint8_t app_text_starts_with_keyword(const char *text, const char *keyword);
@@ -37,6 +67,9 @@ static bool app_process_uart_line(AppState_t *app, const char *line);
 void app_protocol_init(void)
 {
   uart_rx_line_len = 0U;
+  uart_rx_consumed_count = 0UL;
+  uart_rx_restart_seen = usart_get_dma_restart_count();
+  uart_rx_discard_until_newline = 0U;
 }
 
 /**
@@ -72,15 +105,17 @@ void app_protocol_update_rtc_snapshot(AppState_t *app)
  * @param  app 应用状态指针（收到有效命令时更新）。
  * @note   处理 DMA 空闲行中断后累计的接收字节。
  *         行以 '\n' 分隔，'\r' 字符会被跳过。
- *         识别命令：TIME（查询）和 SETTIME（设置 RTC）。
- *         收到有效 SETTIME 命令时更新 RTC 并发送响应。
+ *         识别命令：SETTIME（推荐）和 TIME（旧版设置时间别名）。
+ *         两者都必须携带日期时间；无参数 TIME 不是查询，会返回 bad_format。
+ *         收到有效设置时间命令时更新 RTC 并发送响应。
  *         若单行超过 UART_RX_LINE_SIZE，则重置缓冲。
  */
 /* 轮询 USART2 DMA 缓冲区，按”单行命令”协议接收 TIME / SETTIME。 */
 void app_protocol_poll_uart_commands(AppState_t *app)
 {
-  uint16_t current_pos;
-  uint16_t buf_size = UART_DMA_RX_BUF_SIZE;
+  uint32_t produced_count;
+  uint32_t available;
+  uint32_t restart_count;
   uint8_t rx_byte;
 
   if (app == NULL)
@@ -88,23 +123,53 @@ void app_protocol_poll_uart_commands(AppState_t *app)
     return;
   }
 
-  if (usart_get_dma_idle_flag() == 0U)
+  eeprom_store_set_measurement_active(app->finger_present != 0U);
+
+  restart_count = usart_get_dma_restart_count();
+  if (restart_count != uart_rx_restart_seen)
   {
-    return;
+    uart_rx_restart_seen = restart_count;
+    uart_rx_consumed_count = 0UL;
+    uart_rx_line_len = 0U;
+    uart_rx_discard_until_newline = 1U;
   }
 
   usart_clear_dma_idle_flag();
+  app->uart_error_count = usart_get_uart_error_count();
+  app->uart_dma_restart_count = restart_count;
 
   /*
    * DMA_CNDTR 递减计数 → 当前写入位置 = buf_size - CNDTR。
    * 从 last_pos 读到 current_pos，处理所有已接收字节。
    */
-  current_pos = (uint16_t)(buf_size - (uint16_t)__HAL_DMA_GET_COUNTER(huart2.hdmarx));
-
-  while (usart_get_dma_last_pos() != current_pos)
+  produced_count = usart_get_dma_produced_count();
+  available = produced_count - uart_rx_consumed_count;
+  if (available > UART_DMA_RX_BUF_SIZE)
   {
-    rx_byte = usart_get_dma_rx_buf()[usart_get_dma_last_pos()];
-    usart_set_dma_last_pos((uint16_t)((usart_get_dma_last_pos() + 1U) % buf_size));
+    uart_rx_consumed_count = produced_count - UART_DMA_RX_BUF_SIZE;
+    uart_rx_line_len = 0U;
+    uart_rx_discard_until_newline = 1U;
+    app->uart_rx_overrun_count++;
+  }
+
+  while (uart_rx_consumed_count != produced_count)
+  {
+    uint16_t current_pos =
+        (uint16_t)(uart_rx_consumed_count % UART_DMA_RX_BUF_SIZE);
+    rx_byte = usart_get_dma_rx_buf()[current_pos];
+    uart_rx_consumed_count++;
+    usart_set_dma_last_pos((uint16_t)(uart_rx_consumed_count %
+                                      UART_DMA_RX_BUF_SIZE));
+
+    if (uart_rx_discard_until_newline != 0U)
+    {
+      if (rx_byte == '\n')
+      {
+        uart_rx_discard_until_newline = 0U;
+        uart_rx_line_len = 0U;
+      }
+      continue;
+    }
 
     if (rx_byte == '\r')
     {
@@ -131,20 +196,25 @@ void app_protocol_poll_uart_commands(AppState_t *app)
     {
       app->uart_rx_message_valid = false;
       uart_rx_line_len = 0U;
+      uart_rx_discard_until_newline = 1U;
+      app->uart_oversize_line_count++;
     }
   }
 }
 
 /**
  * @brief  组装当前传感器测量上报，并通过 UART 发送。
- * @param  app 应用状态指针（读取全部测量字段）。
- * @note   组包前先更新 RTC 快照，再通过 USART2 发送格式化文本行。
+ * @param  app 应用状态指针（更新 RTC / TX 状态；组包读取一致快照）。
+ * @note   组包前先更新 RTC 快照，再复制 AppState 一致快照；
+ *         格式化文本行只读取该副本，避免跨任务字段撕裂。
  *         报文由 build_sensor_packet() 构建，并由 send_uart_line() 发送。
  */
 /* 组装当前测量报文并通过串口发送。 */
 void app_protocol_send_sensor_report(AppState_t *app)
 {
+  AppState_t snapshot;
   uint16_t payload_len;
+  uint8_t build_overflow;
 
   if (app == NULL)
   {
@@ -152,7 +222,22 @@ void app_protocol_send_sensor_report(AppState_t *app)
   }
 
   app_protocol_update_rtc_snapshot(app);
-  payload_len = build_sensor_packet(app, json_payload, sizeof(json_payload));
+  if (app_state_take_snapshot(app, &snapshot) == 0U)
+  {
+    app->uart_tx_message_valid = false;
+    return;
+  }
+
+  payload_len = build_sensor_packet(&snapshot,
+                                    json_payload,
+                                    sizeof(json_payload),
+                                    &build_overflow);
+  if ((build_overflow != 0U) || (payload_len == 0U))
+  {
+    app->uart_tx_message_valid = false;
+    return;
+  }
+
   (void)send_uart_line(app, json_payload, payload_len);
 }
 
@@ -161,11 +246,13 @@ void app_protocol_send_sensor_report(AppState_t *app)
  * @param  app         应用状态结构体指针。
  * @param  buffer      格式化报文字符串输出缓冲。
  * @param  buffer_size 输出缓冲大小。
- * @return 格式化报文字符串长度（字节），出错时返回 0。
+ * @param  overflow    写回 1 表示缓冲溢出；否则写回 0。
+ * @return 完整报文字符串长度（字节）；参数错误或溢出时返回 0。
  * @note   上报格式向后兼容：旧版上位机可解析前缀字段，
  *         新版上位机使用追加的诊断字段（SQ、PI、R/BAL、
  *         传感器/SD/RTC 诊断）判断可信度。
- *         字段：M,rtc_valid,yyyymmdd,hhmmss,red,ir,...,crash_flag,...,stack_hwm
+ *         当前列数为 160：列 0 为 M，列 1-159 为数据。
+ *         列 102-159 均为 append-only 诊断尾部字段。
  */
 /*
  * 字段顺序兼容旧上位机，不可改变。
@@ -198,7 +285,18 @@ void app_protocol_send_sensor_report(AppState_t *app)
  *   ppg_sqi_score,ppg_sqi_flags,ppg_sqi_low_perfusion_count,ppg_sqi_motion_count,
  *   ppg_sqi_balance_count,ppg_sqi_transition_count,ppg_sqi_ibi_reject_count,
  *   ppg_sqi_amp_reject_count,ppg_sqi_suppressed_count,
- *   ptt_reject_ecg_count,ptt_reject_ppg_count,ptt_reject_range_count,ptt_reject_jump_count
+ *   ptt_reject_ecg_count,ptt_reject_ppg_count,ptt_reject_range_count,ptt_reject_jump_count,
+ *   bpm_invalid_reason,spo2_invalid_reason,ptt_invalid_reason,ppg_last_gate_flags,
+ *   bpm_age_ms,spo2_age_ms,ptt_match_age_ms,output_stale_flags,ppg_output_sample,
+ *   ppg_side_peak_count,ppg_side_current_peak_count,ppg_side_match_count,
+ *   ppg_side_missed_current_count,ppg_side_unmatched_count,
+ *   ppg_side_reject_short_count,ppg_side_reject_refractory_count,ppg_side_reject_range_count,
+ *   ppg_side_last_ibi_ms,ppg_side_last_hr,ppg_side_last_delta_ms,ppg_side_last_block_ms,
+ *   sd_unsynced,sd_sync_error_count,sd_retention_ms,sd_rolling_mode,
+ *   sd_task_heartbeat,tim6_isr_heartbeat,watchdog_fault_count,watchdog_fault_task,
+ *   watchdog_fault_phase,uart_rx_overrun_count,uart_oversize_line_count,
+ *   uart_error_count,uart_dma_restart_count,
+ *   schema_version,field_count,frame_seq
  */
 
 /* ---- 小型 CSV 构建器：避免超长 snprintf，逐字段追加 ---- */
@@ -209,6 +307,14 @@ typedef struct {
   uint8_t  overflow;
 } AppCsvBuilder_t;
 
+/**
+ *******************************************************************************
+ * @brief  初始化 CSV 追加器。
+ * @param  b    追加器状态。
+ * @param  buf  输出缓冲。
+ * @param  size 输出缓冲长度。
+ *******************************************************************************
+ */
 static void app_csv_init(AppCsvBuilder_t *b, char *buf, size_t size)
 {
   if (b == NULL) { return; }
@@ -219,6 +325,15 @@ static void app_csv_init(AppCsvBuilder_t *b, char *buf, size_t size)
   if ((buf != NULL) && (size > 0U)) { buf[0] = '\0'; }
 }
 
+/**
+ *******************************************************************************
+ * @brief  按 printf 格式向 CSV 缓冲追加一段文本。
+ * @param  b   追加器状态。
+ * @param  fmt printf 风格格式串。
+ * @note   一旦发生溢出，overflow 置位并停止后续追加；该前缀仍以 NUL
+ *         结尾，但不是完整 M 帧，最终会由 build_sensor_packet() 丢弃。
+ *******************************************************************************
+ */
 static void app_csv_appendf(AppCsvBuilder_t *b, const char *fmt, ...)
 {
   va_list args;
@@ -244,14 +359,26 @@ static void app_csv_appendf(AppCsvBuilder_t *b, const char *fmt, ...)
     b->overflow = 1U;
   }
 }
-static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t buffer_size)
+static uint16_t build_sensor_packet(const AppState_t *app,
+                                    char *buffer,
+                                    size_t buffer_size,
+                                    uint8_t *overflow)
 {
   AppCsvBuilder_t b;
   uint16_t year = 0U;
   uint8_t month = 0U, date = 0U;
   uint8_t hours = 0U, minutes = 0U, seconds = 0U;
+  uint32_t frame_seq;
 
-  if ((app == NULL) || (buffer == NULL) || (buffer_size == 0U)) { return 0U; }
+  if (overflow != NULL)
+  {
+    *overflow = 0U;
+  }
+
+  if ((app == NULL) || (buffer == NULL) || (buffer_size == 0U) || (overflow == NULL))
+  {
+    return 0U;
+  }
 
   if (app->rtc_read_ok != 0U) {
     year = app->rtc_datetime.year;   month = app->rtc_datetime.month;
@@ -260,6 +387,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   }
 
   app_csv_init(&b, buffer, buffer_size);
+  frame_seq = app_protocol_frame_seq++;
 
   /* 字段顺序必须与注释中声明的一致，旧上位机依赖此顺序解析。 */
   app_csv_appendf(&b, "M,");
@@ -352,7 +480,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%u,", (unsigned int)app->uart_tx_message_valid);
 
   /* -- SD 日志 -- */
-  app_csv_appendf(&b, "%u,",  (unsigned int)(APP_DataLog_IsActive() ? 1U : 0U));
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sd_log_active);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->sd_state);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->sd_error);
   app_csv_appendf(&b, "%lu,", (unsigned long)app->sd_total_written);
@@ -401,7 +529,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%lu,", (unsigned long)app->max_task_heartbeat);
   app_csv_appendf(&b, "%lu,", (unsigned long)app->ui_task_heartbeat);
 
-  /* ECG 质量与诊断 (102-109) */
+  /* ECG 质量与诊断 (102-108) */
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_signal_quality);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_invalid_reason);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_raw_span);
@@ -410,7 +538,7 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%lu,", (unsigned long)app->ecg_qrs_threshold);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ecg_peak_snr_x100);
 
-  /* 追加式尾部诊断字段：保持前序字段顺序，旧上位机仍可按前缀解析。
+  /* 追加式尾部诊断字段 (109-159)：保持前序字段顺序，旧上位机仍可按前缀解析。
    * Append-only diagnostics: keep existing field order stable for old parsers. */
   app_csv_appendf(&b, "%u,", (unsigned int)app->ecg_dma_available_high_watermark);
   app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_sqi_score);
@@ -425,9 +553,71 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
   app_csv_appendf(&b, "%lu,", (unsigned long)app->ptt_reject_ecg_count);
   app_csv_appendf(&b, "%lu,", (unsigned long)app->ptt_reject_ppg_count);
   app_csv_appendf(&b, "%lu,", (unsigned long)app->ptt_reject_range_count);
-  app_csv_appendf(&b, "%lu",  (unsigned long)app->ptt_reject_jump_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ptt_reject_jump_count);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->bpm_invalid_reason);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->spo2_invalid_reason);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ptt_invalid_reason);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_last_gate_flags);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->bpm_age_ms);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->spo2_age_ms);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ptt_match_age_ms);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->output_stale_flags);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_output_sample);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_side_peak_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_side_current_peak_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_side_match_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_side_missed_current_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_side_unmatched_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_side_reject_short_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_side_reject_refractory_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->ppg_side_reject_range_count);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_side_last_ibi_ms);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_side_last_hr);
+  app_csv_appendf(&b, "%d,",  (int)app->ppg_side_last_delta_ms);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->ppg_side_last_block_ms);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sd_unsynced);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sd_sync_error_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sd_retention_ms);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->sd_rolling_mode);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->sd_task_heartbeat);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->tim6_isr_heartbeat);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->watchdog_fault_count);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->watchdog_fault_task);
+  app_csv_appendf(&b, "%u,",  (unsigned int)app->watchdog_fault_phase);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->uart_rx_overrun_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->uart_oversize_line_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->uart_error_count);
+  app_csv_appendf(&b, "%lu,", (unsigned long)app->uart_dma_restart_count);
+  app_csv_appendf(&b, "%u,",  (unsigned int)APP_PROTOCOL_SCHEMA_VERSION);
+  app_csv_appendf(&b, "%u,",  (unsigned int)APP_PROTOCOL_M_FIELD_COUNT);
+  app_csv_appendf(&b, "%lu",  (unsigned long)frame_seq);
+
+  *overflow = b.overflow;
+  if (b.overflow != 0U)
+  {
+    /* 截断前缀不是有效 M 帧，清空首字节并禁止调用方发送。 */
+    buffer[0] = '\0';
+    return 0U;
+  }
 
   return (uint16_t)b.len;
+}
+
+/**
+ * @brief  按 USART2 115200 baud、8N1 的线速计算阻塞发送超时。
+ * @param  payload_len 本次 HAL_UART_Transmit 的字节数。
+ * @return 理论线时长向上取整，再增加 50% 和 20 ms 调度余量。
+ */
+static uint32_t app_uart_tx_timeout_ms(uint16_t payload_len)
+{
+  uint32_t wire_time_ms;
+
+  wire_time_ms = ((((uint32_t)payload_len * APP_PROTOCOL_UART_BITS_PER_BYTE * 1000UL) +
+                   (APP_PROTOCOL_UART_BAUD_BPS - 1UL)) /
+                  APP_PROTOCOL_UART_BAUD_BPS);
+
+  return wire_time_ms + ((wire_time_ms + 1UL) / 2UL) +
+         APP_PROTOCOL_UART_FIXED_MARGIN_MS;
 }
 
 /**
@@ -437,7 +627,8 @@ static uint16_t build_sensor_packet(const AppState_t *app, char *buffer, size_t 
  * @param  payload_len  payload 字符串长度。
  * @return payload 和 CRLF 均发送成功时返回 true，
  *         否则返回 false（同时更新 app->uart_tx_message_valid）。
- * @note   每段发送使用阻塞式 HAL_UART_Transmit，超时 100 ms。
+ * @note   每段发送使用阻塞式 HAL_UART_Transmit；超时按本段长度和
+ *         USART2 115200 baud 的 8N1 线时长计算，并附加调度余量。
  *         静态 CRLF 字节序列会自动附加到末尾。
  */
 /* 通过 USART2 发送一行文本，并在末尾补充 CRLF。 */
@@ -459,7 +650,7 @@ static bool send_uart_line(AppState_t *app, const char *payload, uint16_t payloa
   status = HAL_UART_Transmit(&huart2,
                              (uint8_t *)payload,
                              (uint16_t)payload_len,
-                             STM32_UART_TIMEOUT_MS);
+                             app_uart_tx_timeout_ms(payload_len));
   if (status != HAL_OK)
   {
     app->uart_tx_message_valid = false;
@@ -469,7 +660,7 @@ static bool send_uart_line(AppState_t *app, const char *payload, uint16_t payloa
   status = HAL_UART_Transmit(&huart2,
                              (uint8_t *)line_end,
                              (uint16_t)(sizeof(line_end) - 1U),
-                             STM32_UART_TIMEOUT_MS);
+                             app_uart_tx_timeout_ms((uint16_t)(sizeof(line_end) - 1U)));
   app->uart_tx_message_valid = (status == HAL_OK);
   return app->uart_tx_message_valid;
 }
@@ -522,7 +713,7 @@ static uint8_t app_text_starts_with_keyword(const char *text, const char *keywor
   return 1U;
 }
 
-/* 解析 TIME / SETTIME 命令后面的时间负载。 */
+/* 解析 SETTIME 或旧版 TIME 设置命令后面的时间负载；TIME 不提供查询语义。 */
 static const char *app_get_time_command_payload(const char *line)
 {
   const char *cursor;
@@ -700,7 +891,7 @@ static bool app_process_uart_line(AppState_t *app, const char *line)
     return false;
   }
 
-  /* EEPROM commands: info/dump/reset/setsn/sethw/setmfg/setled */
+  /* EEPROM 命令域优先分派：info/dump/reset/setsn/sethw/setmfg/setled。 */
   if (eeprom_cmd_process(app, line))
   {
     return true;

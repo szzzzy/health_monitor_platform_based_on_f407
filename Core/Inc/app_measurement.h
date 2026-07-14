@@ -1,3 +1,13 @@
+/**
+  ******************************************************************************
+  * @file    app_measurement.h
+  * @brief   MAX30102 测量流水线、手指检测、恢复与周期节拍接口。
+  *
+  * 测量模块负责传感器读取、基线/手指状态、PPG 门控和输出状态协调；
+  * 具体 HRV/RR/SpO2/BPM/PTT 细节分别委托给对应子模块。
+  ******************************************************************************
+  */
+
 #ifndef __APP_MEASUREMENT_H__
 #define __APP_MEASUREMENT_H__
 
@@ -59,10 +69,10 @@ void app_measurement_update_finger_state(AppState_t *app);
 /* 在手指就位时推进 BPM/SpO2 与波形处理。 */
 void app_measurement_process(AppState_t *app);
 /* 统一生成较低频率的“上报/刷新显示”节拍。 */
-void app_measurement_update_periodic_flags(AppState_t *app);
+void app_measurement_service_time(AppState_t *app);
 void app_measurement_recover_sensor(AppState_t *app);
 
-/* 传感器无新样本看门狗超时 (ms)，供 main.c 安全窗口引用 */
+/* 传感器无新样本预警窗口，供 SD 安全窗口判定使用，单位：ms。 */
 #define APP_SENSOR_STALE_WARN_MS          1000U
 
 /* 传感器健康状态：供 OLED / UART 上报显示当前 MAX30102 链路状态 */
@@ -78,7 +88,7 @@ typedef enum
 
 /* MAX30102 无新样本看门狗 — 当 sensor_last_sample_tick 长时间未更新时，
  * 强制执行 I2C 总线恢复 + max30102_init()。
- * 在主循环每轮和基线采集循环中均需调用。 */
+ * 启动基线循环和运行期 MAXtask 均需周期调用。 */
 void app_measurement_service_sensor_watchdog(AppState_t *app);
 
 /* 批量排空 FIFO：一次 I2C 突发读所有可用样本并送入测量管道。

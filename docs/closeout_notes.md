@@ -31,7 +31,9 @@
 - `measurement_active` 门控 —— 手指在传感器上时 SDtask 禁止 I/O
 - ISR 中只做标志位 + 任务通知，零阻塞
 - I2C1 互斥锁：MAXtask 短等待（8ms），低优先级任务放弃
+- `app_state_take_snapshot()`：UI/OLED 和 USART 组包先复制一致快照，再格式化/渲染，避免跨任务读到半更新状态
 - SD 日志采用环形缓冲 + 后台分片写入，不在实时路径做 f_write
+- PPG Elgendi-style 侧路检测只做 A/B 诊断，不替换当前流式 PPG 主检测器
 
 ---
 
@@ -147,6 +149,9 @@ Offset  Size  Field
 - [x] SD 日志失败退避 60s（不反复阻塞）
 - [x] OLED 刷新跳过机制（display_skipped_count + 强制刷新 1s 超时）
 - [x] D9 SCHED 调度诊断页（TIM6 → MAXtask 100 Hz 闭环验证）
+- [x] AppState 一致快照：OLED 渲染和 USART M 帧组包均从同一快照入口读取共享状态
+- [x] USART M 帧追加 `schema_version/field_count/frame_seq`，当前 `schema_version=2`, `field_count=147`
+- [x] PPG 侧路 A/B 计数：主/侧路峰匹配、未匹配、短 block/不应期/范围拒绝均通过 USART 可观察
 
 ---
 

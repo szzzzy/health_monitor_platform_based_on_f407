@@ -2,7 +2,12 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : 主程序入口与应用层调度
+  * @brief          : 系统启动、自检与 RTOS 调度器移交入口
+  *
+  * 启动顺序：HAL/时钟/外设初始化 → 读取复位与崩溃诊断 → 恢复 I2C 总线 →
+  * 初始化 EEPROM、OLED 与 MAX30102 → 采集无手指基线 → 启动 ECG ADC DMA →
+  * 绑定 AppState 并启动 FreeRTOS。调度器运行后，采集、界面、存储和看门狗
+  * 分别由 freertos.c 中的任务负责，本文件不再承担周期业务调度。
   * @attention
   *
   * <h2><center>&copy; Copyright (c) 2026 STMicroelectronics.
@@ -58,10 +63,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define APP_MAIN_LOOP_DELAY_MS      5U
-#define APP_SENSOR_DRAIN_BUDGET     24U
-#define APP_SENSOR_BOOT_RETRY_MS    1000U
-#define APP_DISPLAY_SKIP_THRESHOLD  8U
+#define APP_MAIN_LOOP_DELAY_MS      5U     /* 启动阶段基线采集轮询间隔，单位：ms */
+#define APP_SENSOR_DRAIN_BUDGET     24U    /* 保留的兼容配置；运行期批量预算由测量模块管理 */
+#define APP_SENSOR_BOOT_RETRY_MS    1000U  /* MAX30102 启动失败后的重试间隔，单位：ms */
+#define APP_DISPLAY_SKIP_THRESHOLD  8U     /* 保留的兼容配置；运行期显示门控位于 UI 任务 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -72,23 +77,26 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-volatile uint8_t  tim6_tick_flag = 0;
-static volatile uint32_t tim6_isr_count = 0U;  /* TIM6 ISR 回调计数，仅供调试器观测 */
-static AppState_t app;
+volatile uint8_t  tim6_tick_flag = 0;          /* 100 Hz 节拍到达标志，ISR 写、任务侧诊断读取 */
+static volatile uint32_t tim6_isr_count = 0U;  /* TIM6 ISR 累计次数，用于调度活性诊断 */
+static AppState_t app;                         /* 各 RTOS 任务共享的应用状态唯一实例 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
-/* 初始化共享状态，并让各模块完成自己的默认配置 */
+/** @brief 清零共享状态，并初始化测量、显示和串口协议子模块。 */
 static void app_state_init(AppState_t *app);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-/* 应用层统一初始化入口，main 中只保留调度 */
-/* ---- 初始化共享 AppState 与所有子系统默认值 ---- */
+/**
+ * @brief  初始化共享 AppState 与不访问硬件的子模块状态。
+ * @param  app 应用状态实例；为 NULL 时不执行任何操作。
+ * @note   此时调度器尚未启动，不存在任务并发访问。
+ */
 static void app_state_init(AppState_t *app)
 {
   if (app == NULL)
@@ -127,7 +135,7 @@ int main(void)
 
   /* USER CODE BEGIN Init */
   app_state_init(&app);
-  /* 尽早启用备份域写访问，确保后续 fault handler 可以写 BKP */
+  /* 尽早启用备份域写访问，确保后续故障处理可直接写 RTC 备份寄存器。 */
   APP_Diag_Init();
   /* USER CODE END Init */
 
@@ -149,13 +157,13 @@ int main(void)
   MX_TIM2_Init();
   MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
-  /* RTC 已就绪，读取上一轮崩溃记录 + 活体快照 (BKP 寄存器) */
+  /* RTC 已就绪，读取上一轮崩溃记录与活体快照（RTC 备份寄存器）。 */
   APP_Diag_ReadCrashToAppState(&app);
   APP_Watchdog_Refresh();
   /* TIM6 中断稍后在 RTOS 就绪后启动，避免 ISR 在调度器启动前调用 FreeRTOS API */
   HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 5, 0);
-  /* 启动显示、读取 RTC，并先给出开机状态页面
-   * 先恢复 I2C1 总线，确保 OLED 和 MAX30102 不会因为上电总线卡死而初始化失败。 */
+  /* 启动阶段先尝试释放可能被从设备拉低的 I2C1 总线，再访问 EEPROM、
+   * OLED 和 MAX30102。计数表示恢复尝试次数，不表示本次恢复必然成功。 */
   (void)MX_I2C1_RecoverBus();
   app.i2c_recover_count++;
   eeprom_store_init();
@@ -223,14 +231,14 @@ int main(void)
   app_measurement_reset_runtime();
   last_status_tick = 0U;
 
-  /* SD 卡日志：延迟到首次 APP_DataLog_Service() 时懒启动。
-   * 避免坏卡/无卡在启动阶段阻塞主功能（MAX30102/OLED/RTC/按键/串口）。
-   * 此处仅初始化内部静态变量，不执行硬件访问。 */
+  /* SD 日志采用懒启动：此处只清零 RAM 状态，不挂载文件系统。
+   * 物理卡访问由低优先级 SDtask 在测量安全窗口内执行，避免坏卡或无卡
+   * 阻塞 MAX30102、OLED、RTC、按键和串口的启动流程。 */
   APP_DataLog_Init();
   app_runtime_update_sd_log_status(&app);
   APP_Watchdog_Refresh();
 
-  /* 上电先采集一段"无手指"背景，建立 IR 基线 */
+  /* 上电先采集“无手指”背景，建立后续接触检测使用的 IR 基线。 */
   while (app_measurement_baseline_ready() == 0U)
   {
     app_protocol_poll_uart_commands(&app);
@@ -259,7 +267,7 @@ int main(void)
     HAL_Delay(APP_MAIN_LOOP_DELAY_MS);
   }
 
-  /* 基线就绪后，给后台跟踪器播种并立即发送一帧初始状态 */
+  /* 基线就绪后为运行期跟踪器播种，并立即发送一帧初始状态。 */
   app.baseline_ir = app_measurement_get_baseline_average();
   app.baseline_range_ir = app_measurement_get_baseline_range();
   {
@@ -293,8 +301,8 @@ int main(void)
   app.report_due = 1U;
   app.display_refresh_requested = 1U;
 
-  /* ECG ADC 延后到 PPG 基线完成后启动，
-     避免基线阶段约 5 秒无人消费样本时必然产生 DMA 溢出。 */
+  /* ECG ADC 延后到 PPG 基线完成后启动，避免启动阶段尚无 MAXtask 消费者时
+   * 环形 DMA 缓冲被覆盖。启动后由 TIM2 以 250 Hz 触发 ADC1 采样。 */
   app_ecg_adc_start();
   app_rtos_bind_state(&app);
   /* USER CODE END 2 */
@@ -386,8 +394,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* USER CODE BEGIN Callback 0 */
   if ((htim != NULL) && (htim->Instance == TIM6))
   {
+    /* TIM6 是 PPG/ECG 服务的 100 Hz 软件节拍：ISR 只更新时间戳和就绪标志，
+     * 再用任务通知唤醒 MAXtask；所有 I2C 访问与算法处理均留在任务上下文。 */
     tim6_isr_count++;
     tim6_tick_flag = 1U;
+    /* 默认纯轮询配置下也复用该就绪标志；启用外部 INT 时，EXTI 回调同样置位。 */
     max30102_mark_data_ready_from_isr();
     app_rtos_notify_max_from_isr();
     return;

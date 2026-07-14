@@ -96,6 +96,8 @@ static void app_display_debug_d9_sched(const AppState_t *app);
 static void app_display_debug_d10_ecg_q(const AppState_t *app);
 static void app_display_draw_lines_8(const char line[8][24]);
 static uint32_t app_display_cap_u32(uint32_t value, uint32_t cap);
+static DebugSubPage_t app_display_debug_page_for_normal_page(DisplayPage_t page);
+static const char *app_get_output_reason_label(uint8_t reason_code);
 static const char *app_get_quality_label(const AppState_t *app);
 static const char *app_get_balance_label(uint8_t balance_status);
 static const char *app_get_regular_label(const AppState_t *app);
@@ -245,7 +247,7 @@ void app_display_handle_buttons(AppState_t *app)
     {
       app->saved_normal_page = app->current_page;
       app->page_mode = PAGE_MODE_DEBUG;
-      app->debug_sub_page = DBG_SUB_D1_MAX;
+      app->debug_sub_page = app_display_debug_page_for_normal_page(app->current_page);
     }
     else if (app->page_mode == PAGE_MODE_DEBUG)
     {
@@ -331,12 +333,12 @@ void app_display_handle_buttons(AppState_t *app)
 
 /**
  * @brief  根据当前页面和调试模式渲染主测量页面。
- * @param  app 指向应用状态的指针（页面选择、测量数据）。
+ * @param  app 指向应用状态快照的指针（页面选择、测量数据）。
  * @note   调试模式下，派发到对应的调试子页面渲染器（d1 至 d7）。
  *         正常模式下，派发到当前页面渲染器：PULSE、OXY、VITALS 或 ECG。
  *         如果 app 为 NULL，则立即返回而不渲染。
  */
-/* 根据当前页面与状态，绘制主测量页面。 */
+/* 根据当前页面与快照状态，绘制主测量页面。 */
 void app_display_measurement_page(const AppState_t *app)
 {
   if (app == NULL)
@@ -816,7 +818,7 @@ static void app_display_ecg_quality_page(const AppState_t *app)
 
   (void)snprintf(line0r, sizeof(line0r), "E Q");
 
-  /* reason string */
+  /* 将原因码压缩为适合窄屏右侧显示的短标签。 */
   switch (app->ecg_invalid_reason) {
   case ECG_INVALID_OK:            reason_str = "OK";    break;
   case ECG_INVALID_LEAD_OFF:      reason_str = "LEAD";  break;
@@ -901,6 +903,43 @@ static uint32_t app_display_cap_u32(uint32_t value, uint32_t cap)
   return (value > cap) ? cap : value;
 }
 
+static DebugSubPage_t app_display_debug_page_for_normal_page(DisplayPage_t page)
+{
+  switch (page)
+  {
+  case DISPLAY_PAGE_BPM:
+  case DISPLAY_PAGE_SPO2:
+  case DISPLAY_PAGE_VITALS:
+    return DBG_SUB_D5_ALGO;
+  case DISPLAY_PAGE_ECG:
+    return DBG_SUB_D8_ECG;
+  case DISPLAY_PAGE_ECG_QUALITY:
+    return DBG_SUB_D10_ECG_Q;
+  default:
+    return DBG_SUB_D1_MAX;
+  }
+}
+
+static const char *app_get_output_reason_label(uint8_t reason_code)
+{
+  switch (reason_code)
+  {
+  case APP_OUTPUT_REASON_OK:            return "OK";
+  case APP_OUTPUT_REASON_NO_FINGER:     return "NOF";
+  case APP_OUTPUT_REASON_CONTACT:       return "CNT";
+  case APP_OUTPUT_REASON_LOW_SQ:        return "LSQ";
+  case APP_OUTPUT_REASON_MOTION:        return "MOT";
+  case APP_OUTPUT_REASON_LOW_PERFUSION: return "LPF";
+  case APP_OUTPUT_REASON_BALANCE:       return "BAL";
+  case APP_OUTPUT_REASON_BEAT_UNSTABLE: return "IBI";
+  case APP_OUTPUT_REASON_STALE:         return "STL";
+  case APP_OUTPUT_REASON_ECG:           return "ECG";
+  case APP_OUTPUT_REASON_RANGE:         return "RNG";
+  case APP_OUTPUT_REASON_JUMP:          return "JMP";
+  default:                              return "?";
+  }
+}
+
 static void app_display_debug_d1_max(const AppState_t *app)
 {
   char line[8][24];
@@ -933,7 +972,18 @@ static void app_display_debug_d1_max(const AppState_t *app)
 
   (void)snprintf(line[0], sizeof(line[0]), "D1 MAX H:%s", health_str);
   (void)snprintf(line[1], sizeof(line[1]), "ID-- MODE--");
-  (void)snprintf(line[2], sizeof(line[2]), "SPO2 -- FIFO --");
+  if ((app->spo2_valid != 0U) || (app->spo2_value != 0U))
+  {
+    (void)snprintf(line[2], sizeof(line[2]), "SPO2 %u%s FIFO %u",
+                   (unsigned int)app->spo2_value,
+                   (app->spo2_valid != 0U) ? "" : "?",
+                   (unsigned int)app->sensor_fifo_available_samples);
+  }
+  else
+  {
+    (void)snprintf(line[2], sizeof(line[2]), "SPO2 -- FIFO %u",
+                   (unsigned int)app->sensor_fifo_available_samples);
+  }
   (void)snprintf(line[3], sizeof(line[3]), "LED1 -- LED2 --");
   (void)snprintf(line[4], sizeof(line[4]), "I2C %lu STR %u",
                  (unsigned long)(app->sensor_last_i2c_error > 9999UL ?
@@ -1080,7 +1130,9 @@ static void app_display_debug_d4_ppg_q(const AppState_t *app)
                  (unsigned int)app->motion_artifact, (unsigned int)app->motion_score);
   (void)snprintf(line[6], sizeof(line[6]), "RATIO %u",
                  (unsigned int)app->spo2_ratio_x1000);
-  (void)snprintf(line[7], sizeof(line[7]), "");
+  (void)snprintf(line[7], sizeof(line[7]), "SQI %u F%02X",
+                 (unsigned int)app->ppg_sqi_score,
+                 (unsigned int)app->ppg_sqi_flags);
 
   app_display_draw_lines_8(line);
 }
@@ -1101,10 +1153,12 @@ static void app_display_debug_d5_algo(const AppState_t *app)
   if (app == NULL) { return; }
 
   (void)snprintf(line[0], sizeof(line[0]), "D5 ALGO");
-  (void)snprintf(line[1], sizeof(line[1]), "HR %u V%u",
-                 (unsigned int)app->bpm_value, (unsigned int)app->bpm_valid);
-  (void)snprintf(line[2], sizeof(line[2]), "SPO2 %u V%u",
-                 (unsigned int)app->spo2_value, (unsigned int)app->spo2_valid);
+  (void)snprintf(line[1], sizeof(line[1]), "HR %u V%u %s",
+                 (unsigned int)app->bpm_value, (unsigned int)app->bpm_valid,
+                 app_get_output_reason_label(app->bpm_invalid_reason));
+  (void)snprintf(line[2], sizeof(line[2]), "SPO2 %u V%u %s",
+                 (unsigned int)app->spo2_value, (unsigned int)app->spo2_valid,
+                 app_get_output_reason_label(app->spo2_invalid_reason));
   (void)snprintf(line[3], sizeof(line[3]), "RR %u V%u",
                  (unsigned int)app->rr_bpm, (unsigned int)app->rr_valid);
   (void)snprintf(line[4], sizeof(line[4]), "IBI %u V%u",
@@ -1113,8 +1167,11 @@ static void app_display_debug_d5_algo(const AppState_t *app)
                  (unsigned int)(app->hrv_sdnn_ms > 9999U ? 9999U : app->hrv_sdnn_ms));
   (void)snprintf(line[6], sizeof(line[6]), "RMSSD %u",
                  (unsigned int)(app->hrv_rmssd_ms > 9999U ? 9999U : app->hrv_rmssd_ms));
-  (void)snprintf(line[7], sizeof(line[7]), "PTT %u V%u",
-                 (unsigned int)app->ptt_ms, (unsigned int)app->ptt_valid);
+  (void)snprintf(line[7], sizeof(line[7]), "PT%uV%u AB%lu",
+                 (unsigned int)app->ptt_ms,
+                 (unsigned int)app->ptt_valid,
+                 (unsigned long)(app->ppg_side_match_count > 9999UL ?
+                                 9999UL : app->ppg_side_match_count));
 
   app_display_draw_lines_8(line);
 }

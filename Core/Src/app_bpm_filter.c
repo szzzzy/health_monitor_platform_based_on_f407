@@ -8,12 +8,12 @@
   * 处理流程：
   *   1. 原始值中值滤波 — 3 样本滑动窗口中值，消除单拍野值
   *   2. 候选确认状态机 — 分层阈值判断心率变化幅度
-  *      - 小幅变化 (≤8 bpm)：EMA 平滑 (7/8 旧 + 1/8 新)
-  *      - 中等变化 (≤14 bpm)：需要 3 拍确认，混合平滑
-  *      - 大幅变化 (>14 bpm，如骤升)：需要 5 拍确认，防止干扰误触发
+  *      - 小幅变化 (≤10 bpm)：EMA 平滑（3/4 旧 + 1/4 新）
+  *      - 中等变化 (>10 bpm)：需要 2 拍候选一致后切换
+  *      - 尖峰变化 (>32 bpm)：需要 3 拍候选一致后切换
   *   3. 首次锁定 — 需要 2 拍一致才输出首个有效 BPM
-  *   4. 无效保持 — 连续 30 个无效周期后才清零输出
-  *   5. 步进限幅 — 每拍最多改变 ±5 bpm，防止突变
+  *   4. 无效保持 — 连续 100 个无效更新周期后才清零输出
+  *   5. 步进限幅 — 单次更新最多改变 ±12 bpm，防止确认后的瞬时跳变
   ******************************************************************************
   */
 
@@ -22,24 +22,25 @@
 #include <string.h>
 
 /* 变化幅度分层阈值 (bpm) */
-#define APP_BPM_CONFIRM_DELTA        8U    /* 小幅变化：快速 EMA 跟踪 */
-#define APP_BPM_SWITCH_DELTA         14U   /* 中等变化：需 3 拍候选确认 */
-#define APP_BPM_SPIKE_DELTA          24U   /* 大幅变化：需 5 拍候选确认（防野值） */
+#define APP_BPM_CONFIRM_DELTA        10U   /* 小幅变化：快速 EMA 跟踪 */
+#define APP_BPM_SWITCH_DELTA         18U   /* 中等变化：需候选确认 */
+#define APP_BPM_SPIKE_DELTA          32U   /* 大幅变化：需候选确认（防野值） */
 
 /* 候选确认所需连续拍数 */
-#define APP_BPM_START_CONFIRM_COUNT  2U    /* 首次锁定 */
-#define APP_BPM_SWITCH_CONFIRM_COUNT 3U    /* 中等变化确认 */
-#define APP_BPM_SPIKE_CONFIRM_COUNT  5U    /* 大幅变化确认 */
+#define APP_BPM_START_CONFIRM_COUNT  2U    /* 首次锁定：两拍一致后再上报 */
+#define APP_BPM_SWITCH_CONFIRM_COUNT 2U    /* 中等变化确认 */
+#define APP_BPM_SPIKE_CONFIRM_COUNT  3U    /* 大幅变化确认 */
 
 /* 无效保持与更新限幅 */
-#define APP_BPM_INVALID_HOLD_TICKS   30U   /* 连续无效周期数后清零 */
-#define APP_BPM_MAX_STEP_PER_UPDATE  5U    /* 每拍最大 BPM 变化量 */
+#define APP_BPM_INVALID_HOLD_TICKS   100U  /* 连续无效周期数后清零 */
+#define APP_BPM_MAX_STEP_PER_UPDATE  12U   /* 每拍最大 BPM 变化量 */
 
 /* === 内部辅助函数 ========================================================== */
 static uint8_t app_bpm_abs_diff_u8(uint8_t lhs, uint8_t rhs);
 static uint8_t app_bpm_limit_step(uint8_t current_bpm, uint8_t target_bpm, uint8_t max_step);
 static uint8_t app_bpm_median3_u8(uint8_t a, uint8_t b, uint8_t c);
 static uint8_t app_bpm_filter_raw(AppState_t *app, uint8_t raw_bpm_value);
+static void app_bpm_accept_initial_candidate(AppState_t *app);
 
 /**
  ******************************************************************************
@@ -64,6 +65,9 @@ void app_bpm_filter_reset(AppState_t *app)
   app->bpm_candidate_value = 0U;
   app->bpm_candidate_count = 0U;
   app->bpm_invalid_hold_count = 0U;
+  app->bpm_last_update_tick = 0UL;
+  app->bpm_age_ms = 0xFFFFU;
+  app->bpm_invalid_reason = APP_OUTPUT_REASON_NO_FINGER;
 }
 
 /**
@@ -107,6 +111,10 @@ uint8_t app_bpm_filter_update(AppState_t *app, uint8_t raw_bpm_valid, uint8_t ra
       {
         app->bpm_candidate_value = filtered_bpm;
         app->bpm_candidate_count = 1U;
+        if (app->bpm_candidate_count >= APP_BPM_START_CONFIRM_COUNT)
+        {
+          app_bpm_accept_initial_candidate(app);
+        }
         return 0U;
       }
 
@@ -122,9 +130,7 @@ uint8_t app_bpm_filter_update(AppState_t *app, uint8_t raw_bpm_valid, uint8_t ra
       /* 达到确认次数 → 输出首帧有效 BPM */
       if (app->bpm_candidate_count >= APP_BPM_START_CONFIRM_COUNT)
       {
-        app->bpm_valid = 1U;
-        app->bpm_value = app->bpm_candidate_value;
-        app->bpm_candidate_count = 0U;
+        app_bpm_accept_initial_candidate(app);
       }
 
       return 0U;
@@ -133,13 +139,16 @@ uint8_t app_bpm_filter_update(AppState_t *app, uint8_t raw_bpm_valid, uint8_t ra
     /* 3. 已锁定状态下的变化处理 */
     diff = app_bpm_abs_diff_u8(filtered_bpm, app->bpm_value);
 
-    /* 小幅变化 (≤8 bpm)：直接 EMA 跟踪 (α = 1/8) */
+    /* 小幅变化：直接 EMA 跟踪 (alpha = 1/4) */
     if (diff <= APP_BPM_CONFIRM_DELTA)
     {
-      blended_value = (((uint16_t)app->bpm_value * 7U) + (uint16_t)filtered_bpm + 4U) / 8U;
+      blended_value = (((uint16_t)app->bpm_value * 3U) + (uint16_t)filtered_bpm + 2U) / 4U;
       app->bpm_value = app_bpm_limit_step(app->bpm_value,
                                           (uint8_t)blended_value,
                                           APP_BPM_MAX_STEP_PER_UPDATE);
+      app->bpm_last_update_tick = HAL_GetTick();
+      app->bpm_age_ms = 0U;
+      app->bpm_invalid_reason = APP_OUTPUT_REASON_OK;
       app->bpm_candidate_value = app->bpm_value;
       app->bpm_candidate_count = 0U;
       return 0U;
@@ -174,19 +183,23 @@ uint8_t app_bpm_filter_update(AppState_t *app, uint8_t raw_bpm_valid, uint8_t ra
     {
       if (diff > APP_BPM_SPIKE_DELTA)
       {
-        /* 尖峰变化：保守混合 (87.5% 旧 + 12.5% 新) */
-        blended_value = (((uint16_t)app->bpm_value * 7U) + (uint16_t)app->bpm_candidate_value + 4U) / 8U;
+        /* 尖峰变化：确认后仍保留平滑，但不再过度滞后。 */
+        blended_value = (((uint16_t)app->bpm_value * 5U) +
+                         ((uint16_t)app->bpm_candidate_value * 3U) + 4U) / 8U;
       }
       else
       {
-        /* 中等变化：均衡混合 (62.5% 旧 + 37.5% 新) */
-        blended_value = (((uint16_t)app->bpm_value * 5U) +
-                         ((uint16_t)app->bpm_candidate_value * 3U) + 4U) / 8U;
+        /* 中等变化：确认后快速追踪。 */
+        blended_value = ((uint16_t)app->bpm_value +
+                         (uint16_t)app->bpm_candidate_value + 1U) / 2U;
       }
 
       app->bpm_value = app_bpm_limit_step(app->bpm_value,
                                           (uint8_t)blended_value,
                                           APP_BPM_MAX_STEP_PER_UPDATE);
+      app->bpm_last_update_tick = HAL_GetTick();
+      app->bpm_age_ms = 0U;
+      app->bpm_invalid_reason = APP_OUTPUT_REASON_OK;
       app->bpm_candidate_value = app->bpm_value;
       app->bpm_candidate_count = 0U;
     }
@@ -208,7 +221,23 @@ uint8_t app_bpm_filter_update(AppState_t *app, uint8_t raw_bpm_valid, uint8_t ra
 
   /* 持续无效超时 → 重置所有状态 */
   app_bpm_filter_reset(app);
+  app->bpm_invalid_reason = APP_OUTPUT_REASON_STALE;
   return 1U;
+}
+
+static void app_bpm_accept_initial_candidate(AppState_t *app)
+{
+  if (app == NULL)
+  {
+    return;
+  }
+
+  app->bpm_valid = 1U;
+  app->bpm_value = app->bpm_candidate_value;
+  app->bpm_last_update_tick = HAL_GetTick();
+  app->bpm_age_ms = 0U;
+  app->bpm_invalid_reason = APP_OUTPUT_REASON_OK;
+  app->bpm_candidate_count = 0U;
 }
 
 /* ---- 无符号 8 位绝对值差值 ---- */

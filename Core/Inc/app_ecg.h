@@ -29,10 +29,8 @@ extern "C" {
  * 仅在 RAW=0 且 FILTERED=0 时生效。默认开启，关闭则回退到原始 NORMAL 显示链路。 */
 #define APP_ECG_DEBUG_DISPLAY_VISUAL   1U
 /* 设为 1 以启用 DSP 预处理：50 Hz 陷波 + 10-20 Hz 带通 biquad 级联。
- * 使用单精度浮点 Direct Form I，充分利用 Cortex-M4F 硬件 FPU（单周期乘加）。
- * STM32F103 算力有限难以在 250 Hz 实时运行二阶 IIR 级联，
- * 但 F407 FPU/DSP 余量充足，可同时并行 MAX30102/HCI/OLED 任务。
- * 设为 0 则回退到纯整数一阶 DC+LP 链路（兼容 F103 级别实现）。 */
+ * 使用单精度浮点 Direct Form I，由目标 Cortex-M4F 的硬件 FPU 执行。
+ * 设为 0 则回退到纯整数一阶 DC+LP 链路。 */
 #define APP_ECG_DSP_PREPROCESS         1U
 
 /* 设为 1 以每 250 个 ECG 样本通过 huart2 输出一次调试统计行。
@@ -117,7 +115,7 @@ void app_ecg_get_debug_snapshot(const AppState_t *app,
                                 AppEcgDebugSnapshot_t *out);
 
 /* 消耗 DMA 缓冲区中所有待处理样本，推进 ECG 流水线。
- * 应在主循环每 10 ms 节拍调用一次。
+ * 由 MAXtask 在 TIM6 10 ms 节拍或通知超时唤醒后调用。
  * 返回非零表示本轮检测到至少一个有效 R 峰。 */
 uint8_t app_ecg_process_samples(AppState_t *app);
 

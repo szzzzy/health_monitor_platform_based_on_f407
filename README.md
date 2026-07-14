@@ -116,6 +116,22 @@ hysteresis, physiological IBI range checks, median IBI jump checks, amplitude dr
 and motion/quality checks. The new SQI path records why candidate beats were rejected and exposes
 IBI/amplitude rejection counters in logs.
 
+## PPG 侧路 A/B 检测 / PPG Side A/B Detector
+
+新增 `Core/Inc/app_ppg_side_elgendi.h` 和 `Core/Src/app_ppg_side_elgendi.c`，实现
+Elgendi-style 双移动平均侧路检测。该路径使用 100 Hz 下约 11 点 `MApeak` 与 67 点
+`MAbeat`、绝对能量、动态 offset 阈值、最小 block 宽度、不应期和 IBI 范围检查。
+
+The side detector uses an Elgendi-style dual-moving-average path with 11-sample `MApeak`,
+67-sample `MAbeat`, absolute energy, bounded offset thresholding, block-width checks,
+refractory logic, and IBI-range checks.
+
+它只输出 A/B 诊断计数：主/侧路峰 +/-150 ms 匹配数、主峰未匹配数、侧路未匹配数、
+短 block/不应期/范围拒绝数、侧路最近 IBI/HR/匹配 delta。它不写 `bpm_valid`、
+`spo2_valid`、`ptt_valid`，也不替换生产检测器。
+
+It only emits A/B diagnostics and never writes `bpm_valid`, `spo2_valid`, or `ptt_valid`.
+
 ## ECG QRS 链路 / ECG QRS Path
 
 ECG 链路保持原有实现：250 Hz ADC DMA、去直流、平滑、可选 50 Hz 陷波和 10-20 Hz 带通、
@@ -149,10 +165,13 @@ PTT is in the trusted `80-350 ms` range, and the value does not jump excessively
 
 USART2 使用追加式 CSV 风格 `M` 帧。旧字段顺序保持不变，本次只在
 `ecg_dma_available_high_watermark` 之后追加诊断字段，旧上位机可继续按稳定前缀解析。
+当前完整帧为 147 列（列 0 为 `M`），最后三列为 `schema_version=2`、
+`field_count=147` 和递增 `frame_seq`。
 
 USART2 sends append-only CSV-style `M` frames. Existing field order is unchanged. This branch
 only appends diagnostics after `ecg_dma_available_high_watermark`, so older host tools can keep
-parsing the stable prefix.
+parsing the stable prefix. The full frame now has 147 columns including column 0 `M`; the last
+three fields are `schema_version=2`, `field_count=147`, and a monotonic `frame_seq`.
 
 | Index | Field | 中文说明 / Description |
 | ---: | --- | --- |
@@ -169,6 +188,47 @@ parsing the stable prefix.
 | 120 | `ptt_reject_ppg_count` | PPG 侧 PTT 拒绝计数 / PPG-side PTT rejects |
 | 121 | `ptt_reject_range_count` | PTT 范围拒绝计数 / PTT range rejects |
 | 122 | `ptt_reject_jump_count` | PTT 突跳拒绝计数 / PTT jump rejects |
+| 123 | `bpm_invalid_reason` | BPM 最近一次无效原因 / latest BPM invalid reason |
+| 124 | `spo2_invalid_reason` | SpO2 最近一次无效原因 / latest SpO2 invalid reason |
+| 125 | `ptt_invalid_reason` | PTT 最近一次拒绝原因 / latest PTT reject reason |
+| 126 | `ppg_last_gate_flags` | 最近 PPG SQI 门控 flags / latest PPG SQI gate flags |
+| 127 | `bpm_age_ms` | BPM 距最近接受更新的年龄 / BPM age since accepted update |
+| 128 | `spo2_age_ms` | SpO2 距最近接受更新的年龄 / SpO2 age since accepted update |
+| 129 | `ptt_match_age_ms` | PTT 匹配时 PPG 峰年龄 / PTT PPG-peak age at match |
+| 130 | `output_stale_flags` | 输出陈旧 flags：bit0 BPM, bit1 SpO2, bit2 PTT |
+| 131 | `ppg_output_sample` | 最近主 PPG beat 样本号 / latest production PPG beat sample |
+| 132 | `ppg_side_peak_count` | Elgendi 侧路接受峰计数 / accepted side peaks |
+| 133 | `ppg_side_current_peak_count` | 主检测器接受峰计数 / production accepted peaks |
+| 134 | `ppg_side_match_count` | 主/侧路 +/-150ms 匹配计数 / matched peaks |
+| 135 | `ppg_side_missed_current_count` | 主峰未被侧路匹配计数 / production peaks missed by side |
+| 136 | `ppg_side_unmatched_count` | 侧路峰未匹配主峰计数 / side peaks unmatched to production |
+| 137 | `ppg_side_reject_short_count` | 侧路短 block 拒绝计数 / short-block rejects |
+| 138 | `ppg_side_reject_refractory_count` | 侧路不应期拒绝计数 / refractory rejects |
+| 139 | `ppg_side_reject_range_count` | 侧路 IBI 范围拒绝计数 / IBI-range rejects |
+| 140 | `ppg_side_last_ibi_ms` | 侧路最近 IBI / latest side IBI |
+| 141 | `ppg_side_last_hr` | 侧路最近 HR / latest side HR |
+| 142 | `ppg_side_last_delta_ms` | 侧路峰与主峰匹配时间差 / side-production peak delta |
+| 143 | `ppg_side_last_block_ms` | 侧路最近接受 block 宽度 / latest accepted side block width |
+| 144 | `schema_version` | 协议 schema 版本，当前为 2 / protocol schema version |
+| 145 | `field_count` | 完整列数，当前为 147 / complete column count |
+| 146 | `frame_seq` | M 帧递增序号 / monotonic M-frame sequence |
+
+输出原因码 / output reason codes:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | OK |
+| 1 | no finger |
+| 2 | contact settling |
+| 3 | low signal quality |
+| 4 | motion |
+| 5 | low perfusion |
+| 6 | RED/IR balance |
+| 7 | beat unstable |
+| 8 | stale/no recent update |
+| 9 | ECG-side PTT reject |
+| 10 | PTT range reject |
+| 11 | PTT jump reject |
 
 ## SD 二进制日志 / SD Binary Log
 

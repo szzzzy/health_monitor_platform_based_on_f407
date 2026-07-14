@@ -11,8 +11,8 @@
   *   5. 传感器恢复（连续 I2C 错误超阈值后重建初始化）
   *   6. 200ms 周期上报/刷新标志管理
   *
-  * 本模块不直接操作 OLED / SD / UART — 只更新 AppState 字段，
-  * 由 main.c 的调度循环统一驱动显示和上报。
+  * 本模块不执行 OLED、物理 SD I/O 或 UART 发送；它更新 AppState，并把原始
+  * 日志记录压入 RAM 环形缓冲。显示/上报由 Uitask 驱动，写卡由 SDtask 驱动。
   ******************************************************************************
   */
 
@@ -27,6 +27,7 @@
 #include "app_motion.h"
 #include "app_oxy_status.h"
 #include "app_ppg_pulse.h"
+#include "app_ppg_side_elgendi.h"
 #include "app_ppg_sqi.h"
 #include "app_ppg_signal.h"
 #include "app_ptt.h"
@@ -44,7 +45,7 @@
 /* 信号质量下限：低于此值抑制 SpO2 输出 */
 #define APP_SIGNAL_QUALITY_MIN_FOR_SPO2   30U
 /* 信号质量下限：低于此值抑制 BPM 输出 */
-#define APP_SIGNAL_QUALITY_MIN_FOR_BPM    25U
+#define APP_SIGNAL_QUALITY_MIN_FOR_BPM    22U
 /* 高级指标超时：无新脉搏超过此窗口则清零 HRV/RR */
 #define APP_ADVANCED_PULSE_STALE_SAMPLES  (MAX30102_ALGO_SAMPLE_RATE_HZ * 8U)
 /* 手指接触稳定倒计数：避免接触瞬态污染检测器 */
@@ -66,6 +67,10 @@
 #define APP_SENSOR_STALE_TIMEOUT_MS       3000U
 #define APP_SENSOR_STALE_CONFIRM_INTERVAL_MS 1000U
 #define APP_SENSOR_STALE_CONFIRM_COUNT       3U
+#define APP_OUTPUT_BPM_STALE_MS           3000U
+#define APP_OUTPUT_SPO2_STALE_MS          8000U
+#define APP_OUTPUT_PTT_STALE_MS           3000U
+#define APP_STATUS_REPORT_PERIOD_MS        200U
 /* 两次恢复尝试之间的最小间隔 (ms) */
 #define APP_SENSOR_RECOVERY_RETRY_MS      5000U
 #define APP_SENSOR_RECOVERY_INIT_ATTEMPTS 2U
@@ -99,11 +104,14 @@ static struct
   uint32_t sample;
 } spo2_beat_state;
 static uint8_t hr_fusion_mismatch_count;
-/* 延迟的主循环必须在总线恢复前有机会耗尽 FIFO。 */
+/* 两次恢复之间留出时间，使 MAXtask 有机会先排空暂时积压的 FIFO。 */
 static uint32_t sensor_last_recovery_tick = 0UL;
 static uint32_t sensor_last_stale_probe_tick = 0UL;
 static uint8_t  sensor_stale_probe_count = 0U;
 static uint8_t  sensor_recovery_fail_count = 0U;
+static uint8_t  measurement_time_initialized = 0U;
+static uint8_t  measurement_last_sensor_health = 0U;
+static uint32_t measurement_last_report_tick = 0UL;
 
 static void app_reset_measurement_outputs(AppState_t *app);
 static void app_invalidate_advanced_outputs(AppState_t *app);
@@ -123,6 +131,14 @@ static uint16_t app_measurement_spo2_select_ratio(void);
 static uint8_t app_measurement_spo2_from_ratio(uint16_t ratio_x1000,
                                                uint8_t *spo2_value);
 static void app_measurement_update_hr_fusion(AppState_t *app);
+/* 将当前门控状态映射到上报用 reason code；不改变滤波器状态。 */
+static uint8_t app_measurement_bpm_gate_reason(const AppState_t *app);
+static uint8_t app_measurement_spo2_gate_reason(const AppState_t *app);
+/* 输出年龄/陈旧标志维护，供 OLED/USART 判断旧值可信度。 */
+static uint16_t app_measurement_elapsed_ms16(uint32_t now, uint32_t tick);
+static void app_measurement_update_output_age(AppState_t *app);
+static void app_measurement_reset_sampling_continuity(AppState_t *app,
+                                                       uint8_t invalid_reason);
 
 /**
  ******************************************************************************
@@ -137,6 +153,7 @@ void app_measurement_init_state(AppState_t *app)
 {
   app_ppg_signal_init_state(app);
   app_ppg_sqi_reset(app);
+  app_ppg_side_elgendi_reset(app);
 }
 
 /**
@@ -159,12 +176,15 @@ void app_measurement_reset_runtime(void)
   app_spo2_filter_reset(NULL);
   app_motion_reset(NULL);
   app_ppg_sqi_reset(NULL);
+  app_ppg_side_elgendi_reset(NULL);
   app_ppg_signal_reset_envelope();
   app_reset_advanced_metrics(NULL);
   app_display_reset_waveforms();
   sensor_last_stale_probe_tick = 0UL;
   sensor_stale_probe_count = 0U;
   sensor_recovery_fail_count = 0U;
+  measurement_time_initialized = 0U;
+  measurement_last_report_tick = 0UL;
 }
 
 /*
@@ -393,7 +413,7 @@ static void app_measurement_process_parsed_sample(AppState_t *app,
 }
 
 /*
- * 主循环传感器读取入口 — 从 MAX30102 FIFO 读取一个 SpO2 样本。
+ * 单样本传感器读取入口 — 从 MAX30102 FIFO 读取一个 RED/IR 样本。
  *
  * 流程：
  *   1. DMA 读取 FIFO（6 字节/RED+IR）
@@ -600,14 +620,16 @@ void app_measurement_update_finger_state(AppState_t *app)
  *   1. 接触稳定倒计数（warm-up 到期时重置全部高级算法状态）
  *   2. SpO2 窗口更新 → 获取滤波后波形样本 → 送入 OLED 波形缓冲
  *   3. 信号质量 + PI 指标计算 (max30102_get_signal_metrics)
- *   4. 运动伪影检测 (app_motion_update_artifact)
+ *   4. PPG SQI / 运动伪影检测，先解释质量再门控输出
  *   5. 运动期间冻结 BPM/SpO2/RR/HRV 输出
  *   6. 基于搏动的 PI 更新（从已接受搏动的峰谷幅度计算）
- *   7. PPGA 脉搏脉冲检测 (app_ppg_pulse_update) → IBI → HRV
- *   8. SpO2 原始值计算 → 滤波器平滑 → 写 AppState
- *   9. BPM 抽头评估 → 时域峰值检测 + 自相关交叉验证 → 滤波器平滑
+ *   7. 侧路 Elgendi 检测器 A/B 统计（只诊断，不写正式输出）
+ *   8. PPG 主脉搏检测 (app_ppg_pulse_update) → IBI → HRV/PTT
+ *   9. SpO2 原始值计算 → 滤波器平滑 → 写 AppState
+ *  10. BPM 抽头评估 → 时域峰值检测 + 自相关交叉验证 → 滤波器平滑
  *
- * 手指未就位时直接返回，不做处理。
+ * 手指未就位时直接返回，不做处理。所有 valid/reason/age 字段通过
+ * app_measurement_update_output_age() 在周期节拍上补齐解释语义。
  */
 void app_measurement_process(AppState_t *app)
 {
@@ -623,8 +645,10 @@ void app_measurement_process(AppState_t *app)
   uint8_t beat_spo2_valid = 0U;
   uint8_t beat_spo2_value = 0U;
   uint8_t signal_quality = 0U;
+  uint8_t filtered_valid = 0U;
   int32_t red_waveform_sample = 0;
   int32_t ir_waveform_sample = 0;
+  uint32_t current_sample;
 
   if (app == NULL)
   {
@@ -661,14 +685,17 @@ void app_measurement_process(AppState_t *app)
       bpm_update_decimator = 0U;
       app_measurement_reset_beat_states();
       app_ppg_sqi_reset(app);
+      app_ppg_side_elgendi_reset(app);
     }
   }
 
   max30102_spo2_add_sample(&spo2_state, app->red_value, app->ir_value);
+  current_sample = spo2_state.total_samples - 1U;
   if (max30102_spo2_get_latest_filtered(&spo2_state,
                                          &red_waveform_sample,
                                          &ir_waveform_sample) != 0U)
   {
+    filtered_valid = 1U;
     app_display_add_ir_sample(ir_waveform_sample);
     app_display_add_red_sample(red_waveform_sample);
   }
@@ -688,6 +715,7 @@ void app_measurement_process(AppState_t *app)
     /* SQI 依赖运动标志和 PPG 窗口指标；先算 side score，再只向下钳制 signal_quality。 */
     app_ppg_sqi_update_window(app, &signal_metrics, signal_quality);
     app_ppg_sqi_apply_quality_gate(app);
+    app->ppg_last_gate_flags = app->ppg_sqi_flags;
   }
   else
   {
@@ -695,6 +723,7 @@ void app_measurement_process(AppState_t *app)
     app_motion_update_artifact(app, NULL, 0U);
     /* 无有效窗口时清除 SQI 输出，避免旧窗口的 flags 延续到 PLACE FINGER/等待阶段。 */
     app_ppg_sqi_update_window(app, NULL, 0U);
+    app->ppg_last_gate_flags = 0U;
     app_invalidate_advanced_outputs(app);
   }
 
@@ -707,6 +736,8 @@ void app_measurement_process(AppState_t *app)
     else
     {
       app->bpm_valid = 0U;
+      app->bpm_invalid_reason = APP_OUTPUT_REASON_MOTION;
+      app->spo2_invalid_reason = APP_OUTPUT_REASON_MOTION;
       app_spo2_filter_update_output(app, 0U, 0U);
       app_invalidate_advanced_outputs(app);
       app_measurement_reset_beat_states();
@@ -725,7 +756,7 @@ void app_measurement_process(AppState_t *app)
       app->rr_valid = 0U;
     }
 
-    if (app_hrv_is_peak_stale(spo2_state.total_samples, APP_ADVANCED_PULSE_STALE_SAMPLES) != 0U)
+    if (app_hrv_is_peak_stale(current_sample, APP_ADVANCED_PULSE_STALE_SAMPLES) != 0U)
     {
       app_invalidate_advanced_outputs(app);
     }
@@ -743,14 +774,22 @@ void app_measurement_process(AppState_t *app)
     }
 
     if ((app->last_beat_sample != 0U) &&
-        ((spo2_state.total_samples - app->last_beat_sample) > APP_PI_STALE_SAMPLES))
+        ((current_sample - app->last_beat_sample) > APP_PI_STALE_SAMPLES))
     {
       app->ir_pi_ac_ema_valid = 0U;
     }
 
-    if (app_ppg_pulse_update(app, ir_waveform_sample, spo2_state.total_samples, &pulse_info) != 0U)
+    /* 侧路检测器只读同一条 IR AC 波形，输出 ppg_side_* A/B 诊断计数。 */
+    if (filtered_valid != 0U)
     {
-      if (app_ppg_pulse_process_metrics(app, &pulse_info, spo2_state.total_samples) != 0U)
+      app_ppg_side_elgendi_update(app,
+                                  ir_waveform_sample,
+                                  current_sample);
+    }
+
+    if (app_ppg_pulse_update(app, ir_waveform_sample, current_sample, &pulse_info) != 0U)
+    {
+      if (app_ppg_pulse_process_metrics(app, &pulse_info, current_sample) != 0U)
       {
         uint8_t beat_bpm;
 
@@ -758,6 +797,10 @@ void app_measurement_process(AppState_t *app)
         app_ppg_sqi_note_accepted_beat(app,
                                        pulse_info.latest_ibi_ms,
                                        pulse_info.beat_amplitude);
+        app_ppg_side_elgendi_note_current_peak(app,
+                                               pulse_info.latest_peak_sample,
+                                               pulse_info.latest_ibi_ms);
+        app->ppg_output_sample = pulse_info.latest_peak_sample;
 
         if (app_measurement_bpm_from_ibi(pulse_info.latest_ibi_ms, &beat_bpm) != 0U)
         {
@@ -792,17 +835,19 @@ void app_measurement_process(AppState_t *app)
          (app_ppg_sqi_allows_spo2(app) == 0U)))
     {
       raw_spo2_valid = 0U;
+      app->spo2_invalid_reason = app_measurement_spo2_gate_reason(app);
     }
     if (app->contact_settle_samples == 0U)
     {
       if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2) ||
           (app_ppg_sqi_allows_spo2(app) == 0U) ||
           ((beat_spo2_attempted != 0U) &&
-           (app_measurement_spo2_beat_recent(spo2_state.total_samples) != 0U)))
+           (app_measurement_spo2_beat_recent(current_sample) != 0U)))
       {
+        app->spo2_invalid_reason = app_measurement_spo2_gate_reason(app);
         app_spo2_filter_update_output(app, 0U, 0U);
       }
-      else if (app_measurement_spo2_beat_recent(spo2_state.total_samples) == 0U)
+      else if (app_measurement_spo2_beat_recent(current_sample) == 0U)
       {
         app_spo2_filter_update_output(app, raw_spo2_valid, raw_spo2_value);
       }
@@ -827,11 +872,12 @@ void app_measurement_process(AppState_t *app)
       acorr_bpm_valid = max30102_autocorr_bpm(&spo2_state, &acorr_bpm);
     }
 
-    if (app_measurement_ppg_beat_bpm_recent(spo2_state.total_samples) != 0U)
+    if (app_measurement_ppg_beat_bpm_recent(current_sample) != 0U)
     {
       if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM) ||
           (app_ppg_sqi_allows_hr(app) == 0U))
       {
+        app->bpm_invalid_reason = app_measurement_bpm_gate_reason(app);
         (void)app_bpm_filter_update(app, 0U, 0U);
         app->rr_valid = 0U;
       }
@@ -860,12 +906,14 @@ void app_measurement_process(AppState_t *app)
     {
       raw_bpm_valid = 0U;
       pulse_info.beat_valid = 0U;
+      app->bpm_invalid_reason = app_measurement_bpm_gate_reason(app);
     }
 
     (void)pulse_info.beat_valid;
     if ((app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM) ||
         (app_ppg_sqi_allows_hr(app) == 0U))
     {
+      app->bpm_invalid_reason = app_measurement_bpm_gate_reason(app);
       app->rr_valid = 0U;
     }
 
@@ -879,30 +927,48 @@ void app_measurement_process(AppState_t *app)
 
 /**
  ******************************************************************************
- * @brief  在 20 个样本（200 毫秒）节拍上更新周期性标志。
+ * @brief  按 200 ms 运行时间更新周期性上报与显示请求标志。
  * @param  app 指向共享应用状态。
  * @return 无。
- * @note   在主循环中每个样本后调用。设置 report_due 和
- *         display_refresh_requested，每 20 次调用使协议上报
- *         和 OLED 刷新以约 5 Hz 运行，与采样率无关。
+ * @note   MAXtask 每个服务周期调用。函数使用 HAL Tick 判断绝对时间，因此
+ *         FIFO 批量大小或任务偶发延迟不会累计改变约 5 Hz 的请求节拍。
  ******************************************************************************
  */
-void app_measurement_update_periodic_flags(AppState_t *app)
+void app_measurement_service_time(AppState_t *app)
 {
+  uint32_t now;
+
   if (app == NULL)
   {
     return;
   }
 
-  app->refresh_div++;
-  if (app->refresh_div < 20U)
+  now = HAL_GetTick();
+  app_measurement_update_output_age(app);
+
+  if (measurement_time_initialized == 0U)
   {
+    measurement_time_initialized = 1U;
+    measurement_last_report_tick = now;
+    measurement_last_sensor_health = app->sensor_health;
+    app->report_due = 1U;
+    app->display_refresh_requested = 1U;
     return;
   }
 
-  app->refresh_div = 0U;
-  app->report_due = 1U;
-  app->display_refresh_requested = 1U;
+  if (app->sensor_health != measurement_last_sensor_health)
+  {
+    measurement_last_sensor_health = app->sensor_health;
+    app->report_due = 1U;
+    app->display_refresh_requested = 1U;
+  }
+
+  if ((now - measurement_last_report_tick) >= APP_STATUS_REPORT_PERIOD_MS)
+  {
+    measurement_last_report_tick = now;
+    app->report_due = 1U;
+    app->display_refresh_requested = 1U;
+  }
 }
 
 static void app_measurement_reset_beat_states(void)
@@ -1226,11 +1292,242 @@ static void app_measurement_update_hr_fusion(AppState_t *app)
   }
 }
 
+/**
+ *******************************************************************************
+ * @brief  将当前 BPM 门控状态映射为统一输出原因码。
+ * @param  app AppState 指针。
+ * @return APP_OUTPUT_REASON_* 原因码。
+ * @note   只解释最近一次 BPM 无效/陈旧的原因，不推进 BPM 滤波器。
+ *******************************************************************************
+ */
+static uint8_t app_measurement_bpm_gate_reason(const AppState_t *app)
+{
+  if (app == NULL)
+  {
+    return APP_OUTPUT_REASON_STALE;
+  }
+  if (app->finger_present == 0U)
+  {
+    return APP_OUTPUT_REASON_NO_FINGER;
+  }
+  if (app->contact_settle_samples > 0U)
+  {
+    return APP_OUTPUT_REASON_CONTACT;
+  }
+  if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_MOTION) != 0U)
+  {
+    return APP_OUTPUT_REASON_MOTION;
+  }
+  if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_TRANSITION) != 0U)
+  {
+    return APP_OUTPUT_REASON_CONTACT;
+  }
+  if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_BPM)
+  {
+    return APP_OUTPUT_REASON_LOW_SQ;
+  }
+
+  return APP_OUTPUT_REASON_STALE;
+}
+
+/**
+ *******************************************************************************
+ * @brief  将当前 SpO2 门控状态映射为统一输出原因码。
+ * @param  app AppState 指针。
+ * @return APP_OUTPUT_REASON_* 原因码。
+ * @note   SpO2 对低灌注、RED/IR 平衡和接触变化更敏感，因此优先
+ *         映射 SQI flags，再回退到 signal_quality / STALE。
+ *******************************************************************************
+ */
+static uint8_t app_measurement_spo2_gate_reason(const AppState_t *app)
+{
+  if (app == NULL)
+  {
+    return APP_OUTPUT_REASON_STALE;
+  }
+  if (app->finger_present == 0U)
+  {
+    return APP_OUTPUT_REASON_NO_FINGER;
+  }
+  if (app->contact_settle_samples > 0U)
+  {
+    return APP_OUTPUT_REASON_CONTACT;
+  }
+  if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_LOW_PERFUSION) != 0U)
+  {
+    return APP_OUTPUT_REASON_LOW_PERFUSION;
+  }
+  if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_MOTION) != 0U)
+  {
+    return APP_OUTPUT_REASON_MOTION;
+  }
+  if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_BALANCE) != 0U)
+  {
+    return APP_OUTPUT_REASON_BALANCE;
+  }
+  if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_TRANSITION) != 0U)
+  {
+    return APP_OUTPUT_REASON_CONTACT;
+  }
+  if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_BEAT_UNSTABLE) != 0U)
+  {
+    return APP_OUTPUT_REASON_BEAT_UNSTABLE;
+  }
+  if (app->signal_quality < APP_SIGNAL_QUALITY_MIN_FOR_SPO2)
+  {
+    return APP_OUTPUT_REASON_LOW_SQ;
+  }
+
+  return APP_OUTPUT_REASON_STALE;
+}
+
+/**
+ *******************************************************************************
+ * @brief  计算当前 tick 与上次更新时间的年龄，并钳位到 uint16。
+ * @param  now  当前 HAL_GetTick()。
+ * @param  tick 上次有效输出的 tick；0 表示从未更新。
+ * @return 年龄 ms，最大 0xFFFF；tick 为 0 时返回 0xFFFF。
+ *******************************************************************************
+ */
+static uint16_t app_measurement_elapsed_ms16(uint32_t now, uint32_t tick)
+{
+  uint32_t age;
+
+  if (tick == 0UL)
+  {
+    return 0xFFFFU;
+  }
+
+  /* 无符号减法按模 2^32 运算，可在 HAL Tick 单次回绕后保持正确的短时差。 */
+  age = now - tick;
+  return (age > 0xFFFFUL) ? 0xFFFFU : (uint16_t)age;
+}
+
+/**
+ *******************************************************************************
+ * @brief  维护 BPM/SpO2/PTT 输出年龄和陈旧标志。
+ * @param  app AppState 指针。
+ * @note   age 字段回答“这个数值多久没刷新”；reason 字段回答
+ *         “为什么当前无效”。PTT 的 ptt_match_age_ms 保留为匹配瞬间
+ *         PPG 峰的延迟，不在此处覆盖。
+ *******************************************************************************
+ */
+static void app_measurement_update_output_age(AppState_t *app)
+{
+  uint32_t now;
+  uint16_t ptt_age_ms;
+
+  if (app == NULL)
+  {
+    return;
+  }
+
+  now = HAL_GetTick();
+  app->output_stale_flags = 0U;
+
+  app->bpm_age_ms = app_measurement_elapsed_ms16(now, app->bpm_last_update_tick);
+  app->spo2_age_ms = app_measurement_elapsed_ms16(now, app->spo2_last_update_tick);
+  ptt_age_ms = app_measurement_elapsed_ms16(now, app->ptt_last_update_tick);
+
+  if ((app->bpm_last_update_tick == 0UL) ||
+      ((uint32_t)app->bpm_age_ms > APP_OUTPUT_BPM_STALE_MS))
+  {
+    app->output_stale_flags |= APP_OUTPUT_STALE_BPM;
+    app->bpm_valid = 0U;
+    app->bpm_invalid_reason = app_measurement_bpm_gate_reason(app);
+  }
+
+  if ((app->spo2_last_update_tick == 0UL) ||
+      ((uint32_t)app->spo2_age_ms > APP_OUTPUT_SPO2_STALE_MS))
+  {
+    app->output_stale_flags |= APP_OUTPUT_STALE_SPO2;
+    app->spo2_valid = 0U;
+    app->spo2_invalid_reason = app_measurement_spo2_gate_reason(app);
+  }
+
+  if ((app->ptt_last_update_tick == 0UL) ||
+      ((uint32_t)ptt_age_ms > APP_OUTPUT_PTT_STALE_MS))
+  {
+    app->output_stale_flags |= APP_OUTPUT_STALE_PTT;
+    app->ptt_valid = 0U;
+    if (app->finger_present == 0U)
+    {
+      app->ptt_invalid_reason = APP_OUTPUT_REASON_NO_FINGER;
+    }
+    else if (app->contact_settle_samples > 0U)
+    {
+      app->ptt_invalid_reason = APP_OUTPUT_REASON_CONTACT;
+    }
+    else if ((app->ecg_valid == 0U) || (app->ecg_lead_off != 0U))
+    {
+      app->ptt_invalid_reason = APP_OUTPUT_REASON_ECG;
+    }
+    else
+    {
+      app->ptt_invalid_reason = APP_OUTPUT_REASON_STALE;
+    }
+  }
+}
+
+static void app_measurement_reset_sampling_continuity(AppState_t *app,
+                                                       uint8_t invalid_reason)
+{
+  if (app == NULL)
+  {
+    return;
+  }
+
+  max30102_spo2_reset(&spo2_state);
+  app_ppg_pulse_reset();
+  app_hrv_reset(app);
+  app_rr_reset(app);
+  app_bpm_filter_reset(app);
+  app_spo2_filter_reset(app);
+  app_motion_reset(app);
+  app_ppg_sqi_reset(app);
+  app_ppg_side_elgendi_reset(app);
+  app_ptt_reset(app);
+  app_measurement_reset_beat_states();
+  app_display_reset_waveforms();
+  bpm_update_decimator = 0U;
+
+  app->bpm_valid = 0U;
+  app->spo2_valid = 0U;
+  app->ptt_valid = 0U;
+  app->ibi_valid = 0U;
+  app->hrv_valid = 0U;
+  app->rr_valid = 0U;
+  app->bpm_invalid_reason = invalid_reason;
+  app->spo2_invalid_reason = invalid_reason;
+  app->ptt_invalid_reason = invalid_reason;
+  app->bpm_last_update_tick = 0UL;
+  app->spo2_last_update_tick = 0UL;
+  app->ptt_last_update_tick = 0UL;
+  app->bpm_age_ms = 0xFFFFU;
+  app->spo2_age_ms = 0xFFFFU;
+  app->ptt_match_age_ms = 0xFFFFU;
+  app->output_stale_flags = APP_OUTPUT_STALE_BPM |
+                            APP_OUTPUT_STALE_SPO2 |
+                            APP_OUTPUT_STALE_PTT;
+  app->ir_pi_ac_ema = 0U;
+  app->ir_pi_ac_ema_valid = 0U;
+  app->last_beat_sample = 0U;
+  app->ppg_output_sample = 0U;
+
+  if (app->finger_present != 0U)
+  {
+    app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
+  }
+
+  app->report_due = 1U;
+  app->display_refresh_requested = 1U;
+}
+
 /*
- * 批量排空 FIFO — 替代原 main.c 中 while(budget--) 单样本循环。
+ * 批量排空 FIFO — 一次 I2C 突发读所有当前可用样本，再逐个推进测量管道。
  * 一次 I2C 突发读所有可用样本，逐个送入测量管道。
  *
- * 返回处理的样本数。调用方（main.c）用返回值决定是否跳过 OLED/SD。
+ * 返回处理的样本数。MAXtask 保存该数量，Uitask 用它判断是否暂缓 OLED 刷新。
  */
 uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
 {
@@ -1238,11 +1535,13 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
   uint32_t ir_batch[24];
   uint8_t  ovf, count, i;
   uint32_t now;
+  MAX30102_BatchStatus_t batch_status;
 
   if (app == NULL) { return 0U; }
 
   /* 批量读 MAX30102 FIFO */
-  count = max30102_read_fifo_batch(red_batch, ir_batch, 24U, &ovf);
+  count = max30102_read_fifo_batch(red_batch, ir_batch, 24U, &ovf,
+                                    &batch_status);
 
   /* 同步驱动层 FIFO 调试字段到 AppState */
   {
@@ -1260,7 +1559,8 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
   app->sensor_read_attempt_count++;
 
   /* 处理溢出 */
-  if (ovf > 0U)
+  if ((batch_status == MAX30102_BATCH_OVERFLOW) ||
+      (batch_status == MAX30102_BATCH_FIFO_CLEAR_FAIL))
   {
     app->fifo_overflow_total += ovf;
     if (app->fifo_overflow_total > 999999UL)
@@ -1269,21 +1569,22 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
     }
 
     /* 立即重置连续性历史，不等到稳定结束 */
-    app_hrv_reset(app);
-    app_rr_reset(app);
-    app_ppg_pulse_reset();
-    app_ppg_sqi_reset(app);
-    app_ptt_reset(app);
-    app_measurement_reset_beat_states();
-
-    app->sensor_health = (uint8_t)SENSOR_HEALTH_OK;
+    app_measurement_reset_sampling_continuity(app, APP_OUTPUT_REASON_STALE);
 
     /* 仅在手指实际就位时进入接触稳定状态。
      * 如果手指不在，上面的溢出/算法状态重置
      * 就足够了 — 不要阻塞 finger_on_confirm_count。 */
-    if (app->finger_present != 0U)
+    if (batch_status == MAX30102_BATCH_FIFO_CLEAR_FAIL)
     {
-      app->contact_settle_samples = APP_CONTACT_SETTLE_SAMPLES;
+      app->sensor_health = (uint8_t)SENSOR_HEALTH_FIFO_CLEAR_FAIL;
+      app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
+      app->sensor_last_i2c_error = HAL_I2C_GetError(&hi2c1);
+      app->sensor_read_error_count++;
+      app->sensor_error_streak = APP_SENSOR_RECOVERY_ERROR_COUNT;
+    }
+    else
+    {
+      app->sensor_health = (uint8_t)SENSOR_HEALTH_STALE;
     }
 
     return 0U;
@@ -1292,7 +1593,8 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
   if (count == 0U)
   {
     /* 非溢出返回 0 → 可能是 FIFO 空或 I2C 错误 */
-    if ((HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) ||
+    if ((batch_status == MAX30102_BATCH_I2C_ERROR) ||
+        (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) ||
         (HAL_I2C_GetError(&hi2c1) != HAL_I2C_ERROR_NONE))
     {
       app->sensor_last_read_status = (uint8_t)APP_MEASUREMENT_READ_ERROR;
@@ -1325,8 +1627,7 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
     sample_tick = now - ((uint32_t)(count - 1U - i) * APP_SAMPLE_PERIOD_MS);
 
     /* 跟踪样本间隔，包含上一批最后样本到本批第一个样本的时间间隔。 */
-    if ((app->sensor_last_sample_tick != 0UL) &&
-        (sample_tick > app->sensor_last_sample_tick))
+    if (app->sensor_last_sample_tick != 0UL)
     {
       uint32_t gap = sample_tick - app->sensor_last_sample_tick;
       uint16_t gap16 = (gap > 0xFFFFUL) ? 0xFFFFU : (uint16_t)gap;
@@ -1346,7 +1647,6 @@ uint8_t app_measurement_drain_fifo_batch(AppState_t *app)
     app_measurement_update_adaptive_thresholds(app);
     app_measurement_update_finger_state(app);
     app_measurement_process(app);
-    app_measurement_update_periodic_flags(app);
   }
 
   return count;
@@ -1429,6 +1729,7 @@ static void app_measurement_do_recovery(AppState_t *app)
   sensor_last_stale_probe_tick = 0UL;
   sensor_stale_probe_count = 0U;
   sample_debug_state.initialized = 0U;
+  app_measurement_reset_sampling_continuity(app, APP_OUTPUT_REASON_STALE);
   /* 进入短时重新采集：如果手指就位，设置接触稳定倒计数以
    * 在重新稳定期间抑制算法输出。如果手指不在，
    * 保持 PLACE FINGER — 不进入稳定。 */
@@ -1527,8 +1828,8 @@ void app_measurement_service_sensor_watchdog(AppState_t *app)
     return;
   }
 
-  /* OLED/SD 工作可能延迟主循环。在清除 MAX30102 FIFO 和
-   * 重建共享 I2C 总线之前确认持久停顿。 */
+  /* 任务调度或共享总线占用可能造成短暂读空；在清除 MAX30102 FIFO 并重建
+   * I2C1 之前，必须按独立探测间隔确认停顿连续发生。 */
   if ((sensor_last_stale_probe_tick != 0UL) &&
       ((now - sensor_last_stale_probe_tick) < APP_SENSOR_STALE_CONFIRM_INTERVAL_MS))
   {
@@ -1574,6 +1875,7 @@ static void app_reset_measurement_outputs(AppState_t *app)
   app_measurement_reset_beat_states();
   app_oxy_status_reset(app);
   app_ppg_sqi_reset(app);
+  app_ppg_side_elgendi_reset(app);
   app_reset_advanced_metrics(app);
 
   /* PTT 依赖 PPG 脉搏波峰与 ECG R 峰的时间差，手指状态切换后旧历史无效 */
@@ -1598,5 +1900,6 @@ static void app_reset_advanced_metrics(AppState_t *app)
   app_hrv_reset(app);
   app_rr_reset(app);
   app_ppg_pulse_reset();
+  app_ppg_side_elgendi_reset(app);
   app_measurement_reset_beat_states();
 }

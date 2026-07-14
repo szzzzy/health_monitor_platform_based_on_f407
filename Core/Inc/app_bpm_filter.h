@@ -16,10 +16,16 @@ extern "C" {
 
 #include "app_state.h"
 
-/* 重置滤波状态（手指离开或持续无效时调用） */
+/** @brief 清零 BPM 历史、候选状态和有效标志；手指离开或持续无效时调用。 */
 void app_bpm_filter_reset(AppState_t *app);
 
-/* 输入原始心率值，返回 0=正常跟踪, 1=BPM 已清零 */
+/**
+ * @brief  对原始逐拍心率执行三点中值、候选确认、EMA 与步进限幅。
+ * @param  app 共享应用状态，可为 NULL。
+ * @param  raw_bpm_valid 原始值可信时为 1，否则进入短时保持路径。
+ * @param  raw_bpm_value 原始心率，单位：bpm。
+ * @return 正常跟踪/保持返回 0；连续无效达到保持上限并清零 BPM 后返回 1。
+ */
 uint8_t app_bpm_filter_update(AppState_t *app, uint8_t raw_bpm_valid, uint8_t raw_bpm_value);
 
 #ifdef __cplusplus

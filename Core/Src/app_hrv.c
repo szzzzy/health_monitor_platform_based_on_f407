@@ -6,8 +6,9 @@
  *   → app_hrv_update_outputs: SDNN, RMSSD, SD1, SD2, SD1/SD2 x100, rhythm_irregular。
  *
  * IBI 接受规则 (app_hrv_accept_ibi):
- *   - 绝对范围: [300, 2000] ms。
- *   - 相对跳变: 距已有均值偏差 ≤50%（仅当缓冲中有 >=4 个 IBI 时启用）。
+ *   - 绝对范围：[250, 2400] ms。
+ *   - 相对跳变：已有 6 个 IBI 后，以最近至多 5 个已接受值的中位数为基准，
+ *     接受偏差不超过 ±65% 的候选。
  *
  * Poincare 指标 (基于同一 32 拍窗口):
  *   SD1 = RMSSD / sqrt(2)               —— 短时变异性（Poincare 椭圆短轴）
@@ -176,7 +177,7 @@ uint8_t app_hrv_mark_peak_seen(uint32_t peak_sample)
 uint8_t app_hrv_is_peak_stale(uint32_t current_sample, uint32_t stale_samples)
 {
   if ((hrv_state.last_peak_valid != 0U) &&
-      (current_sample > (hrv_state.last_peak_sample + stale_samples)))
+      ((current_sample - hrv_state.last_peak_sample) > stale_samples))
   {
     return 1U;
   }

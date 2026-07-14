@@ -1,5 +1,7 @@
-/*
- * HRV 模块——时域与 Poincare 短窗口指标。
+/**
+  ******************************************************************************
+  * @file    app_hrv.h
+  * @brief   HRV 时域、Poincare 和短窗口频域指标接口。
  *
  * 历史管理策略：
  * - app_hrv_reset():     清零 IBI 环形缓冲与所有输出（手指离开/测量重置）。
@@ -7,11 +9,11 @@
  * - 运动伪影期间进入失效标记路径，不清缓冲。
  *
  * IBI 接受规则：
- * - 绝对范围：300–2000 ms。
- * - 相对跳变：相对已有 >=4 个 IBI 均值的偏差 ≤50%。
+ * - 绝对范围：250–2400 ms。
+ * - 相对跳变：已有 6 个 IBI 后，相对最近至多 5 个已接受值中位数的偏差 ≤65%。
  *
  * 输出门控：
- * - hrv_valid 为 1 要求 >=3 个已接受的 IBI；>=4 个后再启用跳变过滤。
+ * - hrv_valid 为 1 要求 >=3 个已接受的 IBI；已有 6 个后再启用跳变过滤。
  * - SD1 = RMSSD / sqrt(2)   (Poincare 短轴)。
  * - SD2 = sqrt(2*SDNN^2 - SD1^2)  (Poincare 长轴)。
  * - SD1/SD2 x100 为短/长期变异性比值。
@@ -20,7 +22,8 @@
  * - 频域 HRV 是基于 32 拍的短窗口 LF/HF 估计。
  *   非诊断用途，也非标准 5 分钟频域 HRV。
  * - 未估计 VLF，因为 32 拍窗口过短。
- */
+  ******************************************************************************
+  */
 #ifndef __APP_HRV_H__
 #define __APP_HRV_H__
 
@@ -30,8 +33,8 @@ extern "C" {
 
 #include "app_state.h"
 
-#define APP_HRV_IBI_MIN_MS 250U
-#define APP_HRV_IBI_MAX_MS 2400U
+#define APP_HRV_IBI_MIN_MS 250U   /* 可接受 IBI 下限，单位：ms */
+#define APP_HRV_IBI_MAX_MS 2400U  /* 可接受 IBI 上限，单位：ms */
 
 /* 清零所有 IBI 历史和输出值——手指离开/测量重置时调用。 */
 void app_hrv_reset(AppState_t *app);

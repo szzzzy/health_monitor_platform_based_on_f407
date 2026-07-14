@@ -1,7 +1,10 @@
 /**
   ******************************************************************************
   * @file    app_settings.c
-  * @brief   OLED settings pages for EEPROM-backed device data.
+  * @brief   EEPROM 设备信息、校准参数、运行统计与错误环的 OLED 页面
+  *
+  * 本模块只读取 g_eeprom 的 RAM 镜像并渲染，不直接访问 I2C EEPROM。
+  * 页面由 Uitask 在持有 I2C1 互斥量时调用，最终统一通过 draw_lines() 刷屏。
   ******************************************************************************
   */
 
@@ -11,6 +14,7 @@
 
 #include <stdio.h>
 
+/** @brief 清屏后按 8 像素行距绘制八行文本，并一次性提交 OLED 帧缓冲。 */
 static void draw_lines(const char line[8][24])
 {
   ssd1306_Clear(SSD1306_COLOR_BLACK);
@@ -25,6 +29,7 @@ static void draw_lines(const char line[8][24])
   ssd1306_UpdateScreen();
 }
 
+/** @brief 把持久化错误类型转换为适合 128×64 页面显示的短标签。 */
 static const char *error_type_name(uint8_t type)
 {
   switch (type)
@@ -41,6 +46,7 @@ static const char *error_type_name(uint8_t type)
   }
 }
 
+/** @brief 渲染序列号、硬件版本、出厂日期和 EEPROM 装载状态。 */
 static void render_identity(const AppState_t *app)
 {
   char line[8][24];
@@ -77,6 +83,7 @@ static void render_identity(const AppState_t *app)
   draw_lines(line);
 }
 
+/** @brief 渲染 MAX30102 RED/IR LED 寄存器值及按 0.2 mA/LSB 换算的电流。 */
 static void render_calibrate(const AppState_t *app)
 {
   char line[8][24];
@@ -105,6 +112,7 @@ static void render_calibrate(const AppState_t *app)
   draw_lines(line);
 }
 
+/** @brief 渲染累计运行时长、启动次数、传感器错误和恢复统计。 */
 static void render_runtime(const AppState_t *app)
 {
   char line[8][24];
@@ -132,6 +140,7 @@ static void render_runtime(const AppState_t *app)
   draw_lines(line);
 }
 
+/** @brief 按“最新记录优先”遍历 EEPROM 错误环并渲染最多七条。 */
 static void render_errors(const AppState_t *app)
 {
   char line[8][24];
@@ -182,6 +191,10 @@ static void render_errors(const AppState_t *app)
   draw_lines(line);
 }
 
+/**
+ * @brief  根据 settings_sub_page 分派设置页面。
+ * @param  app 共享状态快照；为 NULL 时不刷新显示。
+ */
 void app_settings_render_page(const AppState_t *app)
 {
   if (app == NULL)

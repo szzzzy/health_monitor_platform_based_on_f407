@@ -1,4 +1,15 @@
 ﻿#ifndef __APP_STATE_H__
+/**
+  ******************************************************************************
+  * @file    app_state.h
+  * @brief   应用共享状态结构、页面枚举、诊断阶段码和输出原因码。
+  *
+  * AppState_t 是测量、显示、协议和日志之间的共享上下文。MAXtask 更新高频
+  * 原始量与算法字段；OLED 和 USART 在格式化前复制一致快照，SDtask 则只在
+  * 自己的低优先级状态机中同步日志统计。
+  ******************************************************************************
+  */
+
 #define __APP_STATE_H__
 
 #ifdef __cplusplus
@@ -82,8 +93,8 @@ typedef struct
 
 /*
  * 应用运行时的共享状态。
- * 这里集中保存主循环会反复读写的测量值、页面状态、RTC 快照与按键状态，
- * 这样各模块之间只传一个上下文指针，后续维护更容易。
+ * 这里集中保存各 RTOS 任务共享的测量值、页面状态、RTC 快照与诊断计数。
+ * 字段按单写者或短临界区约束使用，模块间统一传递这一上下文指针。
  */
 typedef struct
 {
@@ -126,6 +137,11 @@ typedef struct
   uint32_t last_ui_skip_tick;        /* 最近一次 OLED 跳过的时间戳 */
   uint32_t max_task_heartbeat;       /* MAXtask 心跳（每轮递增） */
   uint32_t ui_task_heartbeat;        /* UiTask 心跳（每轮递增） */
+  uint32_t sd_task_heartbeat;
+  uint32_t tim6_isr_heartbeat;
+  uint32_t watchdog_fault_count;
+  uint8_t  watchdog_fault_task;
+  uint8_t  watchdog_fault_phase;
   uint32_t max_task_timeout_count;   /* MAXtask ulTaskNotifyTake 返回 0 的次数（超时唤醒） */
   uint32_t max_task_gap_ms;          /* MAXtask 连续两次唤醒的最大间隔 (ms) */
   uint8_t raw_signal_present;
@@ -139,8 +155,7 @@ typedef struct
   uint8_t motion_artifact;
   /* 原始运动评分 0–100，基于 AC RMS 尖峰 + RED/IR 平衡 + SQ 骤降三条信号合成。 */
   uint8_t motion_score;
-  /* 文献驱动 PPG SQI 侧路评分/标志/拒绝计数，用于 valid 门控和日志验证。
-   * Literature-guided PPG SQI side score, flags, and rejection counters. */
+  /* PPG SQI 侧路评分、标志和拒绝计数，用于有效性门控与日志验证。 */
   uint8_t ppg_sqi_score;
   uint8_t ppg_sqi_flags;
   uint32_t ppg_sqi_low_perfusion_count;
@@ -150,6 +165,40 @@ typedef struct
   uint32_t ppg_sqi_ibi_reject_count;
   uint32_t ppg_sqi_amp_reject_count;
   uint32_t ppg_sqi_suppressed_count;
+  /*
+   * 输出解释字段：只说明最近一次门控/拒绝/陈旧原因，不改变主算法语义。
+   * reason: 0=OK, 1=NO_FINGER, 2=CONTACT, 3=LOW_SQ, 4=MOTION,
+   *         5=LOW_PERF, 6=BALANCE, 7=BEAT_UNSTABLE, 8=STALE,
+   *         9=ECG, 10=RANGE, 11=JUMP.
+   */
+  uint8_t bpm_invalid_reason;
+  uint8_t spo2_invalid_reason;
+  uint8_t ptt_invalid_reason;
+  uint8_t ppg_last_gate_flags;
+  uint16_t bpm_age_ms;
+  uint16_t spo2_age_ms;
+  uint16_t ptt_match_age_ms;
+  uint8_t output_stale_flags;
+  uint32_t bpm_last_update_tick;
+  uint32_t spo2_last_update_tick;
+  uint32_t ptt_last_update_tick;
+  uint32_t ppg_output_sample;
+  /*
+   * Elgendi 风格 PPG 旁路检测器的 A/B 对照诊断字段。它们不驱动正式的
+   * BPM/SpO2/PTT 输出，只用于统计其与当前流式检测器的一致程度。
+   */
+  uint32_t ppg_side_peak_count;
+  uint32_t ppg_side_current_peak_count;
+  uint32_t ppg_side_match_count;
+  uint32_t ppg_side_missed_current_count;
+  uint32_t ppg_side_unmatched_count;
+  uint32_t ppg_side_reject_short_count;
+  uint32_t ppg_side_reject_refractory_count;
+  uint32_t ppg_side_reject_range_count;
+  uint16_t ppg_side_last_ibi_ms;
+  uint8_t  ppg_side_last_hr;
+  int16_t  ppg_side_last_delta_ms;
+  uint16_t ppg_side_last_block_ms;
   /* PI：存储 (AC/DC) × 1000，即标准灌注指数(%) × 10。例如 PI=12.3% → 值 123。
    * OXY 页显示为 PI:12.3（除以 10 取整+余数）。uint16 承载 >25.5% 的 PI 值。
    * signal_ir_pi_x1000 由基于搏动的 EMA 计算（ir_pi_ac_ema / ir_dc），
@@ -208,8 +257,7 @@ typedef struct
   /*
    * 短窗口节律提示，不是诊断分类。
    * 同时满足 RMSSD >= 120 ms 且 SD1/SD2 x100 >= 70 时置位。
-   * 高 SD1/SD2 比值 + 高 RMSSD 可能暗示节律不齐，
-   * 但判读需要临床上下文。
+   * 该标志仅描述本窗口是否越过工程阈值，不提供节律诊断结论。
    */
   uint8_t rhythm_irregular;
   /* RR：比 IBI/HRV 更慢——需要 SQ>=25、>=8 拍、>=6 秒窗口且脉搏幅度有明显调制。 */
@@ -232,6 +280,10 @@ typedef struct
   /* 最近一次完整串口接收/发送的报文是否有效。 */
   bool uart_rx_message_valid;
   bool uart_tx_message_valid;
+  uint32_t uart_rx_overrun_count;
+  uint32_t uart_oversize_line_count;
+  uint32_t uart_error_count;
+  uint32_t uart_dma_restart_count;
   DisplayPage_t current_page;
   uint8_t rtc_time_valid;
   uint8_t rtc_read_ok;
@@ -240,6 +292,7 @@ typedef struct
   PageButton_t page_prev_button;
   PageButton_t page_next_button;
   /* SD 卡数据记录状态 */
+  uint8_t  sd_log_active;     /* 1 = SD 日志会话处于 active 状态，供快照化 USART/OLED 使用 */
   uint16_t sd_buffered;       /* 环形缓冲中待写入样本数 */
   uint16_t sd_dropped;        /* 累计丢弃样本数 */
   uint16_t sd_written;        /* 本次会话已持久化样本数 */
@@ -248,6 +301,10 @@ typedef struct
   uint8_t  sd_state;          /* 内部状态: 0=IDLE 1=TRY 2=ACTIVE 3=BACKOFF */
   uint32_t sd_last_write_ms;  /* 最近一次 SD 写入耗时 (ms) */
   uint32_t sd_total_written;  /* 累计持久化样本总数 */
+  uint32_t sd_unsynced;
+  uint32_t sd_sync_error_count;
+  uint32_t sd_retention_ms;
+  uint8_t  sd_rolling_mode;
   /* ECG 状态：原始 ADC 值、滤波后 AC 值、导联脱落标志 */
   uint16_t ecg_raw;
   int16_t  ecg_filtered;
@@ -306,6 +363,31 @@ typedef struct
   uint16_t wdt_task_stack_hwm;
 } AppState_t;
 
+/*
+ * 共享状态一致快照。
+ * 只在复制 AppState_t 的短窗口内关中断；格式化、OLED I2C 和 UART TX
+ * 都在副本上执行，避免跨任务读取到半更新的测量字段。
+ */
+static inline uint8_t app_state_take_snapshot(const AppState_t *src, AppState_t *dst)
+{
+  uint32_t primask;
+
+  if ((src == NULL) || (dst == NULL))
+  {
+    return 0U;
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  *dst = *src;
+  if ((primask & 1UL) == 0UL)
+  {
+    __enable_irq();
+  }
+
+  return 1U;
+}
+
 /* ---- 诊断阶段码定义 ---- */
 /* MAXtask 任务阶段 */
 #define PHASE_MAX_IDLE           0U
@@ -341,6 +423,7 @@ typedef struct
 #define PHASE_WDT_IDLE           0U
 #define PHASE_WDT_REFRESH        1U
 #define PHASE_WDT_DELAY          2U
+#define PHASE_WDT_CHECK          3U
 
 /* ECG 信号无效原因码 */
 #define ECG_INVALID_OK            0U
@@ -351,6 +434,36 @@ typedef struct
 #define ECG_INVALID_LOW_AMPLITUDE 5U
 #define ECG_INVALID_NOISY         6U
 #define ECG_INVALID_RAW_FLATLINE  7U
+
+/*
+ * PPG/BPM/SpO2/PTT 输出解释原因码，不改变 valid 语义。
+ * OK 表示最近一次有效输出正常刷新；其他值解释“为什么当前不可信”：
+ * - NO_FINGER / CONTACT：佩戴状态问题，常见于面包板静态测试手指未盖好；
+ * - LOW_SQ / LOW_PERFUSION / BALANCE / BEAT_UNSTABLE：PPG 窗口或逐拍质量问题；
+ * - MOTION：PPG 特征显示明显扰动，不限定为跑动，也包括按压/松动瞬态；
+ * - ECG / RANGE / JUMP：主要用于 PTT 匹配失败解释；
+ * - STALE：旧值超过刷新窗口，显示层应带无效标记。
+ */
+#define APP_OUTPUT_REASON_OK            0U
+#define APP_OUTPUT_REASON_NO_FINGER     1U
+#define APP_OUTPUT_REASON_CONTACT       2U
+#define APP_OUTPUT_REASON_LOW_SQ        3U
+#define APP_OUTPUT_REASON_MOTION        4U
+#define APP_OUTPUT_REASON_LOW_PERFUSION 5U
+#define APP_OUTPUT_REASON_BALANCE       6U
+#define APP_OUTPUT_REASON_BEAT_UNSTABLE 7U
+#define APP_OUTPUT_REASON_STALE         8U
+#define APP_OUTPUT_REASON_ECG           9U
+#define APP_OUTPUT_REASON_RANGE         10U
+#define APP_OUTPUT_REASON_JUMP          11U
+
+/*
+ * output_stale_flags bit layout.
+ * bit=1 表示对应指标 age_ms 超过刷新窗口或从未更新；旧数值可显示但不可信。
+ */
+#define APP_OUTPUT_STALE_BPM            0x01U
+#define APP_OUTPUT_STALE_SPO2           0x02U
+#define APP_OUTPUT_STALE_PTT            0x04U
 
 #ifdef __cplusplus
 }

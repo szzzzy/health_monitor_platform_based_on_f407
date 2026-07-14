@@ -34,16 +34,6 @@ static uint8_t                 sdio_reported_mode = APP_SD_MODE_1BIT;
 static uint32_t                sdio_last_error = 0U;
 static bool                    sdio_4bit_permanently_off = false;
 
-/**
- * @brief  等待 SD 卡返回 TRANSFER（空闲）状态。
- * @param  timeout_ms 最长等待时间，单位毫秒。
- * @return APP_SD_CARD_OK 当卡报告 TRANSFER 状态时返回，
- *         APP_SD_CARD_BUSY 超时返回（超时时卡会被反初始化）。
- * @note   HAL_SD_ReadBlocks / HAL_SD_WriteBlocks 返回 HAL_OK 仅表示
- *         命令已被卡确认。卡可能仍在内部编程中。
- *         此轮询确保下次访问是安全的。
- *         超时后卡会被反初始化，以便上层可以重试。
- */
 /*
  * 等待 SD 卡从编程/接收状态回到传输空闲状态。
  *

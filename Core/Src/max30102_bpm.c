@@ -19,14 +19,14 @@
  * ========================================================================= */
 #define MAX30102_BPM_MIN_RESULT            35U
 #define MAX30102_BPM_MAX_RESULT            220U
-#define MAX30102_BPM_MIN_AMPLITUDE         24U
-#define MAX30102_BPM_MIN_AC_RMS            4U
-#define MAX30102_BPM_THRESHOLD_NUM         4U
+#define MAX30102_BPM_MIN_AMPLITUDE         18U
+#define MAX30102_BPM_MIN_AC_RMS            3U
+#define MAX30102_BPM_THRESHOLD_NUM         3U
 #define MAX30102_BPM_THRESHOLD_DEN         100U
-#define MAX30102_BPM_MIN_THRESHOLD         4U
-#define MAX30102_BPM_PROMINENCE_NUM        3U
+#define MAX30102_BPM_MIN_THRESHOLD         3U
+#define MAX30102_BPM_PROMINENCE_NUM        2U
 #define MAX30102_BPM_PROMINENCE_DEN        100U
-#define MAX30102_BPM_MIN_PROMINENCE        4U
+#define MAX30102_BPM_MIN_PROMINENCE        3U
 #define MAX30102_BPM_MAX_INTERVAL_JITTER   85U
 #define MAX30102_BPM_MIN_EDGE_DELTA        2U
 #define MAX30102_BPM_MAX_PEAK_COUNT        24U
@@ -37,7 +37,7 @@
 #define FFT_SIZE  256U
 #define LAG_MIN    27U
 #define LAG_MAX   171U
-#define AUTOCORR_MIN_PEAK_RATIO 0.08f
+#define AUTOCORR_MIN_PEAK_RATIO 0.06f
 
 static float32_t fft_in[FFT_SIZE];
 static float32_t fft_out[FFT_SIZE];

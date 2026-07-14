@@ -1,4 +1,14 @@
 ﻿#ifndef __APP_DISPLAY_H__
+/**
+  ******************************************************************************
+  * @file    app_display.h
+  * @brief   OLED 显示与页面/波形缓冲公共接口。
+  *
+  * 显示模块只读取 AppState 快照并维护本地波形缓冲；测量算法不依赖 OLED。
+  * RTOS UI 任务应通过 app_state_take_snapshot() 取得一致快照后调用绘制入口。
+  ******************************************************************************
+  */
+
 #define __APP_DISPLAY_H__
 
 #ifdef __cplusplus
@@ -28,7 +38,7 @@ void app_display_reset_ecg_waveform(void);
 void app_display_add_ecg_sample(int32_t filtered_value);
 /* 在 ECG 波形上标记最近检测到的 ECG R 峰。 */
 void app_display_add_ecg_r_peak_marker(void);
-/* 根据当前页面绘制测量结果页。 */
+/* 根据当前页面绘制测量结果页；RTOS UI 调用方应传入 AppState 一致快照。 */
 void app_display_measurement_page(const AppState_t *app);
 /* 绘制状态页，常用于开机、自检和基线采集阶段。 */
 void app_display_status_page(const AppState_t *app, const char *status_line_1, const char *status_line_2);

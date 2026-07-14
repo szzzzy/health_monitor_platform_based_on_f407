@@ -11,8 +11,8 @@
   *   2. RISING — 更新局部最大值；信号回落达到迟滞值 → 确认峰
   *   3. FALLING — 更新局部最小值；信号回升达到迟滞值 → 确认谷
   *   4. 每次确认峰时用峰谷幅度更新 beat_amp_ema
-  *   5. 同极性峰间隔 (IBI) 必须在 [300ms, 2000ms] 范围内
-  *   6. 迟滞值 = max(2, beat_amp_ema / 4)，初始用噪声门限
+  *   5. 同极性峰间隔 (IBI) 必须在 [250 ms, 2400 ms] 范围内
+  *   6. 迟滞值 = max(2, beat_amp_ema / 5)，初始用噪声门限
   *
   * 相比旧版 3 点相邻突出度：
   *   - 不受 PPG 峰顶圆滑导致的相邻点差过小问题影响
@@ -39,12 +39,12 @@
 #define APP_BEAT_EMA_NEW_WEIGHT     1U    /* EMA 新值权重 (1/8) */
 #define APP_BEAT_EMA_OLD_WEIGHT     7U    /* EMA 旧值权重 (7/8) */
 #define APP_BEAT_EMA_SHIFT          3U    /* 除数 = 2^3 = 8，用于手动 EMA */
-#define APP_BEAT_SIGNAL_QUALITY_MIN 25U
+#define APP_BEAT_SIGNAL_QUALITY_MIN 22U
 #define APP_BEAT_IBI_HISTORY_SIZE   5U
-#define APP_BEAT_IBI_JUMP_PERCENT   40U
+#define APP_BEAT_IBI_JUMP_PERCENT   45U
 #define APP_BEAT_MIN_NOISE_MULT     2U
-#define APP_BEAT_AMP_MIN_PERCENT    35U
-#define APP_BEAT_AMP_MAX_PERCENT    280U
+#define APP_BEAT_AMP_MIN_PERCENT    30U
+#define APP_BEAT_AMP_MAX_PERCENT    320U
 
 /* 状态机状态 */
 #define BEAT_STATE_IDLE     0U
@@ -101,15 +101,15 @@ void app_ppg_pulse_reset(void)
  * @param  pulse_info      检测到的搏动输出结构体（无时清零）。
  * @return 检测到有效脉搏返回 1，否则返回 0。
  * @note   状态机：IDLE -> RISING -> FALLING。迟滞自适应来自
- *         beat_amp_ema。IBI 验证范围 [300, 2000] ms。
+ *         beat_amp_ema。IBI 验证范围 [250, 2400] ms。
  ******************************************************************************
  */
 uint8_t app_ppg_pulse_update(AppState_t *app,
                              int32_t filtered_sample,
-                             uint32_t total_samples,
+                             uint32_t current_sample,
                              MAX30102_PulseInfo_t *pulse_info)
 {
-  /* 生理 IBI 范围 → 样本数范围 */
+  /* 把工程 IBI 接受范围换算为当前 100 Hz 采样率下的样本间隔范围。 */
   const uint32_t min_interval_samples =
       (((uint32_t)APP_HRV_IBI_MIN_MS * MAX30102_ALGO_SAMPLE_RATE_HZ) + 999U) / 1000U;
   const uint32_t max_interval_samples =
@@ -143,8 +143,8 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
                         beat.sample_buf[0] : beat.sample_buf[1];
       beat.local_max = (beat.sample_buf[0] > beat.sample_buf[1]) ?
                         beat.sample_buf[0] : beat.sample_buf[1];
-      beat.local_min_sample = total_samples - 1U;
-      beat.local_max_sample = total_samples - 1U;
+      beat.local_min_sample = current_sample;
+      beat.local_max_sample = current_sample;
       beat.state = BEAT_STATE_IDLE;
       beat.prev_trough = beat.local_min;
     }
@@ -185,12 +185,12 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
     if (filtered_sample < beat.local_min)
     {
       beat.local_min = filtered_sample;
-      beat.local_min_sample = total_samples;
+      beat.local_min_sample = current_sample;
     }
     if (filtered_sample > beat.local_max)
     {
       beat.local_max = filtered_sample;
-      beat.local_max_sample = total_samples;
+      beat.local_max_sample = current_sample;
     }
 
     if ((beat.local_max - beat.local_min) >= (int32_t)noise_floor)
@@ -199,7 +199,7 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
       beat.state = BEAT_STATE_RISING;
       beat.prev_trough = beat.local_min;
       beat.local_max = filtered_sample;
-      beat.local_max_sample = total_samples;
+      beat.local_max_sample = current_sample;
     }
   }
   else if (beat.state == BEAT_STATE_RISING)
@@ -208,7 +208,7 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
     if (filtered_sample > beat.local_max)
     {
       beat.local_max = filtered_sample;
-      beat.local_max_sample = total_samples;
+      beat.local_max_sample = current_sample;
     }
     else if ((beat.local_max - filtered_sample) >= (int32_t)beat.hysteresis)
     {
@@ -265,7 +265,7 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
 
       /* 切换到下降跟踪 */
       beat.local_min = filtered_sample;
-      beat.local_min_sample = total_samples;
+      beat.local_min_sample = current_sample;
       beat.state = BEAT_STATE_FALLING;
     }
   }
@@ -275,7 +275,7 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
     if (filtered_sample < beat.local_min)
     {
       beat.local_min = filtered_sample;
-      beat.local_min_sample = total_samples;
+      beat.local_min_sample = current_sample;
     }
     else if ((filtered_sample - beat.local_min) >= (int32_t)beat.hysteresis)
     {
@@ -284,7 +284,7 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
 
       /* 切换到上升跟踪 */
       beat.local_max = filtered_sample;
-      beat.local_max_sample = total_samples;
+      beat.local_max_sample = current_sample;
       beat.state = BEAT_STATE_RISING;
     }
   }
@@ -305,7 +305,7 @@ uint8_t app_ppg_pulse_update(AppState_t *app,
  */
 uint8_t app_ppg_pulse_process_metrics(AppState_t *app,
                                       const MAX30102_PulseInfo_t *pulse_info,
-                                      uint32_t total_samples)
+                                      uint32_t current_sample)
 {
   if ((app == NULL) || (pulse_info == NULL) || (pulse_info->beat_valid == 0U))
   {
@@ -340,8 +340,7 @@ uint8_t app_ppg_pulse_process_metrics(AppState_t *app,
     }
   }
 
-  app->last_beat_sample = total_samples;
-  (void)total_samples;
+  app->last_beat_sample = current_sample;
 
   /* 触发 OLED 波形脉搏标记点 */
   app_display_add_ir_pulse_marker();

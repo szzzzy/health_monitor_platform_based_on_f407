@@ -2,7 +2,10 @@
 /**
   ******************************************************************************
   * @file    stm32f4xx_it.c
-  * @brief   Interrupt Service Routines.
+  * @brief   Cortex-M 故障处理与外设中断分发
+  *
+  * 中断层只保存必要诊断、清除硬件事件并转交 HAL/RTOS；传感器读取、协议解析
+  * 和文件 I/O 均在任务上下文执行，避免拉长中断屏蔽时间。
   ******************************************************************************
   * @attention
   *
@@ -41,7 +44,8 @@
 /* USER CODE BEGIN PD */
 /* 故障处理函数从 AppState 推断“最可能正在运行的任务”及其阶段码。
  * 因为故障处理函数在异常上下文中执行，不能调用 FreeRTOS API。
- * 策略：阶段码非零的任务 = 最可能是肇事者（优先级高的优先）。 */
+ * 策略：按固定诊断归因顺序扫描阶段字段，第一个非空闲任务作为候选；
+ * 该顺序仅用于故障归因，不代表 FreeRTOS 调度优先级。 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -70,15 +74,16 @@
  *   前提下保留诊断信息，系统依赖看门狗任务周期性写入 RTC 备份寄存器的
  *   “活体快照”（见 app_diag.c）。故障发生时，各处理函数调用
  *   fault_get_task_phase() 读取 AppState 中最近保存的任务阶段，再传给
- *   APP_Diag_CaptureCrash()；后者仅用直接寄存器写入把崩溃记录持久化到 BKP SRAM。
+ *   APP_Diag_CaptureCrash()；后者仅用直接寄存器写入把崩溃记录持久化到
+ *   RTC 备份寄存器。
  *
- *   本函数按优先级顺序扫描 AppState 的阶段字段
- *   (MAX > UI > WDT > SD，与 FreeRTOS 任务优先级一致)。第一个阶段码
+ *   本函数按固定诊断归因顺序扫描 AppState 的阶段字段：
+ *   MAX → UI → WDT → SD。该顺序与调度优先级无关；第一个阶段码
  *   不是 IDLE 的任务被视为最可能的故障来源。若所有任务看起来都空闲，
  *   返回任务 ID 0（未知）。
  *
  *   这是尽力而为的启发式判断：任务可能在最后一次阶段码更新后到故障发生前
- *   被抢占，从而产生漏判。BKP 寄存器里的活体快照会为离线分析提供额外上下文。 */
+ *   被抢占，从而产生漏判。RTC 备份寄存器里的活体快照会为离线分析提供额外上下文。 */
 static void fault_get_task_phase(uint8_t *task_id, uint8_t *phase)
 {
     AppState_t *s = app_rtos_get_state();
@@ -239,7 +244,7 @@ void DebugMon_Handler(void)
 void TIM6_DAC_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM6_DAC_IRQn 0 */
-
+  /* HAL 处理更新标志后会调用 main.c 中的周期回调并通知 MAXtask。 */
   /* USER CODE END TIM6_DAC_IRQn 0 */
   HAL_TIM_IRQHandler(&htim6);
   /* USER CODE BEGIN TIM6_DAC_IRQn 1 */
@@ -267,7 +272,7 @@ void TIM7_IRQHandler(void)
 void DMA2_Stream0_IRQHandler(void)
 {
   /* USER CODE BEGIN DMA2_Stream0_IRQn 0 */
-
+  /* ADC1 环形 DMA 半传输/完成事件交给 HAL；样本由 MAXtask 按写指针消费。 */
   /* USER CODE END DMA2_Stream0_IRQn 0 */
   HAL_DMA_IRQHandler(&hdma_adc1);
   /* USER CODE BEGIN DMA2_Stream0_IRQn 1 */
@@ -277,13 +282,13 @@ void DMA2_Stream0_IRQHandler(void)
 
 /* USER CODE BEGIN 1 */
 
-/* ---- DMA1 Stream5：USART2 接收 ---- */
+/* ---- DMA1 Stream5：USART2 环形接收，回调只更新生产圈数/到达标志 ---- */
 void DMA1_Stream5_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(huart2.hdmarx);
 }
 
-/* ---- USART2：DMA 接收空闲线检测 ---- */
+/* ---- USART2：空闲线仅提示协议任务检查 DMA 缓冲，不在 ISR 中解析命令 ---- */
 void USART2_IRQHandler(void)
 {
   if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE) != RESET)

@@ -209,9 +209,9 @@ static HAL_StatusTypeDef I2C1_InitHandle(void)
 }
 
 /*
- * I2C 恢复期间的 GPIO 位脉冲延时：
- * 128 次 NOP 循环，在 168 MHz 的 CM4 上约 3 us。
- * 满足 I2C 标准模式 4.7 us SCL 高低电平的要求。
+ * I2C 恢复期间的 GPIO 位脉冲短延时。实际时长受编译优化、Flash 等待周期和
+ * 中断抢占影响；这里只用于拉开软件生成的 SCL 边沿，不作为精确定时基准。
+ * 当前总线配置为 400 kHz 快速模式，恢复流程结束后仍由 HAL 重新接管时序。
  */
 static void I2C1_RecoveryDelay(void)
 {

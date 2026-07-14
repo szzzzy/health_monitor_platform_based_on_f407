@@ -18,19 +18,25 @@ extern "C" {
 #include "app_state.h"
 #include "max30102.h"
 
-/* 重置峰值检测器内部状态 */
+/** @brief 清零流式峰/谷状态、幅度 EMA 与 IBI 短历史。 */
 void app_ppg_pulse_reset(void);
 
-/* 每收到一个滤波后样本调用一次，返回 1=检测到有效脉搏 */
+/**
+ * @brief  向状态机输入一个带通 PPG 样本，检测峰值并生成逐拍信息。
+ * @return 通过间期、幅度与质量门控的脉搏返回 1，否则返回 0。
+ */
 uint8_t app_ppg_pulse_update(AppState_t *app,
                              int32_t filtered_sample,
-                             uint32_t total_samples,
+                             uint32_t current_sample,
                              MAX30102_PulseInfo_t *pulse_info);
 
-/* 脉搏后处理：推送 IBI 到 HRV、振幅到 RR、触发 OLED 标记 */
+/**
+ * @brief  对已检测脉搏执行 SQI 门控，并把 IBI/幅度送入 HRV、RR 和显示标记。
+ * @return 本次脉搏指标被接受返回 1，被质量门控拒绝返回 0。
+ */
 uint8_t app_ppg_pulse_process_metrics(AppState_t *app,
                                       const MAX30102_PulseInfo_t *pulse_info,
-                                      uint32_t total_samples);
+                                      uint32_t current_sample);
 
 #ifdef __cplusplus
 }

@@ -32,7 +32,7 @@ extern "C" {
 #define APP_PPG_SQI_GATE_OUTPUTS 1U
 #endif
 
-/* SQI flags: low perfusion, motion, RED/IR balance, contact transition, beat instability. */
+/* SQI 位标志：低灌注、运动扰动、RED/IR 失衡、接触过渡、逐拍不稳定。 */
 #define APP_PPG_SQI_FLAG_LOW_PERFUSION   0x01U
 #define APP_PPG_SQI_FLAG_MOTION          0x02U
 #define APP_PPG_SQI_FLAG_BALANCE         0x04U

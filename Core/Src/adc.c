@@ -24,17 +24,23 @@
 #include "tim.h"
 #include <string.h>
 
-#define APP_ECG_ADC_SAMPLE_PERIOD_MS 4U
+/*
+ * ECG 采集链路：TIM2 TRGO（250 Hz）→ ADC1_IN5 → DMA2_Stream0 环形缓冲 →
+ * MAXtask 批量消费。DMA 只推进硬件写指针；软件以 produced/consumed 单调计数
+ * 区分“缓冲恰好为空”和“写指针绕回原位”，并在落后超过一圈时丢弃已覆盖样本。
+ */
+#define APP_ECG_ADC_SAMPLE_PERIOD_MS 4U  /* 250 Hz 采样周期，单位：ms */
 
 static uint16_t app_ecg_adc_buf[APP_ECG_ADC_BUF_SIZE]
-    __attribute__((section(".bss.ARM.__at_0x2001F800"), aligned(4), used));
-static volatile uint16_t app_ecg_adc_consume_idx = 0U;
-static volatile uint8_t app_ecg_adc_overflow_flag = 0U;
+    __attribute__((section(".dma_buffer"), aligned(4), used));
+static volatile uint16_t app_ecg_adc_consume_idx = 0U; /* 下一个待读样本的环形索引 */
+static volatile uint8_t app_ecg_adc_overflow_flag = 0U; /* 至少发生过一次 DMA 覆盖 */
 
-static uint32_t ecg_produced = 0U;
-static uint32_t ecg_consumed = 0U;
-static uint16_t ecg_prev_write_idx = 0U;
+static uint32_t ecg_produced = 0U;       /* 根据 DMA 写指针累计的生产样本数 */
+static uint32_t ecg_consumed = 0U;       /* 已交付给 ECG 算法的样本数 */
+static uint16_t ecg_prev_write_idx = 0U; /* 上次观察到的 DMA 写索引 */
 
+/** @brief 根据本次 DMA 写索引与上次索引的环形差值累计生产量。 */
 static void app_ecg_adc_track_produced(uint16_t write_idx)
 {
   uint16_t delta;
@@ -52,6 +58,10 @@ static void app_ecg_adc_track_produced(uint16_t write_idx)
   ecg_prev_write_idx = write_idx;
 }
 
+/**
+ * @brief  检测软件消费者落后是否超过一整圈，并跳过已被 DMA 覆盖的数据。
+ * @note   覆盖后保留缓冲中最新的一圈样本，同时锁存溢出标志供 ECG 检测器复位。
+ */
 static void app_ecg_adc_drop_overwritten(void)
 {
   uint32_t overwritten;
@@ -191,6 +201,10 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef* adcHandle)
 }
 
 /* USER CODE BEGIN 1 */
+/**
+ * @brief  清零 ECG DMA 软件状态，启动 ADC1 环形 DMA 与 TIM2 触发源。
+ * @note   必须先启动 DMA 再启动定时器，避免首个触发到来时没有接收缓冲。
+ */
 void app_ecg_adc_start(void)
 {
   (void)memset(app_ecg_adc_buf, 0, sizeof(app_ecg_adc_buf));
@@ -213,6 +227,11 @@ void app_ecg_adc_start(void)
   }
 }
 
+/**
+ * @brief  读取 DMA 剩余传输数并换算为当前硬件写索引。
+ * @return DMA 下一次写入位置，范围为 [0, APP_ECG_ADC_BUF_SIZE-1]。
+ * @note   调用同时更新累计生产量并执行覆盖检测。
+ */
 uint16_t app_ecg_adc_get_write_index(void)
 {
   uint16_t ndtr = (uint16_t)__HAL_DMA_GET_COUNTER(&hdma_adc1);
@@ -233,6 +252,7 @@ uint16_t app_ecg_adc_get_write_index(void)
   return write_idx;
 }
 
+/** @brief 返回尚未交付给 ECG 算法的样本数，最大不超过一圈缓冲容量。 */
 uint16_t app_ecg_adc_get_available_count(void)
 {
   uint32_t avail;
@@ -256,6 +276,14 @@ uint16_t app_ecg_adc_get_available_count(void)
   return (uint16_t)avail;
 }
 
+/**
+ * @brief  按时间顺序取出一个 ECG 原始样本，并重建其采样时间戳。
+ * @param  raw_value 输出 12 位 ADC 原始值，不可为 NULL。
+ * @param  timestamp_ms 输出估算采样时刻；为 NULL 时不计算。
+ * @param  now_ms 本批消费开始时的系统时间，单位：ms。
+ * @param  avail_remaining 本样本在当前批次中的剩余数量，用于按 4 ms 间隔回推时间。
+ * @return 成功取样返回 1；参数无效或当前无样本返回 0。
+ */
 uint8_t app_ecg_adc_read_sample(uint16_t *raw_value,
                                 uint32_t *timestamp_ms,
                                 uint32_t now_ms,
@@ -282,7 +310,7 @@ uint8_t app_ecg_adc_read_sample(uint16_t *raw_value,
       age_ms = ((uint32_t)avail_remaining - 1U) * APP_ECG_ADC_SAMPLE_PERIOD_MS;
     }
 
-    *timestamp_ms = (now_ms >= age_ms) ? (now_ms - age_ms) : 0UL;
+    *timestamp_ms = now_ms - age_ms;
   }
 
   *raw_value = app_ecg_adc_buf[app_ecg_adc_consume_idx];
@@ -293,16 +321,19 @@ uint8_t app_ecg_adc_read_sample(uint16_t *raw_value,
   return 1U;
 }
 
+/** @brief 查询自上次清除后是否发生过 DMA 覆盖。 */
 uint8_t app_ecg_adc_had_overflow(void)
 {
   return app_ecg_adc_overflow_flag;
 }
 
+/** @brief 清除 DMA 覆盖锁存标志；不会改动生产/消费位置。 */
 void app_ecg_adc_clear_overflow(void)
 {
   app_ecg_adc_overflow_flag = 0U;
 }
 
+/* 以下接口只暴露底层寄存器快照，供调试页面定位 ADC/DMA 停摆或错误标志。 */
 uint16_t app_ecg_adc_debug_ndtr(void)
 {
   return (uint16_t)__HAL_DMA_GET_COUNTER(&hdma_adc1);

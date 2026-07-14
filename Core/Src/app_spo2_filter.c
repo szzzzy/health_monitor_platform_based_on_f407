@@ -45,6 +45,9 @@ void app_spo2_filter_reset(AppState_t *app)
 
   app->spo2_valid = 0U;
   app->spo2_value = 0U;
+  app->spo2_last_update_tick = 0UL;
+  app->spo2_age_ms = 0xFFFFU;
+  app->spo2_invalid_reason = APP_OUTPUT_REASON_NO_FINGER;
 }
 
 /**
@@ -95,4 +98,7 @@ void app_spo2_filter_update_output(AppState_t *app,
 
   app->spo2_value = spo2_smooth_state.value;
   app->spo2_valid = 1U;
+  app->spo2_last_update_tick = HAL_GetTick();
+  app->spo2_age_ms = 0U;
+  app->spo2_invalid_reason = APP_OUTPUT_REASON_OK;
 }

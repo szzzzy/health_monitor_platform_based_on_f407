@@ -86,7 +86,7 @@ void APP_Diag_CaptureCrash(uint8_t source, uint8_t task_id, uint8_t phase)
 
     /* 尝试读取 uwTick — 若 SysTick 不可用则为 0 */
     {
-        volatile uint32_t *p_tick = (volatile uint32_t *)0x20000000UL; /* dummy */
+        volatile uint32_t *p_tick = (volatile uint32_t *)0x20000000UL; /* 保留的易失占位指针，不执行解引用 */
         (void)p_tick;
         tick = uwTick;
     }

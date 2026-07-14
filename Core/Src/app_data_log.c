@@ -3,13 +3,13 @@
   * @file    app_data_log.c
   * @brief   SD 二进制日志引擎 — 环形缓冲 + 分片写入
   *
-  * 实时路径：PushSample() 仅 16 字节 memcpy
+  * 实时路径：PushSample() 仅执行固定 16 字节样本的字段写入
   * 后台路径：ServiceBudget() 格式化分片 → APP_SdFile_WriteBytes()
   * 停止路径：OnMeasurementStop() → 分片排空 → f_sync
   *
   * 文件格式：
   *   [DataLogFileHeader_t 32B] [DataLogRawSample_t × N] ...
-  * 文件命名：LOG_XXXXX.BIN（递增序号）
+  * 文件命名：YYYYMMDD_NN.BIN；RTC 无效时使用 00000000_NN.BIN。
   *
   * 反压门控：ring_count > 25% → 不启动/不恢复 SD 会话
   *          ring_count > 50% → 暂停写入 + BACKOFF
@@ -24,12 +24,13 @@
 #include <string.h>
 
 /* 环形缓冲区：2048 x 16B = 32KB */
-static DataLogRawSample_t ring[DATA_LOG_RING_SAMPLES];
+static DataLogRawSample_t ring[DATA_LOG_RING_SAMPLES]
+    __attribute__((section(".ccm_data"), aligned(4), used));
 static uint16_t ring_head  = 0U;
 static uint16_t ring_tail  = 0U;
 static uint16_t ring_count = 0U;
 
-/* 状态机 */
+/* 普通后台写入状态机：空闲 → 尝试启动 → 活跃；错误后进入定时退避。 */
 typedef enum {
   SD_STATE_IDLE = 0,
   SD_STATE_TRY_START,
@@ -47,12 +48,16 @@ static uint8_t    sd_last_error = 0U;
 static uint32_t   last_write_ms = 0U;
 static uint32_t   last_backlog  = 0U;
 static uint16_t   session_written = 0U;
+static uint32_t   total_unsynced = 0U;
+static uint32_t   sync_error_count = 0U;
 
-/* 测量活跃门控 */
+/* 测量活跃门控：为 1 时禁止所有物理 SD I/O，但实时 RAM 入队仍继续。 */
 static uint8_t    measurement_active = 0U;
 
-/* 延迟排空状态机 */
+/* 延迟排空状态机：手指离开后按轮次执行分片写、同步与关闭，避免长阻塞。 */
 static uint8_t    flush_pending = 0U;
+static uint32_t   flush_request_seq = 0U;
+static uint32_t   flush_active_seq = 0U;
 typedef enum {
   FLUSH_STATE_IDLE = 0,
   FLUSH_STATE_DRAINING,
@@ -207,7 +212,7 @@ static uint8_t sd_try_start(uint8_t enforce_backlog_guard)
 
   if (sd_state == SD_STATE_BACKOFF)
   {
-    if (HAL_GetTick() < backoff_until)
+    if ((int32_t)(HAL_GetTick() - backoff_until) < 0)
     {
       return 0U;
     }
@@ -228,10 +233,19 @@ static uint8_t sd_try_start(uint8_t enforce_backlog_guard)
 
   header.magic[0] = 'B'; header.magic[1] = 'M';
   header.magic[2] = 'L'; header.magic[3] = 'G';
-  header.version  = 1U;
+  header.version  = 2U;
   header.sample_rate_hz = 100U;
   header.start_tick = HAL_GetTick();
   (void)memset(header.reserved, 0, sizeof(header.reserved));
+  header.reserved[0] = DATA_LOG_MODE_ROLLING_LAST_WINDOW;
+  header.reserved[1] = (uint8_t)(DATA_LOG_RETENTION_MS & 0xFFUL);
+  header.reserved[2] = (uint8_t)((DATA_LOG_RETENTION_MS >> 8U) & 0xFFUL);
+  header.reserved[3] = (uint8_t)((DATA_LOG_RETENTION_MS >> 16U) & 0xFFUL);
+  header.reserved[4] = (uint8_t)((DATA_LOG_RETENTION_MS >> 24U) & 0xFFUL);
+  header.reserved[5] = (uint8_t)(total_dropped & 0xFFUL);
+  header.reserved[6] = (uint8_t)((total_dropped >> 8U) & 0xFFUL);
+  header.reserved[7] = (uint8_t)((total_dropped >> 16U) & 0xFFUL);
+  header.reserved[8] = (uint8_t)((total_dropped >> 24U) & 0xFFUL);
 
   ret = APP_SdFile_WriteBytes(&header, (uint16_t)sizeof(header));
   if (ret != APP_SD_FILE_OK)
@@ -287,6 +301,8 @@ static uint16_t sd_write_one_chunk(uint32_t budget_ms)
     sd_last_error = (uint8_t)ret;
     sd_paused = 1U;
     total_dropped += popped;
+    total_unsynced += session_written;
+    session_written = 0U;
     sd_state = SD_STATE_BACKOFF;
     backoff_until = HAL_GetTick() + BACKOFF_MS;
     return 0U;
@@ -335,8 +351,12 @@ void APP_DataLog_Init(void)
   last_write_ms = 0U;
   last_backlog  = 0U;
   session_written = 0U;
+  total_unsynced = 0U;
+  sync_error_count = 0U;
   measurement_active = 0U;
   flush_pending = 0U;
+  flush_request_seq = 0U;
+  flush_active_seq = 0U;
   flush_deferred_state = FLUSH_STATE_IDLE;
 }
 
@@ -346,7 +366,7 @@ void APP_DataLog_Init(void)
  * @param  tick HAL 滴答计数器值
  * @param  red  红色 LED 原始读数
  * @param  ir   红外 LED 原始读数
- * @param  ecg  ECG 原始读数
+ * @param  ecg  最近的 ECG 滤波值
  * @param  flags 样本状态标志
  * @return 无
  * @note  O(1) 且中断安全。环形缓冲区满时丢弃最旧样本。
@@ -430,7 +450,7 @@ uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms)
     return chunk_bytes;
 
   case SD_STATE_BACKOFF:
-    if (HAL_GetTick() >= backoff_until)
+    if ((int32_t)(HAL_GetTick() - backoff_until) >= 0)
     {
       sd_state = SD_STATE_IDLE;
       sd_paused = 0U;
@@ -458,8 +478,14 @@ uint16_t APP_DataLog_ServiceBudget(uint32_t budget_ms)
  */
 void APP_DataLog_OnMeasurementStop(void)
 {
+  uint32_t primask = ring_enter_critical();
+  flush_request_seq++;
   flush_pending = 1U;
-  flush_deferred_state = FLUSH_STATE_IDLE;
+  if (flush_deferred_state == FLUSH_STATE_DONE)
+  {
+    flush_deferred_state = FLUSH_STATE_IDLE;
+  }
+  ring_exit_critical(primask);
 }
 
 /**
@@ -486,6 +512,10 @@ void APP_DataLog_GetStatus(DataLogStatus_t *status)
   status->state         = (uint8_t)sd_state;
   status->last_write_ms = last_write_ms;
   status->last_backlog  = last_backlog;
+  status->retention_ms = DATA_LOG_RETENTION_MS;
+  status->unsynced = total_unsynced;
+  status->sync_error_count = sync_error_count;
+  status->rolling_mode = DATA_LOG_MODE_ROLLING_LAST_WINDOW;
 }
 /**
  ******************************************************************************
@@ -504,7 +534,7 @@ uint8_t APP_DataLog_IsActive(void)
  * @brief  设置控制 SD I/O 的测量活跃标志
  * @param  active 非零表示测量活跃，零允许 SD 写入
  * @return 无
- * @note  当活跃时，APP_DataLog_ServiceBudget 不执行物理 SD 写入。
+ * @note  当活跃时，普通后台服务和停止排空均不执行物理 SD I/O。
  ******************************************************************************
  */
 void APP_DataLog_SetMeasurementActive(uint8_t active)
@@ -527,15 +557,18 @@ void APP_DataLog_SetMeasurementActive(uint8_t active)
  * 避免在安全窗口一次性阻塞过久。
  *
  * 状态转移: IDLE → DRAINING → SYNC → DONE → IDLE
- * 仅在手指不在位的安全窗口由 main.c 调用。
+ * 仅在手指不在位的停止排空窗口由 SD 任务调用。
  */
 uint8_t APP_DataLog_ServiceDeferredStop(void)
 {
-  if (flush_pending == 0U) { return 0U; }
+  /* 调用层会先检查手指状态；这里再以日志模块自己的活跃门控兜底，
+   * 防止任务切换或未来新增调用点在实时测量期间触发阻塞 I/O。 */
+  if ((flush_pending == 0U) || (measurement_active != 0U)) { return 0U; }
 
   switch (flush_deferred_state)
   {
   case FLUSH_STATE_IDLE:
+    flush_active_seq = flush_request_seq;
     /* 检查是否有会话可用；如无，丢弃环形缓冲后直接完成 */
     if (sd_state != SD_STATE_ACTIVE)
     {
@@ -578,6 +611,8 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
         {
           sd_last_error = (uint8_t)ret;
           total_dropped += remaining;
+          total_unsynced += session_written;
+          session_written = 0U;
           sd_state = SD_STATE_BACKOFF;
           sd_paused = 1U;
           backoff_until = HAL_GetTick() + BACKOFF_MS;
@@ -596,8 +631,20 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
     {
       AppState_t *s = app_rtos_get_state();
       if (s != NULL) { s->sd_task_phase = PHASE_SD_FLUSH; }
-      APP_SdFile_StopSession();
+      AppSdFileStatus_t stop_status = APP_SdFile_StopSession();
       if (s != NULL) { s->sd_task_phase = PHASE_SD_IDLE; }
+      if (stop_status != APP_SD_FILE_OK)
+      {
+        sd_last_error = (uint8_t)stop_status;
+        sd_paused = 1U;
+        sd_state = SD_STATE_BACKOFF;
+        backoff_until = HAL_GetTick() + BACKOFF_MS;
+        total_unsynced += session_written;
+        session_written = 0U;
+        sync_error_count++;
+        flush_deferred_state = FLUSH_STATE_IDLE;
+        return 0U;
+      }
     }
     {
       uint16_t leftover = ring_clear_pending();
@@ -609,10 +656,17 @@ uint8_t APP_DataLog_ServiceDeferredStop(void)
     /* 继续落入下一分支 */
 
   case FLUSH_STATE_DONE:
-    flush_pending = 0U;
+    {
+      uint32_t primask = ring_enter_critical();
+      if (flush_request_seq == flush_active_seq)
+      {
+        flush_pending = 0U;
+      }
+      ring_exit_critical(primask);
+    }
     flush_deferred_state = FLUSH_STATE_IDLE;
     session_written = 0U;
-    return 1U;
+    return (flush_pending == 0U) ? 1U : 0U;
 
   default:
     flush_deferred_state = FLUSH_STATE_IDLE;

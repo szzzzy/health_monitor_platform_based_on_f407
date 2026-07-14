@@ -3,10 +3,10 @@
   * @file    app_ptt.c
   * @brief   PTT 计算：PPG 脉搏波峰时刻 − ECG R 峰时刻
   *
-  * 维护最近 4 个 ECG R 峰时间戳环形缓冲区。
-  * PPG 波峰到达时查找其之前最近的 ECG R 峰，计算时间差。
-  * PTT ∈ [60, 600] ms，越界结果标记无效并清零。
-  * 导联脱落、手指离开、ECG/PPG 复位时清空 PTT 状态。
+  * 维护最近 4 个 ECG R 峰时间戳；PPG 波峰到达时查找其之前最近的 R 峰。
+  * 候选先通过 60–600 ms 的硬件匹配边界，再通过 80–350 ms 的输出可信范围、
+  * ECG/PPG 双侧质量、运动/IBI、FIFO 时延和历史突跳门控。接受值写入 5 点历史
+  * 并输出中位数。拒绝时只清 ptt_valid 并保留旧值；完整 reset 才清空历史和值。
   ******************************************************************************
   */
 
@@ -14,7 +14,7 @@
 #include "app_ppg_sqi.h"
 #include <string.h>
 
-/* PTT 生理边界和可信显示范围；trusted range 更窄，用于过滤明显错误匹配。 */
+/* 先用宽边界排除明显的跨搏动错配，再用更窄范围门控可发布输出。 */
 #define APP_PTT_MIN_MS                60U
 #define APP_PTT_MAX_MS                600U
 #define APP_PTT_TRUSTED_MIN_MS        80U
@@ -75,6 +75,9 @@ void app_ptt_reset(AppState_t *app)
   {
     app->ptt_valid = 0U;
     app->ptt_ms    = 0U;
+    app->ptt_last_update_tick = 0UL;
+    app->ptt_match_age_ms = 0xFFFFU;
+    app->ptt_invalid_reason = APP_OUTPUT_REASON_NO_FINGER;
   }
 }
 
@@ -104,9 +107,10 @@ void app_ptt_add_ecg_peak(uint32_t r_peak_ms)
  * @param  app               AppState 指针。
  * @param  ppg_peak_sample   PPG 峰值样本索引。
  * @param  ppg_total_samples 自启动以来的 PPG 样本总数。
- * @note   前置条件：ecg_valid=1、无导联脱落、ecg_r_peak_ms 非零。
- *         应用 FIFO 积压时限检查（<=30 ms）。结果钳位于
- *         [60, 600] ms。任何失败则设置 ptt_valid=0。
+ * @note   要求 ECG/PPG 质量均不低于 35、无导联脱落和运动门控、IBI 有效，
+ *         且 PPG 峰回推时延不超过 30 ms。候选必须同时落入宽匹配边界
+ *         [60, 600] ms 与可信输出范围 [80, 350] ms，并通过历史突跳检查。
+ *         失败只设置 ptt_valid=0，不清除上次 ptt_ms。
  ******************************************************************************
  */
 void app_ptt_update_from_ppg_peak(AppState_t *app,
@@ -147,7 +151,7 @@ void app_ptt_update_from_ppg_peak(AppState_t *app,
    * 消费时刻而非真实采样时刻，导致 ppg_peak_ms 推算值偏晚。
    * 若推算的峰值延迟 > 30 ms，说明存在 FIFO 积压延迟，PTT 不可信。
    */
-  ppg_age_ms = (HAL_GetTick() >= ppg_peak_ms) ? (HAL_GetTick() - ppg_peak_ms) : 0U;
+  ppg_age_ms = HAL_GetTick() - ppg_peak_ms;
   if (ppg_age_ms > 30U)
   {
     app_ptt_reject_ppg(app);
@@ -162,13 +166,14 @@ void app_ptt_update_from_ppg_peak(AppState_t *app,
 
   ptt_ms = ppg_peak_ms - r_peak_ms;
 
-  /* 越界检查：PTT 必须在 [MIN, MAX] ms 内 */
+  /* 第一层宽边界排除负时序、跨搏动或时间基准异常造成的明显错配。 */
   if ((ptt_ms < APP_PTT_MIN_MS) || (ptt_ms > APP_PTT_MAX_MS))
   {
     app_ptt_reject_range(app);
     return;
   }
 
+  /* 第二层可信范围决定候选能否进入输出历史。 */
   if ((ptt_ms < APP_PTT_TRUSTED_MIN_MS) || (ptt_ms > APP_PTT_TRUSTED_MAX_MS))
   {
     app_ptt_reject_range(app);
@@ -186,6 +191,9 @@ void app_ptt_update_from_ppg_peak(AppState_t *app,
   app_ptt_add_value(ptt_candidate);
   app->ptt_ms    = app_ptt_median_value();
   app->ptt_valid = 1U;
+  app->ptt_last_update_tick = HAL_GetTick();
+  app->ptt_match_age_ms = (ppg_age_ms > 0xFFFFUL) ? 0xFFFFU : (uint16_t)ppg_age_ms;
+  app->ptt_invalid_reason = APP_OUTPUT_REASON_OK;
 }
 
 /* ---- 将 PPG 样本索引转换为绝对毫秒时间戳 ---- */
@@ -195,15 +203,13 @@ static uint32_t app_ptt_ppg_sample_to_ms(const AppState_t *app,
 {
   uint32_t last_sample, delta_samples, delta_ms;
 
-  if ((app == NULL) || (total_samples == 0U)) return HAL_GetTick();
+  if (app == NULL) return HAL_GetTick();
 
   last_sample = total_samples - 1U;
   if (peak_sample > last_sample) return app->sensor_last_sample_tick;
 
   delta_samples = last_sample - peak_sample;
   delta_ms = delta_samples * APP_SAMPLE_PERIOD_MS;
-
-  if (delta_ms > app->sensor_last_sample_tick) return 0UL;
 
   return app->sensor_last_sample_tick - delta_ms;
 }
@@ -222,7 +228,8 @@ static uint8_t app_ptt_find_ref_r_peak(uint32_t ppg_peak_ms, uint32_t *r_peak_ms
                       APP_PTT_ECG_PEAK_HISTORY_SIZE);
     candidate = ptt_ecg_state.r_peak_ms[index];
 
-    if ((candidate != 0UL) && (candidate <= ppg_peak_ms))
+    if ((candidate != 0UL) &&
+        ((int32_t)(ppg_peak_ms - candidate) >= 0))
     {
       *r_peak_ms = candidate;
       return 1U;
@@ -309,6 +316,7 @@ static void app_ptt_reject_ecg(AppState_t *app)
 {
   if (app == NULL) { return; }
   app->ptt_valid = 0U;
+  app->ptt_invalid_reason = APP_OUTPUT_REASON_ECG;
   app_ptt_inc_u32(&app->ptt_reject_ecg_count);
 }
 
@@ -316,6 +324,23 @@ static void app_ptt_reject_ppg(AppState_t *app)
 {
   if (app == NULL) { return; }
   app->ptt_valid = 0U;
+  app->ptt_invalid_reason = APP_OUTPUT_REASON_STALE;
+  if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_LOW_PERFUSION) != 0U)
+  {
+    app->ptt_invalid_reason = APP_OUTPUT_REASON_LOW_PERFUSION;
+  }
+  else if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_MOTION) != 0U)
+  {
+    app->ptt_invalid_reason = APP_OUTPUT_REASON_MOTION;
+  }
+  else if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_TRANSITION) != 0U)
+  {
+    app->ptt_invalid_reason = APP_OUTPUT_REASON_CONTACT;
+  }
+  else if ((app->ppg_sqi_flags & APP_PPG_SQI_FLAG_BEAT_UNSTABLE) != 0U)
+  {
+    app->ptt_invalid_reason = APP_OUTPUT_REASON_BEAT_UNSTABLE;
+  }
   app_ptt_inc_u32(&app->ptt_reject_ppg_count);
 }
 
@@ -323,6 +348,7 @@ static void app_ptt_reject_range(AppState_t *app)
 {
   if (app == NULL) { return; }
   app->ptt_valid = 0U;
+  app->ptt_invalid_reason = APP_OUTPUT_REASON_RANGE;
   app_ptt_inc_u32(&app->ptt_reject_range_count);
 }
 
@@ -330,6 +356,7 @@ static void app_ptt_reject_jump(AppState_t *app)
 {
   if (app == NULL) { return; }
   app->ptt_valid = 0U;
+  app->ptt_invalid_reason = APP_OUTPUT_REASON_JUMP;
   app_ptt_inc_u32(&app->ptt_reject_jump_count);
 }
 

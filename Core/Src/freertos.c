@@ -2,7 +2,12 @@
 /**
   ******************************************************************************
   * File Name          : freertos.c
-  * Description        : FreeRTOS 应用代码
+  * Description        : FreeRTOS 任务、优先级与共享外设同步
+  *
+  * 任务分工：TIM6 ISR 每 10 ms 通知高优先级 MAXtask；MAXtask 消费 ECG DMA、
+  * 排空 MAX30102 FIFO 并推进测量算法；watchdogtask 检查任务心跳和 TIM6 活性；
+  * Uitask 处理串口、按键、OLED 与统计持久化；低优先级 SDtask 仅在安全窗口
+  * 写卡。MAX30102 与 OLED 共用 I2C1，因此所有运行期总线访问由互斥量串行化。
   ******************************************************************************
   * @attention
   *
@@ -36,6 +41,7 @@
 #include "iwdg.h"
 #include "max30102.h"
 #include "app_diag.h"
+#include "app_sched_diag.h"
 #include "tim.h"
 /* USER CODE END Includes */
 
@@ -46,14 +52,31 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define APP_RTOS_MAX_NOTIFY_TIMEOUT_MS 20U
-#define APP_RTOS_MAX_I2C_TIMEOUT_MS    8U
-#define APP_RTOS_UI_PERIOD_MS          20U
-#define APP_RTOS_DISPLAY_PERIOD_MS     200U
-#define APP_RTOS_SD_PERIOD_MS          20U
-#define APP_RTOS_WATCHDOG_PERIOD_MS    50U
-#define APP_DISPLAY_SKIP_THRESHOLD     8U
-#define APP_DISPLAY_FORCE_REFRESH_MS   1000U
+#define APP_RTOS_MAX_NOTIFY_TIMEOUT_MS 20U    /* MAXtask 无通知时的兜底唤醒周期，单位：ms */
+#define APP_RTOS_MAX_I2C_TIMEOUT_MS    8U     /* MAXtask 等待 I2C1 互斥量的上限，单位：ms */
+#define APP_RTOS_UI_PERIOD_MS          20U    /* UI 任务基础周期，单位：ms */
+#define APP_RTOS_DISPLAY_PERIOD_MS     200U   /* 常规 OLED 刷新周期，单位：ms */
+#define APP_RTOS_SD_PERIOD_MS          20U    /* SD 任务状态机轮询周期，单位：ms */
+#define APP_RTOS_WATCHDOG_PERIOD_MS    50U    /* 软件活性看门狗检查周期，单位：ms */
+#define APP_DISPLAY_SKIP_THRESHOLD     8U     /* 单批 FIFO 较大时暂缓 OLED 刷新 */
+#define APP_DISPLAY_FORCE_REFRESH_MS   1000U  /* 连续暂缓达到该时长后强制刷新，单位：ms */
+#define APP_WDT_MAX_DEADLINE_MS          500U
+#define APP_WDT_UI_DEADLINE_MS          1000U
+#define APP_WDT_SD_DEADLINE_MS          1500U
+#define APP_WDT_SD_FLUSH_DEADLINE_MS    7000U
+#define APP_WDT_TIM6_DEADLINE_MS         500U
+#ifndef APP_WDT_INJECT_FREEZE_MAX
+#define APP_WDT_INJECT_FREEZE_MAX          0U
+#endif
+#ifndef APP_WDT_INJECT_FREEZE_UI
+#define APP_WDT_INJECT_FREEZE_UI           0U
+#endif
+#ifndef APP_WDT_INJECT_FREEZE_SD
+#define APP_WDT_INJECT_FREEZE_SD           0U
+#endif
+#ifndef APP_WDT_INJECT_FREEZE_I2C
+#define APP_WDT_INJECT_FREEZE_I2C          0U
+#endif
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,9 +86,9 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-static AppState_t *app_rtos_state = NULL;
-static volatile uint8_t app_rtos_last_fifo_batch_count = 0U;
-static volatile uint8_t app_rtos_ready = 0U;
+static AppState_t *app_rtos_state = NULL;                 /* main() 绑定的共享状态实例 */
+static volatile uint8_t app_rtos_last_fifo_batch_count = 0U; /* 最近一次 FIFO 排空量，供 UI 门控 */
+static volatile uint8_t app_rtos_ready = 0U;              /* 置位后 ISR 才可发送任务通知 */
 
 void app_rtos_mark_ready(void)
 {
@@ -183,8 +206,9 @@ void app_rtos_notify_max_from_isr(void)
  ******************************************************************************
  * @brief  带超时地获取 I2C1 总线互斥锁。
  * @param  timeout_ms 最大等待时间（毫秒）
- * @return 成功返回 1，超时或句柄为 NULL 返回 0。
- * @note  序列化 MAX 任务与 UI 任务之间的 I2C 访问。
+ * @return 成功返回 1，等待超时返回 0。
+ * @note  序列化 MAXtask 与 Uitask 之间的 I2C1 访问。调度器启动前互斥量
+ *        尚未创建，此时返回 1，以允许 main() 完成单线程启动访问。
  ******************************************************************************
  */
 uint8_t app_rtos_i2c_acquire(uint32_t timeout_ms)
@@ -215,7 +239,7 @@ void app_rtos_i2c_release(void)
 
 /**
  ******************************************************************************
- * @brief  运行 MAX30102 服务周期（心电图、FIFO 排空、看门狗）。
+ * @brief  运行一次采集服务周期（ECG 消费、PPG FIFO 排空与传感器看门狗）。
  * @param  app 指向应用程序状态的指针
  * @return 无。
  * @note  从 MAX 任务调用；内部获取 I2C 互斥锁。
@@ -241,6 +265,10 @@ static void app_rtos_service_max(AppState_t *app)
     if (app_rtos_i2c_acquire(APP_RTOS_MAX_I2C_TIMEOUT_MS) != 0U)
     {
       app->max_task_phase = PHASE_MAX_FIFO_DRAIN;
+#if (APP_WDT_INJECT_FREEZE_I2C != 0U)
+      app->max_task_phase = PHASE_MAX_I2C_ACQ;
+      osDelay(10000U);
+#endif
       fifo_batch_count = app_measurement_drain_fifo_batch(app);
 
       if ((fifo_batch_count == 0U) &&
@@ -266,6 +294,8 @@ static void app_rtos_service_max(AppState_t *app)
     app_measurement_service_sensor_watchdog(app);
     app_rtos_i2c_release();
   }
+
+  app_measurement_service_time(app);
 }
 
 /**
@@ -435,30 +465,129 @@ void StartTask02(void *argument)
 
     app_rtos_service_max(app_rtos_state);
     app_rtos_state->max_task_phase = PHASE_MAX_HEARTBEAT;
+#if (APP_WDT_INJECT_FREEZE_MAX == 0U)
     app_rtos_state->max_task_heartbeat++;
+#endif
   }
   /* USER CODE END StartTask02 */
 }
 
 /* USER CODE BEGIN Header_StartTask03 */
 /**
-* @brief 实现 watchdogtask 线程的函数。
-* @param argument: 未使用
-* @retval 无
+ * @brief 监测 MAX/UI/SD 任务心跳与 TIM6 节拍，并在全部健康时刷新 IWDG。
+ * @param argument 未使用。
+ * @note  首次发现超时后锁存故障来源并停止刷新硬件看门狗，由 IWDG 完成复位；
+ *        SD 延迟排空允许更长截止时间，以覆盖 f_sync/f_close 的阻塞时间。
+ * @retval 无
 */
 /* USER CODE END Header_StartTask03 */
 void StartTask03(void *argument)
 {
   /* USER CODE BEGIN StartTask03 */
+  uint8_t initialized = 0U;
+  uint8_t watchdog_latched = 0U;
+  uint32_t last_max_hb = 0U;
+  uint32_t last_ui_hb = 0U;
+  uint32_t last_sd_hb = 0U;
+  uint32_t last_tim6 = 0U;
+  uint32_t last_max_tick = 0U;
+  uint32_t last_ui_tick = 0U;
+  uint32_t last_sd_tick = 0U;
+  uint32_t last_tim6_tick = 0U;
   /* 无限循环 */
   for(;;)
   {
     static uint8_t liveness_div = 0U;
+    uint32_t now = HAL_GetTick();
+    uint32_t tim6_count = APP_TIM6_GetIsrCount();
+    uint32_t sd_deadline = APP_WDT_SD_DEADLINE_MS;
+    uint8_t fault_task = 0U;
+    uint8_t fault_phase = 0U;
 
     if (app_rtos_state != NULL) {
-      app_rtos_state->wdt_task_phase = PHASE_WDT_REFRESH;
+      app_rtos_state->wdt_task_phase = PHASE_WDT_CHECK;
+      app_rtos_state->tim6_isr_heartbeat = tim6_count;
     }
-    APP_Watchdog_Refresh();
+
+    if ((app_rtos_state != NULL) && (initialized == 0U))
+    {
+      initialized = 1U;
+      last_max_hb = app_rtos_state->max_task_heartbeat;
+      last_ui_hb = app_rtos_state->ui_task_heartbeat;
+      last_sd_hb = app_rtos_state->sd_task_heartbeat;
+      last_tim6 = tim6_count;
+      last_max_tick = now;
+      last_ui_tick = now;
+      last_sd_tick = now;
+      last_tim6_tick = now;
+    }
+
+    if ((app_rtos_state != NULL) && (initialized != 0U))
+    {
+      if (app_rtos_state->max_task_heartbeat != last_max_hb)
+      {
+        last_max_hb = app_rtos_state->max_task_heartbeat;
+        last_max_tick = now;
+      }
+      if (app_rtos_state->ui_task_heartbeat != last_ui_hb)
+      {
+        last_ui_hb = app_rtos_state->ui_task_heartbeat;
+        last_ui_tick = now;
+      }
+      if (app_rtos_state->sd_task_heartbeat != last_sd_hb)
+      {
+        last_sd_hb = app_rtos_state->sd_task_heartbeat;
+        last_sd_tick = now;
+      }
+      if (tim6_count != last_tim6)
+      {
+        last_tim6 = tim6_count;
+        last_tim6_tick = now;
+      }
+
+      if (app_rtos_state->sd_task_phase == PHASE_SD_FLUSH)
+      {
+        sd_deadline = APP_WDT_SD_FLUSH_DEADLINE_MS;
+      }
+
+      if ((now - last_max_tick) > APP_WDT_MAX_DEADLINE_MS)
+      {
+        fault_task = 1U;
+        fault_phase = app_rtos_state->max_task_phase;
+      }
+      else if ((now - last_ui_tick) > APP_WDT_UI_DEADLINE_MS)
+      {
+        fault_task = 3U;
+        fault_phase = app_rtos_state->ui_task_phase;
+      }
+      else if ((now - last_sd_tick) > sd_deadline)
+      {
+        fault_task = 4U;
+        fault_phase = app_rtos_state->sd_task_phase;
+      }
+      else if ((now - last_tim6_tick) > APP_WDT_TIM6_DEADLINE_MS)
+      {
+        fault_task = 6U;
+      }
+    }
+
+    if ((fault_task != 0U) && (watchdog_latched == 0U))
+    {
+      watchdog_latched = 1U;
+      app_rtos_state->watchdog_fault_count++;
+      app_rtos_state->watchdog_fault_task = fault_task;
+      app_rtos_state->watchdog_fault_phase = fault_phase;
+      APP_Diag_SaveLiveness(app_rtos_state);
+      APP_Diag_CaptureCrash(DIAG_CRASH_WATCHDOG, fault_task, fault_phase);
+    }
+
+    if (watchdog_latched == 0U)
+    {
+      if (app_rtos_state != NULL) {
+        app_rtos_state->wdt_task_phase = PHASE_WDT_REFRESH;
+      }
+      APP_Watchdog_Refresh();
+    }
 
     /* 每 20 拍 (~1s) 保存一次活体快照到 BKP */
     liveness_div++;
@@ -478,9 +607,11 @@ void StartTask03(void *argument)
 
 /* USER CODE BEGIN Header_StartTask04 */
 /**
-* @brief 实现 Uitask 线程的函数。
-* @param argument: 未使用
-* @retval 无
+ * @brief 处理串口命令、按键、OLED 刷新、测量上报和运行统计持久化。
+ * @param argument 未使用。
+ * @note  OLED 刷新会在 FIFO 压力较高时暂缓；连续暂缓达到上限后强制刷新，
+ *        以兼顾采集实时性和界面可见性。
+ * @retval 无
 */
 /* USER CODE END Header_StartTask04 */
 void StartTask04(void *argument)
@@ -503,7 +634,9 @@ void StartTask04(void *argument)
     }
 
     app_rtos_state->ui_task_phase = PHASE_UI_IDLE;
+#if (APP_WDT_INJECT_FREEZE_UI == 0U)
     app_rtos_state->ui_task_heartbeat++;
+#endif
 
     app_rtos_state->ui_task_phase = PHASE_UI_POLL_UART;
     app_protocol_poll_uart_commands(app_rtos_state);
@@ -594,9 +727,11 @@ void StartTask04(void *argument)
 
 /* USER CODE BEGIN Header_StartTask05 */
 /**
-* @brief 实现 SDtask 线程的函数。
-* @param argument: 未使用
-* @retval 无
+ * @brief 在低优先级任务中推进 SD 分片写入或测量停止后的延迟排空。
+ * @param argument 未使用。
+ * @note  手指在位期间禁止 f_write/f_sync/f_close；实时采集路径只写 RAM 环形缓冲，
+ *        物理 I/O 必须通过本任务的安全窗口判定。
+ * @retval 无
 */
 /* USER CODE END Header_StartTask05 */
 void StartTask05(void *argument)
@@ -611,25 +746,29 @@ void StartTask05(void *argument)
       continue;
     }
 
+#if (APP_WDT_INJECT_FREEZE_SD == 0U)
+    app_rtos_state->sd_task_heartbeat++;
+#endif
     app_rtos_state->sd_task_phase = PHASE_SD_SET_ACTIVE;
-    APP_DataLog_SetMeasurementActive(
-        (app_rtos_state->finger_present != 0U) &&
-        (app_rtos_state->contact_settle_samples == 0U) &&
-        (app_rtos_state->sensor_health == (uint8_t)SENSOR_HEALTH_OK));
+    /* 只要已确认手指在位就锁住所有物理 SD I/O；接触稳定期和传感器
+     * 恢复期也属于采样优先窗口。 */
+    APP_DataLog_SetMeasurementActive(app_rtos_state->finger_present != 0U);
 
     app_rtos_state->sd_task_phase = PHASE_SD_SAFE_CHECK;
-    if (app_runtime_sd_service_safe(app_rtos_state) != 0U)
+    if (APP_DataLog_IsFlushPending() != 0U)
     {
-      if (APP_DataLog_IsFlushPending() != 0U)
+      /* 停止排空不依赖样本新鲜度；传感器停止产样或异常时也必须能收尾。
+       * 已确认手指在位时仍禁止 f_write/f_sync/f_close。 */
+      if (app_runtime_sd_flush_safe(app_rtos_state) != 0U)
       {
         app_rtos_state->sd_task_phase = PHASE_SD_FLUSH;
         (void)APP_DataLog_ServiceDeferredStop();
       }
-      else
-      {
-        app_rtos_state->sd_task_phase = PHASE_SD_SERVICE_BUDGET;
-        (void)APP_DataLog_ServiceBudget(10U);
-      }
+    }
+    else if (app_runtime_sd_service_safe(app_rtos_state) != 0U)
+    {
+      app_rtos_state->sd_task_phase = PHASE_SD_SERVICE_BUDGET;
+      (void)APP_DataLog_ServiceBudget(10U);
     }
 
     app_rtos_state->sd_task_phase = PHASE_SD_STATUS;

@@ -6,8 +6,8 @@
   * 职责：
   *   - 挂载 / 卸载 FAT 卷
  *   - 按日创建 / 追加二进制日志文件（YYYYMMDD_NN.BIN）
-  *   - 2KB 缓冲批量写入 + f_sync
-  *   - 写失败自动关闭会话，每 60s 重试
+  *   - 接收日志层的 512 字节分片并执行 f_write/f_sync
+  *   - 写失败立即使会话和磁盘驱动失效；60 s 重试由 app_data_log 管理
   ******************************************************************************
   */
 
@@ -45,7 +45,7 @@ static uint32_t total_errors  = 0U;
  *   1. 不调用 f_close() —— FatFs 的 f_close 内部会 f_sync，坏卡/拔卡时
  *      f_sync 的多次 disk_write（文件缓冲 + FAT 表 + 目录项）会逐个超时，
  *      每个超时 200ms，总计可阻塞 1s+。改为直接 memset 清零 FIL 对象，
- *      丢弃未写入数据，O(1) 回到主循环。
+     *      丢弃未写入数据，O(1) 返回 SDtask 状态机。
  *   2. f_mount(NULL, "", 0) 使用 opt=0（仅注销工作区注册），不触发
  *      disk_ioctl(CTRL_SYNC)，避免在已失效的磁盘上再尝试同步。
  *   3. 最后同步 STA_NOINIT + 记录重试时间戳，确保后续 60s 内不再
@@ -180,32 +180,12 @@ void APP_SdFile_Init(void)
 }
 
 /**
- * @brief  启动 SD 日志会话：挂载 FAT 卷、打开今日 BIN 文件、定位到末尾。
- * @return APP_SD_FILE_OK 成功，APP_SD_FILE_NO_CARD 挂载/打开失败，
- *         APP_SD_FILE_WRITE_ERROR f_lseek 到文件末尾失败。
- * @note   执行惰性初始化：调用 APP_SD_Card_InitHardware() 再 f_mount
- *         （内部触发 APP_SD_Card_Init）。BIN 文件名为
- *         YYYYMMDD_NN.BIN 格式，其中 NN 按日自动递增。
- *         所有失败路径调用 close_session_after_error() 做级联清理。
- *         由 APP_DataLog_Service() 状态机驱动调用。
- */
-/*
- * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 BIN → 定位到文件末尾。
- *
- * 限频重试：若上次尝试失败，须等待 RETRY_INTERVAL_MS 后才允许重试，
- * 避免在坏卡/无卡场景下每个上报周期（200ms）都阻塞在初始化/挂载。
- * last_retry_tick == 0 表示从未尝试过，允许首次调用直接尝试。
- *
- * 所有失败路径统一调用 close_session_after_error() 做级联清理：
- * 丢弃半打开文件、卸载卷、反初始化卡、同步 STA_NOINIT、设置退避时间戳。
- */
-/*
- * 启动 SD 日志会话：挂载 FAT 卷 → 按日创建/追加 BIN → 定位到文件末尾。
- *
- * 由 APP_DataLog_Service() 状态机驱动调用，重试时序由状态机的
- * ERROR_BACKOFF 控制，此处不再做额外的退避限频。
- *
- * 所有失败路径统一调用 close_session_after_error() 做级联清理。
+ * @brief  挂载 FAT 卷并创建或追加当前日期的 BIN 会话文件。
+ * @return APP_SD_FILE_OK 成功，APP_SD_FILE_NO_CARD 挂载或打开失败，
+ *         APP_SD_FILE_WRITE_ERROR 定位文件末尾失败。
+ * @note   由 APP_DataLog_Service() 在 SDtask 上下文中调用，因此允许执行物理 I/O；
+ *         重试退避由 app_data_log 状态机负责。本函数任一步失败都会统一清理
+ *         文件句柄和挂载状态，避免后续重试继承半初始化资源。
  */
 AppSdFileStatus_t APP_SdFile_StartSession(void)
 {
@@ -215,7 +195,14 @@ AppSdFileStatus_t APP_SdFile_StartSession(void)
     char   file_path[32];
     uint8_t seq;
 
-    if (session_active) APP_SdFile_StopSession();
+    if (session_active)
+    {
+        AppSdFileStatus_t stop_status = APP_SdFile_StopSession();
+        if (stop_status != APP_SD_FILE_OK)
+        {
+            return stop_status;
+        }
+    }
 
     APP_SD_Card_InitHardware();
 
@@ -272,21 +259,44 @@ AppSdFileStatus_t APP_SdFile_StartSession(void)
  * 停止文件会话：f_sync + f_close + 卸载卷 + 反初始化卡。
  * 仅在 finger_present==0 的安全窗口调用。
  */
-void APP_SdFile_StopSession(void)
+AppSdFileStatus_t APP_SdFile_StopSession(void)
 {
+    AppSdFileStatus_t status = APP_SD_FILE_OK;
+    FRESULT fr;
+
     if (session_active)
     {
-        (void)f_sync(&log_file);
-        (void)f_close(&log_file);
+        fr = f_sync(&log_file);
+        if (fr != FR_OK)
+        {
+            status = APP_SD_FILE_SYNC_ERROR;
+        }
+
+        fr = f_close(&log_file);
+        if ((fr != FR_OK) && (status == APP_SD_FILE_OK))
+        {
+            status = APP_SD_FILE_CLOSE_ERROR;
+        }
         session_active = false;
     }
     if (volume_mounted)
     {
-        (void)f_mount(NULL, "", 1);
+        fr = f_mount(NULL, "", 0);
+        if ((fr != FR_OK) && (status == APP_SD_FILE_OK))
+        {
+            status = APP_SD_FILE_UNMOUNT_ERROR;
+        }
         volume_mounted = false;
     }
     APP_SD_Card_Deinit();
     sd_diskio_invalidate();
+
+    if (status != APP_SD_FILE_OK)
+    {
+        total_errors++;
+    }
+
+    return status;
 }
 
 /**

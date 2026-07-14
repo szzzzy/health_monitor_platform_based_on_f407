@@ -32,7 +32,7 @@
 #define APP_PPG_SQI_BALANCE_CAP             45U
 #define APP_PPG_SQI_BEAT_UNSTABLE_CAP       35U
 /* HR/SpO2/PTT 使用不同门限：PTT 对峰时刻更敏感，因此门限最高。 */
-#define APP_PPG_SQI_HR_MIN_SCORE            30U
+#define APP_PPG_SQI_HR_MIN_SCORE            24U
 #define APP_PPG_SQI_SPO2_MIN_SCORE          35U
 #define APP_PPG_SQI_PTT_MIN_SCORE           45U
 /* beat-to-beat 稳定性：短历史中位数用于拒绝突跳 IBI 和异常幅度。 */
@@ -106,6 +106,7 @@ void app_ppg_sqi_reset(AppState_t *app)
   app->ppg_sqi_ibi_reject_count = 0UL;
   app->ppg_sqi_amp_reject_count = 0UL;
   app->ppg_sqi_suppressed_count = 0UL;
+  app->ppg_last_gate_flags = 0U;
 }
 
 /**

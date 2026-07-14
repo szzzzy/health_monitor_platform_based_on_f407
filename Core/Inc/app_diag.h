@@ -1,3 +1,13 @@
+/**
+  ******************************************************************************
+  * @file    app_diag.h
+  * @brief   崩溃记录、任务阶段和栈水位诊断接口。
+  *
+  * 诊断模块把关键崩溃信息写入 RTC 备份寄存器，热复位后由 AppState
+  * 重新读出，供 OLED 调试页和 USART M 帧解释上一次故障。
+  ******************************************************************************
+  */
+
 #ifndef __APP_DIAG_H__
 #define __APP_DIAG_H__
 
@@ -19,6 +29,7 @@ extern "C" {
 #define DIAG_CRASH_MALLOCFAIL    7U
 #define DIAG_CRASH_NMI           8U
 #define DIAG_CRASH_ERROR_HANDLER 9U
+#define DIAG_CRASH_WATCHDOG     10U
 
 /* BKP 寄存器布局（RTC 备份域，热复位后保持）：
  * DR1 = 崩溃魔数 0xCA7A570F（仅在崩溃时设置）
@@ -36,10 +47,15 @@ extern "C" {
 #define APP_DIAG_BKP_MAGIC_LIVENESS 0x11FE5AFEUL
 
 /* ---- 公共 API ---- */
+/** @brief 初始化诊断模块并读取/维护 RTC 备份域计数。 */
 void APP_Diag_Init(void);
+/** @brief 捕获崩溃源、任务 ID 和阶段码到备份寄存器。 */
 void APP_Diag_CaptureCrash(uint8_t source, uint8_t task_id, uint8_t phase);
+/** @brief 清除已保存的崩溃记录。 */
 void APP_Diag_ClearCrash(void);
+/** @brief 查询备份域中是否存在有效崩溃记录。 */
 uint8_t APP_Diag_HasCrashRecord(void);
+/** @brief 将崩溃记录读取并展开到 AppState。 */
 void APP_Diag_ReadCrashToAppState(AppState_t *app);
 
 /* 周期性活跃快照（每约 1 秒由看门狗任务调用） */
